@@ -24,7 +24,7 @@ import {
   unansweredQuestions,
   type RuleContext,
 } from "./rules/rules.ts";
-import { applyEvents } from "./state/engine.ts";
+import { applyDeadlines, applyEvents } from "./state/engine.ts";
 import { RoomState } from "./state/room.ts";
 import type { InterventionCandidate, Message } from "./state/types.ts";
 import { MemoryStore, type InterventionRow, type MessageRow, type Store } from "./store.ts";
@@ -49,6 +49,13 @@ export interface ChorusOptions {
   /** trace sink for the replay harness and logs */
   onEvent?: (e: ChorusEvent) => void;
 }
+
+/** "I'm the verifier." / "This is Verifier." / "Hi, I am ResearchA" — the whole message. */
+const SELF_ID =
+  /^(?:(?:hi|hello|hey)[,!]?\s+)?(?:i'm|i am|this is)\s+(?:the\s+([a-z][\w-]{1,30})|([A-Z][\w-]{1,30}))(?:\s+agent)?\s*[.!]?$/i;
+const NOT_A_NAME = new Set(
+  "done back here ready sure not on in out busy free online working checking looking going sorry fine ok okay available new late".split(" "),
+);
 
 /** Messages that cannot carry an obligation (spec §11.2 pre-filter). */
 const TRIVIAL = /^(ok(ay)?|k|thanks?( you)?|thx|ty|cool|nice|great|sounds good|lgtm|\+1|👍|🙏|yes|no|sure)[.!]*$/i;
@@ -157,9 +164,34 @@ export class ChorusRoom {
 
   tick(): Promise<void> {
     return this.enqueue(async () => {
+      const expired = applyDeadlines(this._state, this.opts.clock.now());
+      for (const id of expired) this.emit({ kind: "state", detail: `${id} → ${this._state.object(id)?.status} (deadline)` });
       await this.evaluate("tick");
-      if (this.pending.length) this.commit();
+      if (this.pending.length || expired.length) this.commit();
     });
+  }
+
+  /**
+   * §12.1: learn an alias only from explicit self-identification ("I'm the
+   * verifier", "This is Verifier"), and never one another agent already uses.
+   */
+  private learnAlias(msg: Message): void {
+    const m = SELF_ID.exec(msg.text.trim());
+    if (!m) return;
+    const alias = (m[1] ?? m[2])!;
+    if (NOT_A_NAME.has(alias.toLowerCase())) return;
+    const s = this._state;
+    const taken = [...s.agents.values()].some(
+      (a) =>
+        a.id !== msg.authorId &&
+        (a.displayName.toLowerCase() === alias.toLowerCase() || a.aliases.some((x) => x.toLowerCase() === alias.toLowerCase())),
+    );
+    const agent = s.agents.get(msg.authorId)!;
+    if (taken || agent.aliases.includes(alias)) return;
+    agent.aliases.push(alias);
+    // Guest seats have no display name; the first self-introduction becomes it.
+    if (agent.displayName === agent.id) agent.displayName = alias;
+    this.emit({ kind: "state", seq: msg.seq, detail: `${agent.id} is also known as "${alias}"` });
   }
 
   private commit(message?: MessageRow): void {
@@ -257,6 +289,7 @@ export class ChorusRoom {
       return "skipped";
     }
     this.emit({ kind: "message", seq: msg.seq, detail: `${s.agentName(msg.authorId)}: ${msg.text}` });
+    this.learnAlias(msg);
 
     if (COMMAND.test(msg.text)) {
       const r = runCommand(s, msg, this.opts.clock.now());
@@ -339,14 +372,15 @@ export class ChorusRoom {
       ...unansweredQuestions(s, ctx),
       ...missingAcknowledgements(s, ctx),
       ...staleCommitments(s, ctx),
+      // Deadlines expire on ticks, which can resolve dependencies.
+      ...resolvedDependencies(s, ctx),
+      ...dependencyDeadlocks(s, ctx),
       ...(trigger === "state_change"
         ? [
             ...(await duplicateWork(s, ctx)),
             ...conflicts(s, ctx),
             ...repeatedQuestions(s, ctx),
             ...decisionReminders(s, ctx),
-            ...resolvedDependencies(s, ctx),
-            ...dependencyDeadlocks(s, ctx),
           ]
         : completion(s, ctx)),
     ];

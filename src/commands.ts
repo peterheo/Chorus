@@ -63,7 +63,8 @@ function open(state: RoomState): string {
     lines.push(`${q.id} (${tag}${claimed}) — ${q.text} [${state.agentName(q.askerId)}, ${state.cite(q.sourceMessageId)}]`);
   }
   for (const c of state.activeCommitments()) {
-    lines.push(`${c.id} — ${state.agentName(c.ownerId)}: ${c.action} [${c.status}${c.optional ? ", optional" : ""}]`);
+    const due = c.deadline ? `, due ${c.deadline.slice(11, 16)} UTC` : "";
+    lines.push(`${c.id} — ${state.agentName(c.ownerId)}: ${c.action} [${c.status}${c.optional ? ", optional" : ""}${due}]`);
   }
   for (const h of state.pendingHandoffs()) {
     lines.push(`${h.id} — handoff ${state.agentName(h.fromAgentId)} → ${state.agentName(h.toAgentId)}: ${h.action} [pending, ${state.cite(h.sourceMessageId)}]`);

@@ -166,8 +166,15 @@ const EVENT_NAMES: Record<string, Record<string, string>> = {
     completed: "commitment.completed",
     blocked: "commitment.blocked",
     cancelled: "commitment.cancelled",
+    expired: "commitment.expired",
   },
-  handoff: { pending: "handoff.pending", accepted: "handoff.accepted", declined: "handoff.declined", completed: "handoff.completed" },
+  handoff: {
+    pending: "handoff.pending",
+    accepted: "handoff.accepted",
+    declined: "handoff.declined",
+    completed: "handoff.completed",
+    expired: "handoff.expired",
+  },
   claim: { active: "claim.recorded", retracted: "claim.retracted" },
   conflict: { confirmed: "conflict.detected", candidate: "conflict.candidate", resolved: "conflict.resolved", dismissed: "conflict.dismissed" },
   dependency: { waiting: "dependency.waiting", resolved: "dependency.resolved" },
@@ -192,6 +199,6 @@ export function transitionEvent(s: RoomState, t: Transition, index: number): Roo
     id: index,
     event: name,
     sequence: t.messageId ? (s.message(t.messageId)?.seq ?? null) : null,
-    data: { [`${t.kind}_id`]: t.objectId, from: t.from, to: t.to, cause: t.cause, at: t.at },
+    data: { [`${t.kind}_id`]: t.objectId, from: t.from, to: t.to, cause: t.cause, reason: t.reason ?? null, at: t.at },
   };
 }

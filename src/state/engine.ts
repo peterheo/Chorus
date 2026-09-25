@@ -6,6 +6,7 @@ import type { Confirmer } from "../confirm.ts";
 import type { ExtractedEvent } from "../schemas/llm.ts";
 import { conditionsOverlap, contentTokens, overlap, textSimilarity } from "../similarity.ts";
 import type { RoomState } from "./room.ts";
+import { parseDeadline } from "../deadline.ts";
 import { parseClaim } from "../extract/heuristic.ts";
 import type {
   Claim,
@@ -54,12 +55,13 @@ function transition(
   msg: Message | undefined,
   now: Date,
   cause: "event" | "tick" | "command" | "feedback" = "event",
+  reason?: string,
 ): void {
   const from = obj.status;
   if (from === to) return;
   obj.status = to;
   if (kind === "commitment") touch(state, obj as Commitment, now);
-  state.record({ objectId: obj.id, kind, from, to, cause, messageId: msg?.id, at: now.toISOString() });
+  state.record({ objectId: obj.id, kind, from, to, cause, messageId: msg?.id, reason, at: now.toISOString() });
 }
 
 /** Record that the owner updated a commitment (feeds §21 staleness). */
@@ -112,7 +114,11 @@ function newCommitment(
   conditional: boolean,
   now: Date,
   fromHandoffId?: string,
+  inheritedDeadline?: string,
 ): Commitment {
+  // §16.2: a stated deadline ("by 14:30", "in 10 minutes") makes it expirable.
+  const dl = parseDeadline(e.payload.deadline, new Date(msg.timestamp)) ?? parseDeadline(action, new Date(msg.timestamp));
+  if (dl?.rest) action = dl.rest.replace(/[.,;]+$/, "");
   const c: Commitment = {
     id: state.nextId("commitment"),
     ownerId: msg.authorId,
@@ -120,6 +126,7 @@ function newCommitment(
     action,
     status: conditional ? "proposed" : "in_progress",
     optional: conditional,
+    deadline: dl?.deadline ?? inheritedDeadline,
     fromHandoffId,
     createdAt: now.toISOString(),
     createdIndex: state.roomIndex,
@@ -169,19 +176,52 @@ function acceptHandoff(state: RoomState, h: Handoff, msg: Message, e: ExtractedE
   h.acknowledgementMessageId = msg.id;
   h.derivedFromMessageIds.push(msg.id);
   transition(state, "handoff", h, "accepted", msg, now);
-  const c = newCommitment(state, msg, e, h.action, false, now, h.id);
+  const c = newCommitment(state, msg, e, h.action, false, now, h.id, h.deadline);
   h.resultingCommitmentId = c.id;
+  // §16.3: accepting a transfer cancels the sender's original commitment.
+  const original = h.transfersCommitmentId ? state.commitments.get(h.transfersCommitmentId) : undefined;
+  if (original && ["proposed", "accepted", "in_progress", "blocked"].includes(original.status)) {
+    original.derivedFromMessageIds.push(msg.id);
+    transition(state, "commitment", original, "cancelled", msg, now, "event", `transferred to ${c.id}`);
+    // Anyone waiting on the original now waits on the new commitment.
+    for (const p of state.waitingDependencies()) {
+      if (p.blockingObjectId === original.id) p.blockingObjectId = c.id;
+    }
+  }
   return c;
 }
 
+/**
+ * Time-driven transitions (§16.2, §16.3): commitments and handoffs whose
+ * stated deadline has passed expire. Runs on ticks and after messages.
+ */
+export function applyDeadlines(state: RoomState, now: Date, msg?: Message): string[] {
+  const changed: string[] = [];
+  for (const c of state.activeCommitments()) {
+    if (c.deadline && ["in_progress", "blocked", "accepted"].includes(c.status) && Date.parse(c.deadline) <= now.getTime()) {
+      transition(state, "commitment", c, "expired", msg, now, msg ? "event" : "tick", "deadline");
+      changed.push(c.id);
+    }
+  }
+  for (const h of state.pendingHandoffs()) {
+    if (h.deadline && Date.parse(h.deadline) <= now.getTime()) {
+      transition(state, "handoff", h, "expired", msg, now, msg ? "event" : "tick", "deadline");
+      changed.push(h.id);
+    }
+  }
+  if (changed.length) changed.push(...syncHandoffs(state, msg, now), ...resolveDependencies(state, msg, now));
+  return changed;
+}
+
 /** Accepted handoffs mirror their commitment's terminal state (§16.3). */
-function syncHandoffs(state: RoomState, msg: Message, now: Date): string[] {
+function syncHandoffs(state: RoomState, msg: Message | undefined, now: Date): string[] {
   const changed: string[] = [];
   for (const h of state.handoffs.values()) {
     if (h.status !== "accepted" || !h.resultingCommitmentId) continue;
     const c = state.commitments.get(h.resultingCommitmentId);
     if (c?.status === "completed") transition(state, "handoff", h, "completed", msg, now);
     else if (c?.status === "cancelled") transition(state, "handoff", h, "cancelled", msg, now);
+    else if (c?.status === "expired") transition(state, "handoff", h, "expired", msg, now);
     else continue;
     changed.push(h.id);
   }
@@ -214,12 +254,12 @@ function blockerDone(state: RoomState, p: Dependency): boolean {
 }
 
 /** Resolve waiting dependencies whose blocker finished; unblock the waiter's commitment. */
-function resolveDependencies(state: RoomState, msg: Message, now: Date): string[] {
+function resolveDependencies(state: RoomState, msg: Message | undefined, now: Date): string[] {
   const changed: string[] = [];
   for (const p of state.waitingDependencies()) {
     if (!blockerDone(state, p)) continue;
     p.resolvedAt = now.toISOString();
-    if (!p.derivedFromMessageIds.includes(msg.id)) p.derivedFromMessageIds.push(msg.id);
+    if (msg && !p.derivedFromMessageIds.includes(msg.id)) p.derivedFromMessageIds.push(msg.id);
     transition(state, "dependency", p, "resolved", msg, now);
     changed.push(p.id);
     const blocked = p.blockedCommitmentId ? state.commitments.get(p.blockedCommitmentId) : undefined;
@@ -402,14 +442,23 @@ export async function applyEvents(
           .filter((x): x is string => !!x && x !== msg.authorId);
         // §9.4: a request with a named target is a Handoff, one per target.
         if (e.type === "request" && targets.length > 0) {
+          const dl = parseDeadline(p.text ?? msg.text, new Date(msg.timestamp));
+          // "B, take over my C4": a transfer of the sender's own commitment.
+          const transferred = e.references
+            .map((r) => state.commitments.get(r.toUpperCase()))
+            .find((c) => c && c.ownerId === msg.authorId && ["in_progress", "accepted", "blocked"].includes(c.status));
+          let action = dl?.rest || p.text || msg.text;
+          if (transferred && /\b(take over|pick up|handle|finish)\b/i.test(action)) action = transferred.action;
           for (const to of targets) {
             const h: Handoff = {
               id: state.nextId("handoff"),
               fromAgentId: msg.authorId,
               toAgentId: to,
-              action: p.text ?? msg.text,
+              action,
               sourceMessageId: msg.id,
               status: "pending",
+              deadline: dl?.deadline ?? transferred?.deadline,
+              transfersCommitmentId: transferred?.id,
               createdAt: now.toISOString(),
               createdIndex: state.roomIndex,
               derivedFromMessageIds: [msg.id],
@@ -684,5 +733,6 @@ export async function applyEvents(
   }
   result.changed.push(...syncHandoffs(state, msg, now));
   result.changed.push(...resolveDependencies(state, msg, now));
+  result.changed.push(...applyDeadlines(state, now, msg));
   return result;
 }

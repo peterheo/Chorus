@@ -490,6 +490,11 @@ export function formatCompletion(state: RoomState, r: CompletionReport): string 
       lines.push(`optional follow-up: ${c.id} (${state.agentName(c.ownerId)}) "${c.action}"`);
     }
     for (const x of r.candidateConflicts) lines.push(`unconfirmed conflict (warning): ${x.id} — ${x.subject}`);
+    for (const c of state.commitments.values()) {
+      if (c.status === "expired") {
+        lines.push(`expired without completion (warning): ${c.id} (${state.agentName(c.ownerId)}) "${c.action}"`);
+      }
+    }
     lines.push("", "This is coordination status only; it does not mean the task itself succeeded.");
     return lines.join("\n");
   }

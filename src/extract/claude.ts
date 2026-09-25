@@ -32,7 +32,7 @@ Only emit an event when the message itself provides sufficient evidence. Do not 
 Event types:
 - question: the author asks something. payload.text = the question, canonical form.
 - request: the author asks someone to do something. Put named addressees in target_agents; leave it empty for "can someone…". payload.text = the request.
-- commitment: "I'll do X" (payload.action). Conditional or tentative offers ("If nobody else can, I could…") set payload.conditional = true.
+- commitment: "I'll do X" (payload.action). Conditional or tentative offers ("If nobody else can, I could…") set payload.conditional = true. If a deadline is stated, copy the phrase exactly as written into payload.deadline ("by 14:30", "in 10 minutes"); otherwise null.
 - decision: the room settles something ("Let's go with Vendor X", "Decided: output is JSON"). payload.text = the decision as a statement.
 - dependency: the author is waiting on something ("blocked on C3", "waiting for B's pricing check"). payload.text = what they wait on; put short IDs in references and named agents in target_agents.
 - acknowledgement, answer, status_update, completion, withdrawal, correction, disagreement: as named. For completion/status_update set payload.action when stated.

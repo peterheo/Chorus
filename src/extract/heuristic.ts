@@ -188,10 +188,11 @@ export class HeuristicExtractor implements Extractor {
       if (s.endsWith("?")) {
         const body = stripEnd(s);
         const target = questionAddressee(body, roster) ?? leadingAddressee(body, roster);
+        const refs = [...s.matchAll(SHORT_ID)].map((m) => m[1]!);
         if (UNTARGETED_REQUEST.test(body)) {
-          out.push(event("request", { text: s }, { confidence: 0.93 }));
+          out.push(event("request", { text: s }, { confidence: 0.93, references: refs }));
         } else if (target) {
-          out.push(event("request", { text: s }, { confidence: 0.92, target_agents: [target] }));
+          out.push(event("request", { text: s }, { confidence: 0.92, target_agents: [target], references: refs }));
         } else {
           out.push(event("question", { text: s }, { confidence: 0.94 }));
         }
@@ -205,6 +206,7 @@ export class HeuristicExtractor implements Extractor {
           event("request", { text: stripEnd(s.replace(/^@?[\w-]+[,:]\s+/, "")) }, {
             confidence: 0.9,
             target_agents: [addressee],
+            references: [...s.matchAll(SHORT_ID)].map((m) => m[1]!),
           }),
         );
         continue;

@@ -83,6 +83,9 @@ export interface Handoff extends Provenance {
   action: string;
   sourceMessageId: string;
   status: HandoffStatus;
+  deadline?: string;
+  /** "B, take over my C4": the sender's commitment being handed over */
+  transfersCommitmentId?: string;
   acknowledgementMessageId?: string;
   resultingCommitmentId?: string;
   lastSurfacedIndex?: number;
@@ -145,6 +148,8 @@ export interface Transition {
   to: string;
   cause: "event" | "tick" | "command" | "feedback";
   messageId?: string;
+  /** why, when not obvious from the status (e.g. "transferred", "deadline") */
+  reason?: string;
   at: string;
 }
 
