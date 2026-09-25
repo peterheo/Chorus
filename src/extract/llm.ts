@@ -89,6 +89,8 @@ export interface LlmBackend {
   }): Promise<BackendResult<z.infer<S>>>;
   /** Errors that retrying cannot fix (bad request, bad credentials): rethrown instead of retried. */
   isFatal(err: unknown): boolean;
+  /** False while every model is rate-limited for longer than the backend will wait. */
+  available?(): boolean;
 }
 
 export interface LlmOptions {
@@ -97,15 +99,31 @@ export interface LlmOptions {
   onCall?: (call: LlmCall) => void;
 }
 
-/** The model returned nothing usable after the retry (§48: the message is marked extraction_failed). */
+/** The model returned nothing usable after the retry (§48), or is rate-limited. */
 export class ExtractionFailedError extends Error {
-  constructor(reason: string) {
+  constructor(
+    reason: string,
+    /** no request was possible within the rate limit */
+    readonly rateLimited = false,
+  ) {
     super(`extraction failed: ${reason}`);
     this.name = "ExtractionFailedError";
   }
 }
 
-type ParseResult<T> = { ok: true; value: T } | { ok: false; refused: boolean; reason: string };
+/** Every model is over its rate limit for longer than the backend is willing to wait. */
+export class RateLimitedError extends Error {
+  constructor(
+    message: string,
+    /** when a model is expected to have room again */
+    readonly retryInMs: number,
+  ) {
+    super(message);
+    this.name = "RateLimitedError";
+  }
+}
+
+type ParseResult<T> = { ok: true; value: T } | { ok: false; refused: boolean; rateLimited?: boolean; reason: string };
 
 export async function parseWithRetry<S extends z.ZodType>(args: {
   backend: LlmBackend;
@@ -148,6 +166,11 @@ export async function parseWithRetry<S extends z.ZodType>(args: {
       lastError = r.reason;
     } catch (err) {
       if (backend.isFatal(err)) throw err;
+      // Retrying cannot help until the limit resets; let the caller fall back.
+      if (err instanceof RateLimitedError) {
+        opts.log?.(`LLM rate-limited: ${err.message}`);
+        return { ok: false, refused: false, rateLimited: true, reason: err.message };
+      }
       lastError = (err as Error).message;
       report(`error: ${lastError}`, false);
     }
@@ -164,6 +187,11 @@ export class LlmExtractor implements Extractor {
     private readonly opts: LlmOptions = {},
   ) {
     this.name = backend.name;
+  }
+
+  /** False while the backend is rate-limited: use the fallback without trying. */
+  available(): boolean {
+    return this.backend.available?.() ?? true;
   }
 
   async extract(text: string, ctx: ExtractionContext): Promise<ExtractedEvent[]> {
@@ -184,7 +212,7 @@ export class LlmExtractor implements Extractor {
     });
     if (result.ok) return result.value.events;
     if (result.refused) return []; // a refusal means: no events from this message
-    throw new ExtractionFailedError(result.reason);
+    throw new ExtractionFailedError(result.reason, result.rateLimited);
   }
 
   async extractBatch(items: Array<{ text: string; ctx: ExtractionContext }>): Promise<ExtractedEvent[][]> {
@@ -210,11 +238,16 @@ export class LlmExtractor implements Extractor {
     });
     if (!result.ok) {
       if (result.refused) return items.map(() => []);
-      throw new ExtractionFailedError(result.reason);
+      throw new ExtractionFailedError(result.reason, result.rateLimited);
     }
     const byIndex = new Map(result.value.results.map((r) => [r.index, r.events]));
     return items.map((_, i) => byIndex.get(i) ?? []);
   }
+}
+
+export interface LlmConfirmerOptions extends LlmOptions {
+  /** answers when the model can't (rate-limited or failed); those answers are not cached */
+  fallback?: Confirmer;
 }
 
 export class LlmConfirmer implements Confirmer {
@@ -222,7 +255,7 @@ export class LlmConfirmer implements Confirmer {
 
   constructor(
     private readonly backend: LlmBackend,
-    private readonly opts: LlmOptions = {},
+    private readonly opts: LlmConfirmerOptions = {},
   ) {}
 
   private async ask<S extends z.ZodType>(
@@ -231,48 +264,54 @@ export class LlmConfirmer implements Confirmer {
     input: unknown,
     schema: S,
     purpose: LlmCall["purpose"],
-    fallback: z.infer<S>,
+    fallback: () => Promise<z.infer<S>> | z.infer<S>,
   ): Promise<z.infer<S>> {
     const hit = this.cache.get(key) as z.infer<S> | undefined;
     if (hit) return hit;
+    if (this.backend.available?.() === false) return fallback();
     const r = await parseWithRetry({ backend: this.backend, system, input, schema, purpose, opts: this.opts });
-    const v = r.ok ? r.value : fallback;
+    if (!r.ok && !r.refused) return fallback(); // may succeed later: don't cache
+    const v = r.ok ? r.value : await fallback();
     this.cache.set(key, v);
     return v;
   }
 
   duplicate(a: string, b: string): Promise<DuplicateVerdict> {
+    const fb = this.opts.fallback;
     return this.ask(
       `dup:${a}\u0000${b}`,
       DUPLICATE_SYSTEM,
       { commitment_a: a, commitment_b: b },
       DuplicateVerdictSchema,
       "duplicate_confirm",
-      { verdict: "different", confidence: 0 },
+      () => fb?.duplicate(a, b) ?? NO_DUPLICATE,
     );
   }
 
   againstDecision(d: DecisionView, k: ClaimView): Promise<ConflictVerdict> {
+    const fb = this.opts.fallback;
     return this.ask(
       `dec:${JSON.stringify(d)}\u0000${JSON.stringify(k)}`,
       DECISION_SYSTEM,
       { decision: d.statement, claim: k },
       ConflictVerdictSchema,
       "decision_confirm",
-      UNCLEAR,
+      () => fb?.againstDecision(d, k) ?? UNCLEAR,
     );
   }
 
   conflict(a: ClaimView, b: ClaimView): Promise<ConflictVerdict> {
+    const fb = this.opts.fallback;
     return this.ask(
       `conf:${JSON.stringify(a)}\u0000${JSON.stringify(b)}`,
       CONFLICT_SYSTEM,
       { claim_a: a, claim_b: b },
       ConflictVerdictSchema,
       "conflict_confirm",
-      UNCLEAR,
+      () => fb?.conflict(a, b) ?? UNCLEAR,
     );
   }
 }
 
 const UNCLEAR: ConflictVerdict = { verdict: "unclear", confidence: 0, reason: "no model output" };
+const NO_DUPLICATE: DuplicateVerdict = { verdict: "different", confidence: 0 };

@@ -148,6 +148,11 @@ export class ChorusRoom {
     const primary = this.opts.extractor;
     const fallback = this.opts.fallbackExtractor;
     if (!fallback || primary.name === "heuristic") return primary;
+    if (primary.available?.() === false) {
+      // The provider's rate limit is spent: don't queue behind it.
+      this._state.count("llm_rate_limited");
+      return fallback;
+    }
     const now = this.opts.clock.now().getTime();
     this.llmWindow = this.llmWindow.filter((t) => now - t < 60_000);
     if (this.llmWindow.length >= this.opts.config.llm.maxCallsPerMinute) {
@@ -687,10 +692,17 @@ export class ChorusRoom {
       events = preExtracted ?? (await extractor.extract(msg.text, this.context(msg)));
     } catch (err) {
       if ((err as Error).name !== "ExtractionFailedError") throw err;
-      s.count("extraction_failures");
-      this.emit({ kind: "error", seq: msg.seq, detail: (err as Error).message });
-      await this.evaluate("state_change");
-      return "extraction_failed";
+      const rateLimited = (err as { rateLimited?: boolean }).rateLimited === true;
+      s.count(rateLimited ? "llm_rate_limited" : "extraction_failures");
+      const fallback = this.opts.fallbackExtractor;
+      if (!fallback || fallback === extractor) {
+        this.emit({ kind: "error", seq: msg.seq, detail: (err as Error).message });
+        await this.evaluate("state_change");
+        return "extraction_failed";
+      }
+      // §48 records the failure; the rule-based extractor still reads the message.
+      this.emit({ kind: "error", seq: msg.seq, detail: `${(err as Error).message}; using ${fallback.name}` });
+      events = await fallback.extract(msg.text, this.context(msg));
     }
     this.emit({
       kind: "events",

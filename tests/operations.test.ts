@@ -274,13 +274,32 @@ describe("pipeline with an LLM extractor", () => {
     return { room, transport, clock };
   }
 
-  it("counts extraction failures and keeps going", async () => {
+  it("counts extraction failures and reads the message with the rules instead", async () => {
     const { room, transport } = build(new ClaudeExtractor({ client: fakeClient([bad, bad]) }), defaultConfig);
     await room.start();
     await transport.deliver("A", "I'll verify the endpoint.");
     await room.idle();
     assert.equal(room.state.counters.get("extraction_failures"), 1);
-    assert.equal(room.state.commitments.size, 0);
+    assert.equal(room.state.commitments.get("C1")!.action, "verify the endpoint");
+  });
+
+  it("uses the rules without calling the LLM while it is rate-limited", async () => {
+    let calls = 0;
+    const limited: Extractor = {
+      name: "gemini",
+      available: () => false,
+      extract: async () => {
+        calls++;
+        return [];
+      },
+    };
+    const { room, transport } = build(limited, defaultConfig);
+    await room.start();
+    await transport.deliver("A", "I'll verify the endpoint.");
+    await room.idle();
+    assert.equal(calls, 0);
+    assert.equal(room.state.counters.get("llm_rate_limited"), 1);
+    assert.equal(room.state.commitments.size, 1);
   });
 
   it("falls back to the rule-based extractor over the per-minute budget (§63)", async () => {

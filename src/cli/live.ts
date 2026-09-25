@@ -13,7 +13,13 @@
 //   LLM_MODEL            model for the LLM extractor (default gemini-3.8-flash
 //                        for gemini, claude-opus-5 for claude)
 //   GEMINI_FALLBACK_MODELS  comma-separated models to try when the primary is
-//                        overloaded (default gemini-flash-latest,gemini-flash-lite-latest)
+//                        overloaded or out of quota (default gemini-flash-lite-latest)
+//   GEMINI_RPM / GEMINI_TPM / GEMINI_RPD  your per-model Gemini quota: requests/min,
+//                        input tokens/min, requests/day (default 5 / 250000 / none;
+//                        a spent daily quota is detected from Google's 429)
+//   GEMINI_MAX_WAIT_MS   longest a message waits for quota before the rules take
+//                        it (default 15000)
+//   CHORUS_RULES_FIRST   "1": only messages the rules find nothing in use the LLM
 //   CHORUS_DB            SQLite file for room state (default .chorus/chorus.db)
 //   CHORUS_API_PORT      serve the state API + SSE (spec §31–32) on this port
 //   CHORUS_API_TOKEN     bearer token for the API (generated and printed if unset)
@@ -120,7 +126,7 @@ const room: ChorusRoom = new ChorusRoom({
 });
 
 await room.start({ tick: true });
-log(`Chorus listening in ${roomId} as ${transport.selfId()} (mode ${mode}, extractor ${kind}${llm ? ` ${llm.model}` : ""}, after #${after})`);
+log(`Chorus listening in ${roomId} as ${transport.selfId()} (mode ${mode}, extractor ${kind}${llm ? ` ${llm.model}` : ""}${llm && env.CHORUS_RULES_FIRST === "1" ? " (rules first)" : ""}, after #${after})`);
 log(`Receipts signed with key ${signer.keyId}`);
 
 const apiPort = env.CHORUS_API_PORT ? Number(env.CHORUS_API_PORT) : undefined;

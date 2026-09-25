@@ -16,4 +16,6 @@ export interface Extractor {
    * event list per item, in order. Used when the room's backlog grows.
    */
   extractBatch?(items: Array<{ text: string; ctx: ExtractionContext }>): Promise<ExtractedEvent[][]>;
+  /** False while a call can't be made now (rate-limited): use the fallback extractor instead. */
+  available?(): boolean;
 }

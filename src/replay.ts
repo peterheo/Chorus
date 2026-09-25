@@ -50,6 +50,8 @@ export async function replay(fixtureInput: Fixture | unknown, opts: ReplayOption
   const room = new ChorusRoom({
     transport,
     extractor: opts.extractor ?? new HeuristicExtractor(),
+    // An LLM extractor falls back to the rules when rate-limited or failing, as in live runs.
+    fallbackExtractor: opts.extractor ? new HeuristicExtractor() : undefined,
     confirmer: opts.confirmer ?? new HeuristicConfirmer(),
     clock,
     config,
