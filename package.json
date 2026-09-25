@@ -9,9 +9,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "test": "node --disable-warning=ExperimentalWarning --import tsx --test \"tests/**/*.test.ts\"",
     "replay": "tsx src/cli/replay.ts",
-    "start": "tsx src/cli/live.ts"
+    "start": "node --disable-warning=ExperimentalWarning --import tsx src/cli/live.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.128.0",

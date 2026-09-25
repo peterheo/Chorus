@@ -6,7 +6,7 @@ import type { Confirmer } from "../confirm.ts";
 import type { ExtractedEvent } from "../schemas/llm.ts";
 import { conditionsOverlap, contentTokens, overlap, textSimilarity } from "../similarity.ts";
 import type { RoomState } from "./room.ts";
-import type { Claim, Commitment, Conflict, Message, ObjectKind, Question } from "./types.ts";
+import type { Claim, Commitment, Conflict, Handoff, Message, ObjectKind, Question } from "./types.ts";
 
 export interface ApplyContext {
   config: ChorusConfig;
@@ -47,7 +47,14 @@ function transition(
   const from = obj.status;
   if (from === to) return;
   obj.status = to;
+  if (kind === "commitment") touch(state, obj as Commitment, now);
   state.record({ objectId: obj.id, kind, from, to, cause, messageId: msg?.id, at: now.toISOString() });
+}
+
+/** Record that the owner updated a commitment (feeds §21 staleness). */
+function touch(state: RoomState, c: Commitment, now: Date): void {
+  c.updatedIndex = state.roomIndex;
+  c.updatedAt = now.toISOString();
 }
 
 function created(state: RoomState, kind: ObjectKind, id: string, status: string, msg: Message, now: Date): void {
@@ -93,6 +100,7 @@ function newCommitment(
   action: string,
   conditional: boolean,
   now: Date,
+  fromHandoffId?: string,
 ): Commitment {
   const c: Commitment = {
     id: state.nextId("commitment"),
@@ -101,8 +109,11 @@ function newCommitment(
     action,
     status: conditional ? "proposed" : "in_progress",
     optional: conditional,
+    fromHandoffId,
     createdAt: now.toISOString(),
     createdIndex: state.roomIndex,
+    updatedIndex: state.roomIndex,
+    updatedAt: now.toISOString(),
     derivedFromMessageIds: [msg.id],
     extractorConfidence: e.confidence,
   };
@@ -120,6 +131,50 @@ function newCommitment(
     }
   }
   return c;
+}
+
+/**
+ * The pending handoff a message from its recipient refers to: the one it
+ * replies to, else one whose action matches, else the only one pending.
+ */
+function handoffFor(state: RoomState, msg: Message, action?: string | null): Handoff | undefined {
+  const mine = state.pendingHandoffs().filter((h) => h.toAgentId === msg.authorId);
+  if (mine.length === 0) return undefined;
+  if (msg.replyToId) {
+    const direct = mine.find((h) => h.sourceMessageId === msg.replyToId);
+    if (direct) return direct;
+  }
+  if (action) {
+    const best = mine
+      .map((h) => ({ h, s: textSimilarity(h.action, action) }))
+      .sort((a, b) => b.s - a.s)[0]!;
+    if (best.s >= 0.5) return best.h;
+  }
+  return mine.length === 1 ? mine[0] : undefined;
+}
+
+/** §16.3: accepting a handoff creates the recipient's commitment; that commitment is then the live object. */
+function acceptHandoff(state: RoomState, h: Handoff, msg: Message, e: ExtractedEvent, now: Date): Commitment {
+  h.acknowledgementMessageId = msg.id;
+  h.derivedFromMessageIds.push(msg.id);
+  transition(state, "handoff", h, "accepted", msg, now);
+  const c = newCommitment(state, msg, e, h.action, false, now, h.id);
+  h.resultingCommitmentId = c.id;
+  return c;
+}
+
+/** Accepted handoffs mirror their commitment's terminal state (§16.3). */
+function syncHandoffs(state: RoomState, msg: Message, now: Date): string[] {
+  const changed: string[] = [];
+  for (const h of state.handoffs.values()) {
+    if (h.status !== "accepted" || !h.resultingCommitmentId) continue;
+    const c = state.commitments.get(h.resultingCommitmentId);
+    if (c?.status === "completed") transition(state, "handoff", h, "completed", msg, now);
+    else if (c?.status === "cancelled") transition(state, "handoff", h, "cancelled", msg, now);
+    else continue;
+    changed.push(h.id);
+  }
+  return changed;
 }
 
 /** Which open question (if any) does this claim or answer resolve? (§15) */
@@ -255,9 +310,30 @@ export async function applyEvents(
     switch (e.type) {
       case "question":
       case "request": {
-        const targets = e.target_agents.map((n) => resolveAgent(state, n)).filter((x): x is string => !!x);
-        // Targeted requests become Handoffs (§9.4); handoffs are post-MVP, so
-        // until then they are tracked as requests with target agents.
+        const targets = e.target_agents
+          .map((n) => resolveAgent(state, n))
+          .filter((x): x is string => !!x && x !== msg.authorId);
+        // §9.4: a request with a named target is a Handoff, one per target.
+        if (e.type === "request" && targets.length > 0) {
+          for (const to of targets) {
+            const h: Handoff = {
+              id: state.nextId("handoff"),
+              fromAgentId: msg.authorId,
+              toAgentId: to,
+              action: p.text ?? msg.text,
+              sourceMessageId: msg.id,
+              status: "pending",
+              createdAt: now.toISOString(),
+              createdIndex: state.roomIndex,
+              derivedFromMessageIds: [msg.id],
+              extractorConfidence: e.confidence,
+            };
+            state.handoffs.set(h.id, h);
+            created(state, "handoff", h.id, "pending", msg, now);
+            result.created.push(h.id);
+          }
+          break;
+        }
         const q: Question = {
           id: state.nextId("question"),
           kind: e.type === "request" ? "request" : "question",
@@ -281,6 +357,14 @@ export async function applyEvents(
       case "commitment": {
         const action = p.action ?? msg.text;
         const conditional = p.conditional === true;
+        // "I'll do it" in answer to a handoff accepts that handoff.
+        const pending = conditional ? undefined : handoffFor(state, msg, action);
+        if (pending) {
+          const c = acceptHandoff(state, pending, msg, e, now);
+          result.changed.push(pending.id);
+          result.created.push(c.id);
+          break;
+        }
         // Confirming your own earlier tentative offer promotes it instead.
         const proposed = [...state.commitments.values()].find(
           (c) => c.ownerId === msg.authorId && c.status === "proposed" && textSimilarity(c.action, action) >= 0.6,
@@ -300,6 +384,8 @@ export async function applyEvents(
       case "status_update": {
         const c = latestActiveCommitment(state, msg.authorId, p.action);
         if (c) {
+          touch(state, c, now);
+          c.derivedFromMessageIds.push(msg.id);
           if (c.status === "proposed" || c.status === "accepted" || c.status === "blocked") {
             c.optional = false;
             transition(state, "commitment", c, "in_progress", msg, now);
@@ -323,6 +409,13 @@ export async function applyEvents(
       }
 
       case "withdrawal": {
+        const h = handoffFor(state, msg);
+        if (h) {
+          h.acknowledgementMessageId = msg.id;
+          transition(state, "handoff", h, "declined", msg, now);
+          result.changed.push(h.id);
+          break;
+        }
         const c = latestActiveCommitment(state, msg.authorId);
         if (c) {
           c.derivedFromMessageIds.push(msg.id);
@@ -339,6 +432,13 @@ export async function applyEvents(
       }
 
       case "acknowledgement": {
+        const h = handoffFor(state, msg);
+        if (h) {
+          const c = acceptHandoff(state, h, msg, e, now);
+          result.changed.push(h.id);
+          result.created.push(c.id);
+          break;
+        }
         const q = msg.replyToId ? state.openQuestions().find((x) => x.sourceMessageId === msg.replyToId) : undefined;
         if (q && q.status === "open") {
           q.ackIndex = state.roomIndex;
@@ -408,5 +508,6 @@ export async function applyEvents(
       result.changed.push(q.id);
     }
   }
+  result.changed.push(...syncHandoffs(state, msg, now));
   return result;
 }

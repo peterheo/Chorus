@@ -30,6 +30,8 @@ export interface ChorusConfig {
     minSeconds: number;
     resurfaceCooldownMessages: number;
   };
+  handoff: { minTargetMessages: number; resurfaceCooldownMessages: number };
+  stale: { ageRefSeconds: number; roomRefMessages: number; resurfaceCooldownMessages: number };
   presence: { activeWindowMessages: number };
   extraction: { recentWindow: number };
 }
@@ -61,6 +63,8 @@ export const defaultConfig: ChorusConfig = {
     minSeconds: 30,
     resurfaceCooldownMessages: 20,
   },
+  handoff: { minTargetMessages: 3, resurfaceCooldownMessages: 20 },
+  stale: { ageRefSeconds: 600, roomRefMessages: 30, resurfaceCooldownMessages: 30 },
   presence: { activeWindowMessages: 30 },
   extraction: { recentWindow: 10 },
 };

@@ -122,6 +122,96 @@ export function unansweredQuestions(state: RoomState, ctx: RuleContext): Interve
   return out;
 }
 
+/**
+ * §20 — the recipient has kept talking without acknowledging a handoff. This
+ * is evidence the handoff was missed, which a timer alone cannot give.
+ */
+export function missingAcknowledgements(state: RoomState, ctx: RuleContext): InterventionCandidate[] {
+  const cfg = ctx.config.handoff;
+  const out: InterventionCandidate[] = [];
+  for (const h of state.pendingHandoffs()) {
+    if (h.ignored) continue;
+    const since = h.lastSurfacedIndex ?? h.createdIndex;
+    const recipientMessages = state.messages.filter(
+      (m) => m.authorId === h.toAgentId && !m.isFromChorus && m.roomIndex > h.createdIndex,
+    ).length;
+    if (recipientMessages < cfg.minTargetMessages) continue;
+    if (h.lastSurfacedIndex !== undefined && state.roomIndex - since < cfg.resurfaceCooldownMessages) continue;
+    out.push({
+      type: "missing_acknowledgement",
+      severity: "medium",
+      involvedAgentIds: [h.toAgentId, h.fromAgentId],
+      relatedObjectIds: [h.id],
+      evidenceMessageIds: [h.sourceMessageId],
+      confidence: h.extractorConfidence,
+      urgency: Math.min(1, 0.6 + recipientMessages / 20),
+      expectedValue: 0.8,
+      blockedAgents: 1,
+      idempotencyKey: `missing_acknowledgement:${h.id}:${h.lastSurfacedIndex ?? 0}`,
+      text: [
+        `${state.agentName(h.toAgentId)}: handoff ${h.id} from ${state.agentName(h.fromAgentId)} has not been acknowledged.`,
+        "",
+        `${h.id} — ${h.action} (${state.cite(h.sourceMessageId)})`,
+        "",
+        `Reply to accept or decline. You have posted ${recipientMessages} messages since.`,
+      ].join("\n"),
+      replyToMessageId: h.sourceMessageId,
+      createdIndex: state.roomIndex,
+    });
+  }
+  return out;
+}
+
+/**
+ * §21 — a commitment is stale on several signals, not just age: time, room
+ * activity, and the owner talking about other things without an update.
+ */
+export function staleCommitments(state: RoomState, ctx: RuleContext): InterventionCandidate[] {
+  const cfg = ctx.config.stale;
+  const out: InterventionCandidate[] = [];
+  for (const c of state.activeCommitments()) {
+    if (c.optional || c.ignored || c.status !== "in_progress") continue;
+    if (c.lastSurfacedIndex !== undefined && state.roomIndex - c.lastSurfacedIndex < cfg.resurfaceCooldownMessages) {
+      continue;
+    }
+    const ageSeconds = (ctx.now.getTime() - new Date(c.updatedAt).getTime()) / 1000;
+    const roomSince = state.roomIndex - c.updatedIndex;
+    const ownerSince = state.messages.filter(
+      (m) => m.authorId === c.ownerId && !m.isFromChorus && m.roomIndex > c.updatedIndex,
+    ).length;
+    const dependents = 0; // dependencies are not tracked yet (§44 item 9)
+    const score =
+      0.35 * Math.min(ageSeconds / cfg.ageRefSeconds, 1) +
+      0.25 * Math.min(roomSince / cfg.roomRefMessages, 1) +
+      0.2 * Math.min(ownerSince / 5, 1) +
+      0.2 * Math.min(dependents / 2, 1);
+    if (score < ctx.config.thresholds.stale) continue;
+    const minutes = Math.round(ageSeconds / 60);
+    out.push({
+      type: "stale_commitment",
+      severity: "medium",
+      involvedAgentIds: [c.ownerId],
+      relatedObjectIds: [c.id],
+      evidenceMessageIds: [c.sourceMessageId],
+      confidence: Math.min(0.95, score + 0.1),
+      urgency: score,
+      expectedValue: 0.8,
+      blockedAgents: dependents,
+      idempotencyKey: `stale_commitment:${c.id}:${c.lastSurfacedIndex ?? 0}`,
+      text: [
+        `No update on ${c.id} for ${roomSince} messages (${minutes} min):`,
+        "",
+        `${state.agentName(c.ownerId)} → ${c.action} (${state.cite(c.sourceMessageId)})`,
+        "",
+        `${state.agentName(c.ownerId)}, is this still in progress? "@chorus resolved ${c.id}" if it's done.`,
+      ].join("\n"),
+      replyToMessageId: c.sourceMessageId,
+      createdIndex: state.roomIndex,
+    });
+  }
+  return out;
+}
+
 /** §22 — announce each confirmed conflict once. */
 export function conflicts(state: RoomState, _ctx: RuleContext): InterventionCandidate[] {
   const out: InterventionCandidate[] = [];
@@ -155,6 +245,7 @@ export function conflicts(state: RoomState, _ctx: RuleContext): InterventionCand
 export interface CompletionReport {
   complete: boolean;
   openQuestions: Question[];
+  pendingHandoffs: ReturnType<RoomState["pendingHandoffs"]>;
   requiredCommitments: ReturnType<RoomState["activeCommitments"]>;
   optionalCommitments: ReturnType<RoomState["activeCommitments"]>;
   confirmedConflicts: ReturnType<RoomState["unresolvedConflicts"]>;
@@ -167,6 +258,7 @@ export function completionReport(state: RoomState): CompletionReport {
   const unresolved = state.unresolvedConflicts();
   const r = {
     openQuestions: state.openQuestions(),
+    pendingHandoffs: state.pendingHandoffs(),
     requiredCommitments: active.filter((c) => !c.optional),
     optionalCommitments: active.filter((c) => c.optional),
     confirmedConflicts: unresolved.filter((x) => x.status === "confirmed"),
@@ -174,7 +266,11 @@ export function completionReport(state: RoomState): CompletionReport {
   };
   return {
     ...r,
-    complete: r.openQuestions.length === 0 && r.requiredCommitments.length === 0 && r.confirmedConflicts.length === 0,
+    complete:
+      r.openQuestions.length === 0 &&
+      r.pendingHandoffs.length === 0 &&
+      r.requiredCommitments.length === 0 &&
+      r.confirmedConflicts.length === 0,
   };
 }
 
@@ -185,6 +281,7 @@ export function formatCompletion(state: RoomState, r: CompletionReport): string 
       "READY TO CLOSE",
       "",
       "0 open questions",
+      "0 pending handoffs",
       "0 unresolved conflicts",
       "0 required active commitments",
     ];
@@ -199,6 +296,12 @@ export function formatCompletion(state: RoomState, r: CompletionReport): string 
   if (r.openQuestions.length) {
     lines.push(`${plural(r.openQuestions.length, "open question")}:`);
     for (const q of r.openQuestions) lines.push(`${q.id} — ${q.text} (${state.cite(q.sourceMessageId)})`);
+  }
+  if (r.pendingHandoffs.length) {
+    lines.push(`${plural(r.pendingHandoffs.length, "pending handoff")}:`);
+    for (const h of r.pendingHandoffs) {
+      lines.push(`${h.id} — ${state.agentName(h.fromAgentId)} → ${state.agentName(h.toAgentId)}: ${h.action}`);
+    }
   }
   if (r.requiredCommitments.length) {
     lines.push(`${plural(r.requiredCommitments.length, "active commitment")}:`);
@@ -218,13 +321,9 @@ export const COMPLETION_QUIET_SECONDS = 60;
  * on ticks only, after the room has been quiet for a minute, so a brief
  * moment with nothing open mid-conversation is not announced.
  */
-export function completion(
-  state: RoomState,
-  ctx: RuleContext,
-  announced: { value: boolean },
-): InterventionCandidate[] {
-  if (announced.value || state.mode !== "facilitate") return [];
-  const hadObligations = state.questions.size + state.commitments.size + state.conflicts.size > 0;
+export function completion(state: RoomState, ctx: RuleContext): InterventionCandidate[] {
+  if (state.completionAnnounced || state.mode !== "facilitate") return [];
+  const hadObligations = state.questions.size + state.commitments.size + state.conflicts.size + state.handoffs.size > 0;
   const last = state.messages.filter((m) => !m.isFromChorus).at(-1);
   const quiet = last ? (ctx.now.getTime() - new Date(last.timestamp).getTime()) / 1000 : 0;
   if (!hadObligations || quiet < COMPLETION_QUIET_SECONDS) return [];

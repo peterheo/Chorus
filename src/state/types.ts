@@ -63,6 +63,27 @@ export interface Commitment extends Provenance {
   optional: boolean;
   deadline?: string;
   completionMessageId?: string;
+  /** set when created by accepting a handoff (§16.3) */
+  fromHandoffId?: string;
+  /** room index of the last message that touched this commitment (§21) */
+  updatedIndex: number;
+  updatedAt: string;
+  lastSurfacedIndex?: number;
+  ignored?: boolean;
+}
+
+export type HandoffStatus = "pending" | "accepted" | "declined" | "completed" | "cancelled" | "expired";
+
+/** Targeted requests and explicit transfers of work (§10.3). */
+export interface Handoff extends Provenance {
+  fromAgentId: string;
+  toAgentId: string;
+  action: string;
+  sourceMessageId: string;
+  status: HandoffStatus;
+  acknowledgementMessageId?: string;
+  resultingCommitmentId?: string;
+  lastSurfacedIndex?: number;
   ignored?: boolean;
 }
 
@@ -87,7 +108,7 @@ export interface Conflict extends Provenance {
   ignored?: boolean;
 }
 
-export type ObjectKind = "question" | "commitment" | "claim" | "conflict";
+export type ObjectKind = "question" | "commitment" | "claim" | "conflict" | "handoff";
 
 export interface Transition {
   objectId: string;
@@ -103,7 +124,10 @@ export type InterventionType =
   | "duplicate_work"
   | "unanswered_question"
   | "conflict_detected"
-  | "completion_check";
+  | "completion_check"
+  | "missing_acknowledgement"
+  | "stale_commitment"
+  | "command_reply";
 
 export interface InterventionCandidate {
   type: InterventionType;

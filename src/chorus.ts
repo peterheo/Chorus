@@ -1,18 +1,27 @@
 // The per-room pipeline (spec §11): receive → normalize → dedupe → pre-filter
-// → extract → apply → rules → policy → post. All work for a room runs on one
-// serial queue, so state is only ever touched by one step at a time.
+// → extract → apply → rules → policy → post → commit. All work for a room runs
+// on one serial queue, so state is only ever touched by one step at a time.
 
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { Clock } from "./clock.ts";
 import { COMMAND, runCommand } from "./commands.ts";
 import type { ChorusConfig } from "./config.ts";
 import type { Confirmer } from "./confirm.ts";
 import type { Extractor, ExtractionContext } from "./extract/types.ts";
 import { InterventionPolicy } from "./policy.ts";
-import { completion, conflicts, duplicateWork, unansweredQuestions, type RuleContext } from "./rules/rules.ts";
+import {
+  completion,
+  conflicts,
+  duplicateWork,
+  missingAcknowledgements,
+  staleCommitments,
+  unansweredQuestions,
+  type RuleContext,
+} from "./rules/rules.ts";
 import { applyEvents } from "./state/engine.ts";
 import { RoomState } from "./state/room.ts";
 import type { InterventionCandidate, Message } from "./state/types.ts";
+import { MemoryStore, type InterventionRow, type MessageRow, type Store } from "./store.ts";
 import type { ExternalRoomMessage, RoomTransport } from "./transport/types.ts";
 
 export interface ChorusEvent {
@@ -27,6 +36,10 @@ export interface ChorusOptions {
   confirmer: Confirmer;
   clock: Clock;
   config: ChorusConfig;
+  /** where state is committed after every message; defaults to memory only */
+  store?: Store;
+  /** key for this room in the store (the SharedNet room ID in live use) */
+  roomKey?: string;
   /** trace sink for the replay harness and logs */
   onEvent?: (e: ChorusEvent) => void;
 }
@@ -34,16 +47,37 @@ export interface ChorusOptions {
 /** Messages that cannot carry an obligation (spec §11.2 pre-filter). */
 const TRIVIAL = /^(ok(ay)?|k|thanks?( you)?|thx|ty|cool|nice|great|sounds good|lgtm|\+1|👍|🙏|yes|no|sure)[.!]*$/i;
 
+/**
+ * Deterministic UUID v4-shaped key for an intervention (spec §35). If Chorus
+ * crashes after posting but before committing, re-processing produces the same
+ * candidate and the same key, and SharedNet returns the stored message instead
+ * of posting it twice.
+ */
+export function interventionKey(roomKey: string, selfId: string, candidateKey: string): string {
+  const h = createHash("sha256").update(`${roomKey}\u0000${selfId}\u0000${candidateKey}`).digest("hex");
+  const variant = ((parseInt(h[16]!, 16) & 0x3) | 0x8).toString(16);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
 export class ChorusRoom {
-  readonly state: RoomState;
+  private _state: RoomState;
   private readonly policy: InterventionPolicy;
+  private readonly store: Store;
+  private readonly roomKey: string;
   private queue: Promise<void> = Promise.resolve();
-  private readonly completionAnnounced = { value: false };
   private timer: NodeJS.Timeout | null = null;
+  /** interventions posted since the last commit */
+  private pending: InterventionRow[] = [];
 
   constructor(private readonly opts: ChorusOptions) {
-    this.state = new RoomState(opts.config.mode);
+    this.store = opts.store ?? new MemoryStore();
+    this.roomKey = opts.roomKey ?? "room";
+    this._state = new RoomState(opts.config.mode);
     this.policy = new InterventionPolicy(() => opts.config);
+  }
+
+  get state(): RoomState {
+    return this._state;
   }
 
   private emit(e: ChorusEvent): void {
@@ -70,9 +104,17 @@ export class ChorusRoom {
   }
 
   async start(opts: { tick?: boolean } = {}): Promise<void> {
+    const saved = this.store.load(this.roomKey);
+    if (saved) {
+      this._state = RoomState.fromJSON(saved.state);
+      this.emit({
+        kind: "state",
+        detail: `restored ${this.roomKey} at #${saved.lastProcessedSeq} (mode ${this._state.mode})`,
+      });
+    }
     const t = this.opts.transport;
     await t.connect();
-    this.state.chorusAgentId = t.selfId();
+    this._state.chorusAgentId = t.selfId();
     for (const r of await t.roster()) this.ensureAgent(r.id, r.name);
     t.onMessage((m) => this.enqueue(() => this.ingest(m)));
     if (opts.tick) {
@@ -87,17 +129,30 @@ export class ChorusRoom {
   }
 
   tick(): Promise<void> {
-    return this.enqueue(() => this.evaluate("tick"));
+    return this.enqueue(async () => {
+      await this.evaluate("tick");
+      if (this.pending.length) this.commit();
+    });
+  }
+
+  private commit(message?: MessageRow): void {
+    this.store.commit(this.roomKey, {
+      seq: this._state.lastProcessedSeq,
+      state: this._state.toJSON(),
+      message,
+      interventions: this.pending,
+    });
+    this.pending = [];
   }
 
   private ensureAgent(id: string, name?: string): void {
     const now = this.opts.clock.now().toISOString();
-    const a = this.state.agents.get(id);
+    const a = this._state.agents.get(id);
     if (a) {
       if (name && a.displayName === id) a.displayName = name;
       return;
     }
-    this.state.agents.set(id, {
+    this._state.agents.set(id, {
       id,
       displayName: name ?? id,
       aliases: [],
@@ -108,11 +163,26 @@ export class ChorusRoom {
   }
 
   private async ingest(ext: ExternalRoomMessage): Promise<void> {
-    const s = this.state;
+    const s = this._state;
     if (s.messageIds.has(ext.id)) {
       this.emit({ kind: "skip", seq: ext.seq, detail: `duplicate delivery of ${ext.id}` });
       return;
     }
+    const processingState = await this.process(ext);
+    s.lastProcessedSeq = Math.max(s.lastProcessedSeq, ext.seq);
+    this.commit({
+      externalId: ext.id,
+      seq: ext.seq,
+      authorId: ext.authorId,
+      text: ext.text,
+      timestamp: ext.timestamp,
+      isFromChorus: ext.authorId === s.chorusAgentId,
+      processingState,
+    });
+  }
+
+  private async process(ext: ExternalRoomMessage): Promise<MessageRow["processingState"]> {
+    const s = this._state;
     s.messageIds.add(ext.id);
     this.ensureAgent(ext.authorId, ext.authorName);
 
@@ -134,10 +204,10 @@ export class ChorusRoom {
     if (!isFromChorus) agent.lastRoomIndex = s.roomIndex;
 
     // §11.1: Chorus's own messages are stored but never extracted or counted.
-    if (isFromChorus) return;
+    if (isFromChorus) return "own";
     if (ext.type && ext.type !== "message") {
       this.emit({ kind: "skip", seq: msg.seq, detail: `non-message type ${ext.type}` });
-      return;
+      return "skipped";
     }
     this.emit({ kind: "message", seq: msg.seq, detail: `${s.agentName(msg.authorId)}: ${msg.text}` });
 
@@ -146,7 +216,7 @@ export class ChorusRoom {
       this.emit({ kind: "command", seq: msg.seq, detail: msg.text.trim() });
       await this.post(
         {
-          type: "completion_check",
+          type: "command_reply",
           severity: "low",
           involvedAgentIds: [msg.authorId],
           relatedObjectIds: [],
@@ -163,13 +233,13 @@ export class ChorusRoom {
         true,
       );
       if (r.changed) await this.evaluate("state_change");
-      return;
+      return "command";
     }
 
     if (TRIVIAL.test(msg.text.trim()) && !msg.replyToId) {
       this.emit({ kind: "skip", seq: msg.seq, detail: "pre-filter: trivial" });
       await this.evaluate("state_change");
-      return;
+      return "skipped";
     }
 
     const events = await this.opts.extractor.extract(msg.text, this.context(msg));
@@ -190,10 +260,11 @@ export class ChorusRoom {
       this.emit({ kind: "state", seq: msg.seq, detail: `${id} → ${s.object(id)?.status}` });
     }
     await this.evaluate("state_change");
+    return "applied";
   }
 
   private context(msg: Message): ExtractionContext {
-    const s = this.state;
+    const s = this._state;
     const recent = s.messages
       .filter((m) => !m.isFromChorus && m.id !== msg.id)
       .slice(-this.opts.config.extraction.recentWindow)
@@ -207,20 +278,23 @@ export class ChorusRoom {
       openObjects: [
         ...s.openQuestions().map((q) => ({ id: q.id, summary: q.text, owner: s.agentName(q.askerId) })),
         ...s.activeCommitments().map((c) => ({ id: c.id, summary: c.action, owner: s.agentName(c.ownerId) })),
+        ...s.pendingHandoffs().map((h) => ({ id: h.id, summary: h.action, owner: s.agentName(h.toAgentId) })),
       ].slice(0, 20),
     };
   }
 
   private async evaluate(trigger: "state_change" | "tick"): Promise<void> {
-    const s = this.state;
+    const s = this._state;
     const ctx: RuleContext = { config: this.opts.config, confirmer: this.opts.confirmer, now: this.opts.clock.now() };
-    // §17.1: unanswered is time-based but also checked on messages, since its
-    // message-count threshold is crossed by a message arriving.
+    // §17.1: count-based thresholds are crossed by a message arriving, so the
+    // time-based rules also run on state changes; completion is tick-only.
     const candidates: InterventionCandidate[] = [
       ...unansweredQuestions(s, ctx),
+      ...missingAcknowledgements(s, ctx),
+      ...staleCommitments(s, ctx),
       ...(trigger === "state_change"
         ? [...(await duplicateWork(s, ctx)), ...conflicts(s, ctx)]
-        : completion(s, ctx, this.completionAnnounced)),
+        : completion(s, ctx)),
     ];
     const decision = this.policy.choose(s, candidates, ctx.now);
     for (const { candidate, reason } of decision.suppressed) {
@@ -230,25 +304,36 @@ export class ChorusRoom {
   }
 
   private async post(c: InterventionCandidate, solicited: boolean): Promise<void> {
-    const s = this.state;
+    const s = this._state;
     const now = this.opts.clock.now();
-    // Record before sending: a crash mid-send retries with the same key (§35).
-    const record = { candidate: c, postedAt: now.toISOString(), postedIndex: s.roomIndex, solicited, messageId: undefined as string | undefined };
+    const record = {
+      candidate: c,
+      postedAt: now.toISOString(),
+      postedIndex: s.roomIndex,
+      solicited,
+      messageId: undefined as string | undefined,
+    };
     s.posted.push(record);
-    if (c.type === "unanswered_question") {
+    if (c.type === "unanswered_question" || c.type === "stale_commitment" || c.type === "missing_acknowledgement") {
       for (const id of c.relatedObjectIds) {
-        const q = s.questions.get(id);
-        if (q) q.lastSurfacedIndex = s.roomIndex;
+        const o = s.questions.get(id) ?? s.commitments.get(id) ?? s.handoffs.get(id);
+        if (o) o.lastSurfacedIndex = s.roomIndex;
       }
     }
-    if (c.type === "completion_check" && !solicited) this.completionAnnounced.value = true;
+    if (c.type === "completion_check") s.completionAnnounced = true;
     if (s.mode === "observe" && !solicited) return;
-    const result = await this.opts.transport.sendMessage({
-      text: c.text,
-      replyToId: c.replyToMessageId,
-      idempotencyKey: randomUUID(),
-    });
+
+    const key = interventionKey(this.roomKey, s.chorusAgentId ?? "", `${c.idempotencyKey}#${s.posted.length}`);
+    const result = await this.opts.transport.sendMessage({ text: c.text, replyToId: c.replyToMessageId, idempotencyKey: key });
     record.messageId = result.id;
+    this.pending.push({
+      key,
+      type: c.type,
+      text: c.text,
+      solicited,
+      outputMessageId: result.id,
+      postedAt: record.postedAt,
+    });
     this.emit({ kind: "posted", seq: result.seq, detail: `${solicited ? "reply" : c.type}\n${c.text}` });
   }
 }

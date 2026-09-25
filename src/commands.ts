@@ -35,6 +35,7 @@ function status(state: RoomState): string {
     "",
     `Open questions: ${open.length}`,
     `Commitments in progress: ${inProgress.length}`,
+    `Pending handoffs: ${state.pendingHandoffs().length}`,
     `Unresolved conflicts: ${confirmed.length}${candidates.length ? ` (+${candidates.length} unconfirmed)` : ""}`,
   ];
   const oldest = open
@@ -61,6 +62,9 @@ function open(state: RoomState): string {
   }
   for (const c of state.activeCommitments()) {
     lines.push(`${c.id} — ${state.agentName(c.ownerId)}: ${c.action} [${c.status}${c.optional ? ", optional" : ""}]`);
+  }
+  for (const h of state.pendingHandoffs()) {
+    lines.push(`${h.id} — handoff ${state.agentName(h.fromAgentId)} → ${state.agentName(h.toAgentId)}: ${h.action} [pending, ${state.cite(h.sourceMessageId)}]`);
   }
   for (const x of state.unresolvedConflicts()) lines.push(`${x.id} — conflict: ${x.subject} [${x.status}]`);
   return lines.length ? ["OPEN ITEMS", "", ...lines].join("\n") : "No open items.";
@@ -144,6 +148,19 @@ function feedback(state: RoomState, verb: string, arg: string | undefined, msg: 
       x.resolutionMessageIds.push(msg.id);
       return { reply: `${id} marked resolved.`, changed: true };
     }
+    const h = state.handoffs.get(id);
+    if (h) {
+      if (who !== h.fromAgentId && who !== h.toAgentId) return deny(`only the sender or recipient may resolve ${id}`);
+      const c = h.resultingCommitmentId ? state.commitments.get(h.resultingCommitmentId) : undefined;
+      if (c && c.status !== "completed") {
+        state.record({ objectId: c.id, kind: "commitment", from: c.status, to: "completed", cause: "feedback", messageId: msg.id, at: now.toISOString() });
+        c.status = "completed";
+        c.completionMessageId = msg.id;
+      }
+      state.record({ objectId: h.id, kind: "handoff", from: h.status, to: "completed", cause: "feedback", messageId: msg.id, at: now.toISOString() });
+      h.status = "completed";
+      return { reply: `${id} marked completed.`, changed: true };
+    }
     return { reply: `No object ${id}.`, changed: false };
   }
 
@@ -151,10 +168,16 @@ function feedback(state: RoomState, verb: string, arg: string | undefined, msg: 
     const q = state.questions.get(id);
     const c = state.commitments.get(id);
     const x = state.conflicts.get(id);
+    const h = state.handoffs.get(id);
     const owner = q?.askerId ?? c?.ownerId;
     if (q || c) {
       if (who !== owner) return deny(`only the asker/owner may ignore ${id}`);
       (q ?? c)!.ignored = true;
+      return { reply: `${id} will not be raised unsolicited.`, changed: true };
+    }
+    if (h) {
+      if (who !== h.fromAgentId) return deny(`only the sender may ignore ${id}`);
+      h.ignored = true;
       return { reply: `${id} will not be raised unsolicited.`, changed: true };
     }
     if (x) {

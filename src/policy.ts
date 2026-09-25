@@ -28,9 +28,6 @@ export interface Decision {
 }
 
 export class InterventionPolicy {
-  /** first room index each idempotency key was seen, for the queue TTL */
-  private readonly firstSeen = new Map<string, number>();
-
   constructor(private readonly config: () => ChorusConfig) {}
 
   private allowedInMode(state: RoomState, c: InterventionCandidate): boolean {
@@ -68,8 +65,8 @@ export class InterventionPolicy {
         suppressed.push({ candidate: c, reason: `mode ${state.mode}` });
         continue;
       }
-      const first = this.firstSeen.get(c.idempotencyKey) ?? state.roomIndex;
-      this.firstSeen.set(c.idempotencyKey, first);
+      const first = state.candidateFirstSeen.get(c.idempotencyKey) ?? state.roomIndex;
+      state.candidateFirstSeen.set(c.idempotencyKey, first);
       if (state.roomIndex - first > cfg.queueTtlMessages) {
         suppressed.push({ candidate: c, reason: "queue TTL expired" });
         continue;

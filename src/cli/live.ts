@@ -9,18 +9,22 @@
 //   CHORUS_MODE          observe | assist (default) | facilitate
 //   CHORUS_EXTRACTOR     heuristic (default) | claude
 //   LLM_MODEL            model for the claude extractor (default claude-opus-5)
+//   CHORUS_DB            SQLite file for room state (default .chorus/chorus.db)
 //
 // Flags:
-//   --after N            start after sequence N (default: the room's latest
-//                        message, so history is not re-announced)
+//   --after N            start after sequence N. Default: where the saved
+//                        state left off, or the room's latest message on a
+//                        first run (so history is not re-announced).
 
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { ChorusRoom } from "../chorus.ts";
 import { SystemClock } from "../clock.ts";
 import { defaultConfig, type Mode } from "../config.ts";
 import { HeuristicConfirmer } from "../confirm.ts";
 import { ClaudeConfirmer, ClaudeExtractor } from "../extract/claude.ts";
 import { HeuristicExtractor } from "../extract/heuristic.ts";
+import { SqliteStore } from "../store.ts";
 import { SharedNetTransport } from "../transport/sharednet.ts";
 
 function fail(msg: string): never {
@@ -60,8 +64,14 @@ async function latestSequence(): Promise<number> {
   return page.items[0]?.sequence ?? 0;
 }
 
+const dbPath = env.CHORUS_DB ?? ".chorus/chorus.db";
+mkdirSync(dirname(dbPath), { recursive: true });
+const store = new SqliteStore(dbPath);
+const saved = store.load(roomId);
+
 const afterIdx = process.argv.indexOf("--after");
-const after = afterIdx >= 0 ? Number(process.argv[afterIdx + 1]) : await latestSequence();
+const after =
+  afterIdx >= 0 ? Number(process.argv[afterIdx + 1]) : saved ? saved.lastProcessedSeq : await latestSequence();
 
 const useClaude = env.CHORUS_EXTRACTOR === "claude";
 const transport = new SharedNetTransport({ baseUrl, roomId, token, after, log });
@@ -71,6 +81,8 @@ const room = new ChorusRoom({
   confirmer: useClaude ? new ClaudeConfirmer({ model: env.LLM_MODEL, log }) : new HeuristicConfirmer(),
   clock: new SystemClock(),
   config: { ...defaultConfig, mode },
+  store,
+  roomKey: roomId,
   onEvent: (e) => {
     if (e.kind === "suppressed" || e.kind === "skip") return;
     log(`${e.seq !== undefined ? `#${e.seq} ` : ""}${e.kind}: ${e.detail.replace(/\n/g, " ⏎ ")}`);
@@ -83,6 +95,7 @@ log(`Chorus listening in ${roomId} as ${transport.selfId()} (mode ${mode}, extra
 const shutdown = async () => {
   log("shutting down");
   await room.stop();
+  store.close();
   process.exit(0);
 };
 process.on("SIGINT", shutdown);

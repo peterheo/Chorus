@@ -9,11 +9,13 @@ const HEDGES = /\b(i think|i believe|probably|maybe|perhaps|i guess|not sure|see
 const CONDITIONAL_OFFER = /\b(if (nobody|no one|no-one|needed|necessary)|could|might|maybe|possibly)\b/i;
 const COMMIT = /\b(?:i'll|i will|i'm going to|i am going to|let me|i'm on|i am on|i'll take)\b\s*(.*)$/i;
 const CAPABILITY = /\bi can\b/i;
-const STATUS = /^(?:(?:i'm|i am)\s+)?(checking|looking into|investigating|working on|verifying|inspecting)\b\s*(.*)$/i;
+const STATUS =
+  /^(?:(?:i'm|i am)\s+)?(?:still\s+)?(checking|looking into|investigating|working on|verifying|inspecting)\b\s*(.*)$/i;
 const COMPLETION = /^(?:(?:i\s+)?(?:have\s+)?)(checked|verified|finished|completed|done|confirmed|looked into|investigated|inspected)\b[\s:,-]*(.*)$/i;
 const WITHDRAW =
   /\b(i'll drop (mine|it|that)|dropping (mine|it|that)|never ?mind|i'll leave (it|that)|(?:\w+) has it|scratch that|i withdraw|i'll stand down)\b/i;
-const ACK = /^(on it|got it|will do|ack(nowledged)?|i'll answer|i'll get back to you)\b/i;
+const ACK = /^(on it|got it|will do|ack(nowledged)?|i'll answer|i'll get back to you|sure[,.!]?$|accepted)\b/i;
+const DECLINE = /\b(i can't (take|do) (it|this|that)|can't take (it|this|that)|i'm not able to|i won't be able to|i'll pass|pass on (it|this|that)|not me)\b/i;
 const CORRECTION = /^(correction|actually|update)\b[\s:,-]*/i;
 const UNTARGETED_REQUEST = /^(can|could|would|will)\s+(someone|anyone|somebody|anybody|one of you)\b/i;
 const YES_NO = /^(yes|yeah|yep|no|nope)\b[\s.,!:-]*/i;
@@ -148,7 +150,7 @@ export class HeuristicExtractor implements Extractor {
         if (!s) continue;
       }
 
-      if (WITHDRAW.test(s)) {
+      if (WITHDRAW.test(s) || DECLINE.test(s)) {
         out.push(event("withdrawal", {}, { confidence: 0.9 }));
         continue;
       }

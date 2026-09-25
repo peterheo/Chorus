@@ -10,7 +10,7 @@ Requires Node 22+.
 
 ```bash
 npm install
-npm test                                        # §77 acceptance tests + extractor tests
+npm test                                        # acceptance, handoff, persistence, extractor tests
 npm run replay -- tests/fixtures/milestone.json # the §82 milestone, with a state timeline
 ```
 
@@ -23,30 +23,34 @@ SHAREDNET_SEAT_FILE=~/.config/sharednet/rooms/<room>/<member>.json \
 CHORUS_MODE=assist npm start
 ```
 
-Or set `SHAREDNET_ROOM` and `SHAREDNET_TOKEN` (the seat's `sni_…` token) directly. Chorus starts after the room's latest message, so it does not re-announce history (`--after N` overrides). Messages from Chorus's own seat are ignored, so talk to it from a different seat.
+Or set `SHAREDNET_ROOM` and `SHAREDNET_TOKEN` (the seat's `sni_…` token) directly. Messages from Chorus's own seat are ignored, so talk to it from a different seat.
+
+State is saved to SQLite (`.chorus/chorus.db`, override with `CHORUS_DB`) after every message. On restart Chorus resumes from the last message it finished; on a first run it starts after the room's latest message so it does not re-announce history (`--after N` overrides both).
 
 | Variable | Values |
 |---|---|
 | `CHORUS_MODE` | `observe` (silent), `assist` (default: commands + confirmed conflicts), `facilitate` (all interventions) |
 | `CHORUS_EXTRACTOR` | `heuristic` (default, deterministic) or `claude` (needs Anthropic credentials) |
 | `LLM_MODEL` | model for the Claude extractor; default `claude-opus-5` |
+| `CHORUS_DB` | SQLite state file; default `.chorus/chorus.db` |
 
 In the room: `@chorus status`, `open`, `commitments`, `conflicts`, `close-check`, `mode <m>`, and feedback `resolved <id>`, `ignore <id>`, `wrong [id]`, `correct [id]` (permission-checked, spec §60).
 
-## What is built (MVP, spec §44 items 1–7)
+## What is built (spec §44 items 1–8)
 
 | Area | Where | Notes |
 |---|---|---|
 | Schemas (LLM layer + domain) | `src/schemas/llm.ts`, `src/state/types.ts` | Zod v4; LLM output is snake_case with agent names, mapped to IDs by the engine |
 | Replay transport + virtual clock | `src/transport/replay.ts`, `src/replay.ts`, `src/clock.ts` | Fixtures per §47; ticks simulated between messages |
 | Extraction | `src/extract/heuristic.ts`, `src/extract/claude.ts` | Deterministic rules by default; Claude via structured output with one retry |
-| State engine | `src/state/engine.ts` | Questions, requests, commitments, claims, conflicts; §40 confidence bands; transition log |
-| Rules | `src/rules/rules.ts` | Duplicate work (two-stage), unanswered (count OR wall-clock), conflicts (grouped), completion |
+| State engine | `src/state/engine.ts` | Questions, requests, handoffs, commitments, claims, conflicts; §40 confidence bands; transition log |
+| Rules | `src/rules/rules.ts` | Duplicate work (two-stage), unanswered (count OR wall-clock), missing handoff acknowledgement, stale commitment, conflicts (grouped), completion |
+| Persistence | `src/store.ts`, `src/state/room.ts` | SQLite snapshot + resume cursor committed per message; message and intervention audit log; deterministic post idempotency keys (§35) |
 | Policy | `src/policy.ts` | §26 score, mode filter, dedup, rate limits, queue TTL |
 | Commands + feedback | `src/commands.ts` | §29 MVP commands, §60 permissions |
 | SharedNet transport | `src/transport/sharednet.ts` | Raw API `wait` loop, idempotent posts, roster |
 
-**Not built yet:** persistence (state is in memory; a restart loses it; spec §33/§35), handoffs, dependencies, decisions (§44 items 8–10), stale-commitment rule, intervention merging (§51), embeddings (stage 1 is lexical overlap instead, see `src/similarity.ts`).
+**Not built yet:** dependencies and decisions (§44 items 9–10), intervention merging (§51), embeddings (stage 1 is lexical overlap instead, see `src/similarity.ts`), raw LLM-response logging (§48). Persistence stores a full snapshot per message, which is fine at hackathon scale but should become incremental for long rooms.
 
 ## SharedNet transport capabilities (Phase 0 spike, 2026-09-25)
 
