@@ -11,4 +11,9 @@ export interface ExtractionContext {
 export interface Extractor {
   readonly name: string;
   extract(text: string, ctx: ExtractionContext): Promise<ExtractedEvent[]>;
+  /**
+   * Optional (§11.2): extract several queued messages in one call. Returns one
+   * event list per item, in order. Used when the room's backlog grows.
+   */
+  extractBatch?(items: Array<{ text: string; ctx: ExtractionContext }>): Promise<ExtractedEvent[][]>;
 }

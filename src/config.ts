@@ -33,7 +33,8 @@ export interface ChorusConfig {
   handoff: { minTargetMessages: number; resurfaceCooldownMessages: number };
   stale: { ageRefSeconds: number; roomRefMessages: number; resurfaceCooldownMessages: number };
   presence: { activeWindowMessages: number };
-  extraction: { recentWindow: number };
+  /** §11.2: batch extraction when more than batchWhenBacklogOver messages are waiting */
+  extraction: { recentWindow: number; batchWhenBacklogOver: number; maxBatch: number };
   /** §43: watch / facilitate / replay / receipt commands */
   operations: { enabled: boolean };
   /** §63: per-room LLM call budget; over budget, extraction falls back to the rule-based extractor */
@@ -72,7 +73,7 @@ export const defaultConfig: ChorusConfig = {
   handoff: { minTargetMessages: 3, resurfaceCooldownMessages: 20 },
   stale: { ageRefSeconds: 600, roomRefMessages: 30, resurfaceCooldownMessages: 30 },
   presence: { activeWindowMessages: 30 },
-  extraction: { recentWindow: 10 },
+  extraction: { recentWindow: 10, batchWhenBacklogOver: 5, maxBatch: 10 },
   operations: { enabled: true },
   llm: { maxCallsPerMinute: 60 },
   retention: { days: 7 },

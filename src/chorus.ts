@@ -8,6 +8,7 @@ import { COMMAND, runCommand } from "./commands.ts";
 import type { ChorusConfig } from "./config.ts";
 import type { Confirmer } from "./confirm.ts";
 import type { Extractor, ExtractionContext } from "./extract/types.ts";
+import type { ExtractedEvent } from "./schemas/llm.ts";
 import { transitionEvent, type RoomEvent } from "./api/views.ts";
 import { InterventionPolicy } from "./policy.ts";
 import {
@@ -94,6 +95,8 @@ export class ChorusRoom {
   /** start times of recent LLM extraction calls, for the §63 budget */
   private llmWindow: number[] = [];
   private lastPruneAt = 0;
+  /** messages received but not yet processed (§11.2) */
+  private inbox: Array<{ ext: ExternalRoomMessage; done: () => void }> = [];
   private readonly listeners = new Set<(e: RoomEvent) => void>();
   /** transitions already published to subscribers */
   private published = 0;
@@ -199,7 +202,15 @@ export class ChorusRoom {
     await t.connect();
     this._state.chorusAgentId = t.selfId();
     for (const r of await t.roster()) this.ensureAgent(r.id, r.name);
-    t.onMessage((m) => this.enqueue(() => this.ingest(m)));
+    // The handler resolves only once the message is processed, so the
+    // transport never advances its cursor past unprocessed messages.
+    t.onMessage(
+      (m) =>
+        new Promise<void>((done) => {
+          this.inbox.push({ ext: m, done });
+          void this.enqueue(() => this.drain());
+        }),
+    );
     if (opts.tick) {
       this.timer = setInterval(() => void this.tick(), this.opts.config.tickSeconds * 1000);
     }
@@ -318,13 +329,80 @@ export class ChorusRoom {
     });
   }
 
-  private async ingest(ext: ExternalRoomMessage): Promise<void> {
+  /** Would this message go to the extractor? (mirrors the early exits in process) */
+  private extractable(ext: ExternalRoomMessage): boolean {
+    const s = this._state;
+    return (
+      !s.messageIds.has(ext.id) &&
+      ext.authorId !== s.chorusAgentId &&
+      (!ext.type || ext.type === "message") &&
+      !COMMAND.test(ext.text) &&
+      !(TRIVIAL.test(ext.text.trim()) && !ext.replyToId)
+    );
+  }
+
+  /**
+   * Process everything in the inbox. §11.2: when the backlog is large and the
+   * extractor can batch, extract several messages in one call against the
+   * current state, then apply each in sequence order as usual.
+   */
+  private async drain(): Promise<void> {
+    const batch = this.inbox.splice(0);
+    if (batch.length === 0) return;
+    const cfg = this.opts.config.extraction;
+    const pre = new Map<string, ExtractedEvent[]>();
+    if (batch.length > cfg.batchWhenBacklogOver) {
+      const c = this._state.counters;
+      c.set("extraction_backlog_max", Math.max(c.get("extraction_backlog_max") ?? 0, batch.length));
+      const extractor = this.chooseExtractor();
+      if (extractor.extractBatch) {
+        const todo = batch.map((b) => b.ext).filter((e) => this.extractable(e));
+        for (let i = 0; i < todo.length; i += cfg.maxBatch) {
+          const chunk = todo.slice(i, i + cfg.maxBatch);
+          try {
+            const results = await extractor.extractBatch(
+              chunk.map((e) => ({ text: e.text, ctx: this.context(this.previewMessage(e)) })),
+            );
+            chunk.forEach((e, j) => pre.set(e.id, results[j] ?? []));
+            this._state.count("extraction_batches");
+            this.emit({ kind: "events", detail: `batch-extracted ${chunk.length} messages (#${chunk[0]!.seq}–#${chunk.at(-1)!.seq})` });
+          } catch (err) {
+            // Fall back to one call per message below.
+            this.emit({ kind: "error", detail: `batch extraction failed: ${(err as Error).message}` });
+          }
+        }
+      }
+    }
+    for (const b of batch) {
+      try {
+        await this.ingest(b.ext, pre.get(b.ext.id));
+      } finally {
+        b.done();
+      }
+    }
+  }
+
+  /** A Message view of an unprocessed message, for building extraction context. */
+  private previewMessage(ext: ExternalRoomMessage): Message {
+    return {
+      id: ext.id,
+      seq: ext.seq,
+      roomIndex: 0,
+      authorId: ext.authorId,
+      text: ext.text,
+      timestamp: ext.timestamp,
+      replyToId: ext.replyToId,
+      isFromChorus: false,
+    };
+  }
+
+  private async ingest(ext: ExternalRoomMessage, preExtracted?: ExtractedEvent[]): Promise<void> {
     const s = this._state;
     if (s.messageIds.has(ext.id)) {
       this.emit({ kind: "skip", seq: ext.seq, detail: `duplicate delivery of ${ext.id}` });
       return;
     }
-    const processingState = await this.process(ext);
+    const processingState = await this.process(ext, preExtracted);
     s.lastProcessedSeq = Math.max(s.lastProcessedSeq, ext.seq);
     this.commit({
       externalId: ext.id,
@@ -337,7 +415,7 @@ export class ChorusRoom {
     });
   }
 
-  private async process(ext: ExternalRoomMessage): Promise<MessageRow["processingState"]> {
+  private async process(ext: ExternalRoomMessage, preExtracted?: ExtractedEvent[]): Promise<MessageRow["processingState"]> {
     const s = this._state;
     s.messageIds.add(ext.id);
     this.ensureAgent(ext.authorId, ext.authorName);
@@ -391,10 +469,10 @@ export class ChorusRoom {
       return "skipped";
     }
 
-    const extractor = this.chooseExtractor();
+    const extractor = preExtracted ? this.opts.extractor : this.chooseExtractor();
     let events;
     try {
-      events = await extractor.extract(msg.text, this.context(msg));
+      events = preExtracted ?? (await extractor.extract(msg.text, this.context(msg)));
     } catch (err) {
       if ((err as Error).name !== "ExtractionFailedError") throw err;
       s.count("extraction_failures");

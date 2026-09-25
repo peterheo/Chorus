@@ -52,6 +52,11 @@ export const ExtractionResultSchema = z.object({
 });
 export type ExtractionResult = z.infer<typeof ExtractionResultSchema>;
 
+/** §11.2 batch extraction: events per message, keyed by the message's index in the batch. */
+export const BatchExtractionResultSchema = z.object({
+  results: z.array(z.object({ index: z.number().int().min(0), events: z.array(ExtractedEventSchema) })),
+});
+
 export const emptyPayload: Payload = {
   text: null,
   action: null,

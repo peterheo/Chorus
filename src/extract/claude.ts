@@ -6,6 +6,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
 import type { z } from "zod";
 import {
+  BatchExtractionResultSchema,
   ConflictVerdictSchema,
   DuplicateVerdictSchema,
   ExtractionResultSchema,
@@ -53,7 +54,7 @@ Return "conflict" only for a real contradiction, "not_conflict" when both can ho
 
 /** One request to the model, for the llm_calls log (spec §48) and metrics (§59). */
 export interface LlmCall {
-  purpose: "extraction" | "duplicate_confirm" | "conflict_confirm" | "decision_confirm";
+  purpose: "extraction" | "batch_extraction" | "duplicate_confirm" | "conflict_confirm" | "decision_confirm";
   model: string;
   rawResponse: string;
   parsedOk: boolean;
@@ -170,6 +171,38 @@ export class ClaudeExtractor implements Extractor {
     if (result.ok) return result.value.events;
     if (result.refused) return []; // a refusal means: no events from this message
     throw new ExtractionFailedError(result.reason);
+  }
+
+  async extractBatch(items: Array<{ text: string; ctx: ExtractionContext }>): Promise<ExtractedEvent[][]> {
+    const first = items[0]!.ctx;
+    const input = {
+      roster: first.roster,
+      open_objects: first.openObjects,
+      recent_messages: first.recent,
+      messages: items.map((it, index) => ({
+        index,
+        author: it.ctx.author,
+        reply_target: it.ctx.replyTo ?? null,
+        text: it.text,
+      })),
+    };
+    const result = await parseWithRetry({
+      client: this.client,
+      model: this.model,
+      system:
+        EXTRACTION_SYSTEM +
+        "\n\nThis request contains several messages, in order. Return one result per message index with that message's events.",
+      input,
+      schema: BatchExtractionResultSchema,
+      purpose: "batch_extraction",
+      opts: this.opts,
+    });
+    if (!result.ok) {
+      if (result.refused) return items.map(() => []);
+      throw new ExtractionFailedError(result.reason);
+    }
+    const byIndex = new Map(result.value.results.map((r) => [r.index, r.events]));
+    return items.map((_, i) => byIndex.get(i) ?? []);
   }
 }
 

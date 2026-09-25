@@ -80,6 +80,8 @@ export function metrics(s: RoomState) {
     llm_input_tokens: counter("llm_input_tokens"),
     llm_output_tokens: counter("llm_output_tokens"),
     llm_budget_fallbacks: counter("llm_budget_fallbacks"),
+    extraction_batches: counter("extraction_batches"),
+    extraction_backlog_max: counter("extraction_backlog_max"),
     /** the §59 headline metric; null until an intervention has a verdict */
     useful_ratio: useful + notUseful ? useful / (useful + notUseful) : null,
   };
