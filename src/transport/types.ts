@@ -39,6 +39,8 @@ export interface TransportCapabilities {
 export interface RosterEntry {
   id: string;
   name?: string;
+  /** e.g. "online"/"offline" when the transport reports it */
+  presence?: string;
 }
 
 export interface RoomTransport {

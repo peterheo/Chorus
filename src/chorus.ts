@@ -29,6 +29,7 @@ import { applyDeadlines, applyEvents } from "./state/engine.ts";
 import { RoomState } from "./state/room.ts";
 import type { InterventionCandidate, Message } from "./state/types.ts";
 import type { LlmCall } from "./extract/claude.ts";
+import { agentBrief } from "./insights.ts";
 import { endExpiredSession } from "./operations.ts";
 import { ReceiptSigner } from "./receipts.ts";
 import { MemoryStore, type InterventionRow, type MessageRow, type ReceiptRow, type Store } from "./store.ts";
@@ -56,7 +57,15 @@ export interface ChorusOptions {
   signer?: ReceiptSigner;
   /** used when the primary (LLM) extractor is over its call budget (§63) */
   fallbackExtractor?: Extractor;
+  /**
+   * §78 facilitator election: announce this instance on start and speak only
+   * while it is the lowest online Chorus instance ID in the room.
+   */
+  election?: boolean;
 }
+
+/** A Chorus instance announcing itself for §78 election. */
+const PRESENCE = /^\[chorus\] online as (\S+)/;
 
 /** "I'm the verifier." / "This is Verifier." / "Hi, I am ResearchA" — the whole message. */
 const SELF_ID =
@@ -95,6 +104,9 @@ export class ChorusRoom {
   /** start times of recent LLM extraction calls, for the §63 budget */
   private llmWindow: number[] = [];
   private lastPruneAt = 0;
+  private lastRosterAt = 0;
+  /** a welcome-back brief for the author of the message being processed (§78) */
+  private pendingBrief: InterventionCandidate | null = null;
   /** messages received but not yet processed (§11.2) */
   private inbox: Array<{ ext: ExternalRoomMessage; done: () => void }> = [];
   private readonly listeners = new Set<(e: RoomEvent) => void>();
@@ -201,7 +213,7 @@ export class ChorusRoom {
     const t = this.opts.transport;
     await t.connect();
     this._state.chorusAgentId = t.selfId();
-    for (const r of await t.roster()) this.ensureAgent(r.id, r.name);
+    await this.refreshRoster();
     // The handler resolves only once the message is processed, so the
     // transport never advances its cursor past unprocessed messages.
     t.onMessage(
@@ -214,6 +226,42 @@ export class ChorusRoom {
     if (opts.tick) {
       this.timer = setInterval(() => void this.tick(), this.opts.config.tickSeconds * 1000);
     }
+    if (this.opts.election) {
+      const self = this._state.chorusAgentId!;
+      await this.enqueue(async () => {
+        await this.post(
+          this.reply(
+            `presence:${self}:${this.opts.clock.now().toISOString()}`,
+            `[chorus] online as ${self}. With several Chorus instances in a room, only the lowest online instance ID speaks; the others keep state and take over if it goes offline.`,
+            [],
+          ),
+          true,
+          true,
+        );
+        this.commit();
+      });
+    }
+  }
+
+  private async refreshRoster(): Promise<void> {
+    this.lastRosterAt = this.opts.clock.now().getTime();
+    for (const r of await this.opts.transport.roster()) {
+      this.ensureAgent(r.id, r.name);
+      const a = this._state.agents.get(r.id)!;
+      if (r.presence) a.presence = r.presence;
+    }
+  }
+
+  /** §78: am I the instance that speaks? Always true without election. */
+  isSpeaker(): boolean {
+    if (!this.opts.election) return true;
+    const s = this._state;
+    const self = s.chorusAgentId!;
+    const online = [...s.chorusPeers.keys()].filter((id) => {
+      const p = s.agents.get(id)?.presence;
+      return p === undefined || p === "online"; // unknown presence counts as online
+    });
+    return [self, ...online].sort()[0] === self;
   }
 
   async stop(): Promise<void> {
@@ -227,6 +275,7 @@ export class ChorusRoom {
       const now = this.opts.clock.now();
       const expired = applyDeadlines(this._state, now);
       for (const id of expired) this.emit({ kind: "state", detail: `${id} → ${this._state.object(id)?.status} (deadline)` });
+      if (this.opts.election && now.getTime() - this.lastRosterAt >= 60_000) await this.refreshRoster();
       const sessionEnd = endExpiredSession(this._state, this.roomKey, now, this.signer);
       if (sessionEnd) {
         this.pendingReceipts.push(sessionEnd.record);
@@ -337,6 +386,7 @@ export class ChorusRoom {
       ext.authorId !== s.chorusAgentId &&
       (!ext.type || ext.type === "message") &&
       !COMMAND.test(ext.text) &&
+      !PRESENCE.test(ext.text) &&
       !(TRIVIAL.test(ext.text.trim()) && !ext.replyToId)
     );
   }
@@ -380,6 +430,34 @@ export class ChorusRoom {
         b.done();
       }
     }
+  }
+
+  /** §78: an agent returning after a long absence gets a brief of what changed. */
+  private welcomeBack(msg: Message): InterventionCandidate | null {
+    const s = this._state;
+    const a = s.agents.get(msg.authorId)!;
+    if (!a.prevRoomIndex) return null; // first message: nothing to catch up on
+    const cfg = this.opts.config.brief;
+    const awayMessages = s.roomIndex - a.prevRoomIndex - 1;
+    const awayMinutes = a.prevSeenAt ? (Date.parse(msg.timestamp) - Date.parse(a.prevSeenAt)) / 60_000 : 0;
+    if (awayMessages < cfg.minAbsentMessages && awayMinutes < cfg.minAbsentMinutes) return null;
+    const lines = agentBrief(s, a.id, a.prevRoomIndex, a.prevSeenAt ?? "");
+    if (lines.length === 0) return null;
+    return {
+      type: "agent_brief",
+      severity: "medium",
+      involvedAgentIds: [a.id],
+      relatedObjectIds: [],
+      evidenceMessageIds: [msg.id],
+      confidence: 0.95,
+      urgency: 0.7,
+      expectedValue: 0.9,
+      blockedAgents: 0,
+      idempotencyKey: `agent_brief:${a.id}:${msg.id}`,
+      text: [`Welcome back, ${s.agentName(a.id)}. Since you were last active (${awayMessages} messages ago):`, "", ...lines.map((l) => `- ${l}`)].join("\n"),
+      replyToMessageId: msg.id,
+      createdIndex: s.roomIndex,
+    };
   }
 
   /** A Message view of an unprocessed message, for building extraction context. */
@@ -434,8 +512,12 @@ export class ChorusRoom {
     };
     s.messages.push(msg);
     const agent = s.agents.get(ext.authorId)!;
+    if (!isFromChorus) {
+      agent.prevRoomIndex = agent.lastRoomIndex;
+      agent.prevSeenAt = agent.lastSeenAt;
+      agent.lastRoomIndex = s.roomIndex;
+    }
     agent.lastSeenAt = ext.timestamp;
-    if (!isFromChorus) agent.lastRoomIndex = s.roomIndex;
 
     // §11.1: Chorus's own messages are stored but never extracted or counted.
     if (isFromChorus) return "own";
@@ -444,7 +526,15 @@ export class ChorusRoom {
       return "skipped";
     }
     this.emit({ kind: "message", seq: msg.seq, detail: `${s.agentName(msg.authorId)}: ${msg.text}` });
+    const peer = PRESENCE.exec(msg.text);
+    if (peer) {
+      // Another Chorus instance: remember it for election, never extract from it.
+      s.chorusPeers.set(msg.authorId, msg.timestamp);
+      this.emit({ kind: "state", seq: msg.seq, detail: `Chorus peer ${msg.authorId}; speaker is ${this.isSpeaker() ? "this instance" : "another instance"}` });
+      return "skipped";
+    }
     this.learnAlias(msg);
+    this.pendingBrief = this.welcomeBack(msg);
 
     if (COMMAND.test(msg.text)) {
       const r = runCommand(s, msg, {
@@ -538,9 +628,11 @@ export class ChorusRoom {
             ...conflicts(s, ctx),
             ...repeatedQuestions(s, ctx),
             ...decisionReminders(s, ctx),
+            ...(this.pendingBrief ? [this.pendingBrief] : []),
           ]
         : completion(s, ctx)),
     ];
+    this.pendingBrief = null;
     const decision = this.policy.choose(s, candidates, ctx.now);
     for (const { candidate, reason } of decision.suppressed) {
       this.emit({ kind: "suppressed", detail: `${candidate.type} ${candidate.relatedObjectIds.join(",")}: ${reason}` });
@@ -548,7 +640,7 @@ export class ChorusRoom {
     if (decision.post) await this.post(decision.post, false);
   }
 
-  private async post(c: InterventionCandidate, solicited: boolean): Promise<string | undefined> {
+  private async post(c: InterventionCandidate, solicited: boolean, always = false): Promise<string | undefined> {
     const s = this._state;
     const now = this.opts.clock.now();
     const record = {
@@ -572,6 +664,12 @@ export class ChorusRoom {
       }
     }
     if (s.mode === "observe" && !solicited) return undefined;
+    // A standby instance records what it would have said (so it does not
+    // repeat it after taking over) but stays silent (§78).
+    if (!always && !this.isSpeaker()) {
+      this.emit({ kind: "suppressed", detail: `${c.type}: standby (another Chorus instance is speaking)` });
+      return undefined;
+    }
 
     const key = interventionKey(this.roomKey, s.chorusAgentId ?? "", `${c.idempotencyKey}#${s.posted.length}`);
     const result = await this.opts.transport.sendMessage({ text: c.text, replyToId: c.replyToMessageId, idempotencyKey: key });

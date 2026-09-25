@@ -41,6 +41,8 @@ export interface ChorusConfig {
   llm: { maxCallsPerMinute: number };
   /** §65: message text older than this is pruned */
   retention: { days: number };
+  /** §78: welcome-back brief for an agent returning after this long away */
+  brief: { minAbsentMessages: number; minAbsentMinutes: number };
 }
 
 export const defaultConfig: ChorusConfig = {
@@ -77,6 +79,7 @@ export const defaultConfig: ChorusConfig = {
   operations: { enabled: true },
   llm: { maxCallsPerMinute: 60 },
   retention: { days: 7 },
+  brief: { minAbsentMessages: 30, minAbsentMinutes: 15 },
 };
 
 export function withMode(config: ChorusConfig, mode: Mode): ChorusConfig {

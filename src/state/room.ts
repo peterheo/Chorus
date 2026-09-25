@@ -57,6 +57,8 @@ export class RoomState {
   readonly counters = new Map<string, number>();
   /** active chorus.watch / chorus.facilitate session (§43) */
   session: FacilitationSession | null = null;
+  /** other Chorus instances that announced themselves: id → announcement time (§78 election) */
+  readonly chorusPeers = new Map<string, string>();
   /** signed receipts issued in this room (§54) */
   readonly receipts: SignedReceiptRecord[] = [];
 
@@ -168,6 +170,7 @@ export class RoomState {
       metricCounters: [...this.counters],
       session: this.session,
       receipts: this.receipts,
+      chorusPeers: [...this.chorusPeers],
       completionAnnounced: this.completionAnnounced,
       readyToClose: this.readyToClose,
       agents: [...this.agents.values()],
@@ -197,6 +200,7 @@ export class RoomState {
     for (const [k, v] of j.metricCounters ?? []) s.counters.set(k, v);
     s.session = j.session ?? null;
     s.receipts.push(...(j.receipts ?? []));
+    for (const [k, v] of j.chorusPeers ?? []) s.chorusPeers.set(k, v);
     s.completionAnnounced = j.completionAnnounced;
     s.readyToClose = j.readyToClose ?? false;
     for (const a of j.agents) s.agents.set(a.id, a);
@@ -238,6 +242,7 @@ export interface RoomSnapshot {
   metricCounters?: Array<[string, number]>;
   session?: FacilitationSession | null;
   receipts?: SignedReceiptRecord[];
+  chorusPeers?: Array<[string, string]>;
   completionAnnounced: boolean;
   readyToClose?: boolean;
   agents: Agent[];

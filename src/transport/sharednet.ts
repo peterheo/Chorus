@@ -165,7 +165,8 @@ export class SharedNetTransport implements RoomTransport {
     for (const m of res.memberships ?? []) {
       const id = (m.instance_id ?? m.member_id ?? m.id) as string | undefined;
       const name = (m.name ?? m.display_name ?? m.handle) as string | undefined;
-      if (id) out.push(name ? { id, name } : { id });
+      const presence = typeof m.presence === "string" ? m.presence : undefined;
+      if (id) out.push({ id, ...(name ? { name } : {}), ...(presence ? { presence } : {}) });
     }
     return out;
   }

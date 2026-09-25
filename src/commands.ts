@@ -2,6 +2,7 @@
 // Deterministic; no LLM involved. Replies are solicited and exempt from limits.
 
 import type { Mode } from "./config.ts";
+import { agentBrief, health, interactionMap, threads } from "./insights.ts";
 import { metrics } from "./metrics.ts";
 import {
   WATCH_DEFAULT_MINUTES,
@@ -44,6 +45,7 @@ const HELP = [
   "@chorus resolved <id> | ignore <id> | wrong [id] | correct [id] | reopen <D…>",
   "@chorus mode observe|assist|facilitate",
   "@chorus watch [minutes] | facilitate | stop | replay | receipt | metrics",
+  "@chorus brief | health | map | threads",
 ].join("\n");
 
 function status(state: RoomState): string {
@@ -336,6 +338,53 @@ export function runCommand(state: RoomState, msg: Message, ctx: CommandContext):
       return operations(state, verb.toLowerCase(), arg, msg, ctx);
     case "metrics":
       return { reply: metricsReply(state), changed: false };
+    case "brief": {
+      const a = state.agents.get(msg.authorId);
+      const since = a?.prevRoomIndex ?? 0;
+      const lines = agentBrief(state, msg.authorId, since, a?.prevSeenAt ?? "");
+      const head = since ? `Since your previous message (${state.roomIndex - since - 1} messages ago):` : "Everything so far:";
+      return { reply: lines.length ? [head, "", ...lines.map((l) => `- ${l}`)].join("\n") : "Nothing new concerns you.", changed: false };
+    }
+    case "health": {
+      const h = health(state);
+      return {
+        reply: [
+          "ROOM HEALTH (dimensions, not a single score)",
+          "",
+          `Open obligations: ${h.open_obligations.questions} questions, ${h.open_obligations.commitments} commitments, ${h.open_obligations.handoffs} handoffs`,
+          `Duplicate work: ${h.duplicate_work.active_pairs} active pairs`,
+          `Unresolved conflicts: ${h.unresolved_conflicts.confirmed}`,
+          `Stalled dependencies: ${h.stalled_dependencies.stalled} of ${h.stalled_dependencies.waiting} waiting (≥${h.stalled_dependencies.stalled_after_messages} messages)`,
+          `Unanswered questions surfaced and still open: ${h.unanswered_questions.surfaced_and_still_open} (oldest ${h.unanswered_questions.oldest_age_messages} messages)`,
+          `Blocked commitments: ${h.blocked_commitments}`,
+        ].join("\n"),
+        changed: false,
+      };
+    }
+    case "map": {
+      const edges = interactionMap(state).slice(0, 15);
+      if (!edges.length) return { reply: "No interactions between agents recorded yet.", changed: false };
+      return {
+        reply: [
+          "INTERACTION MAP (replies / handoffs / dependencies)",
+          "",
+          ...edges.map((e) => `${state.agentName(e.from)} → ${state.agentName(e.to)}: ${e.replies} / ${e.handoffs} / ${e.dependencies}`),
+        ].join("\n"),
+        changed: false,
+      };
+    }
+    case "threads": {
+      const ts = threads(state).slice(0, 10);
+      if (!ts.length) return { reply: "No topics tracked yet.", changed: false };
+      return {
+        reply: [
+          "TOPIC THREADS",
+          "",
+          ...ts.map((t) => `"${t.label}" — ${t.objects.join(", ")} (${t.open} open; ${t.agents.map((a) => state.agentName(a)).join(", ")})`),
+        ].join("\n"),
+        changed: false,
+      };
+    }
     case "status":
       return { reply: status(state), changed: false };
     case "open":

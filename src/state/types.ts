@@ -8,6 +8,11 @@ export interface Agent {
   firstSeenAt: string;
   lastSeenAt: string;
   lastRoomIndex: number;
+  /** activity before the agent's latest message, for "since you were last active" (§78) */
+  prevRoomIndex?: number;
+  prevSeenAt?: string;
+  /** from the transport roster when it reports presence (§9.2); never inferred */
+  presence?: string;
 }
 
 export interface Message {
@@ -164,6 +169,7 @@ export type InterventionType =
   | "decision_reminder"
   | "dependency_resolved"
   | "dependency_deadlock"
+  | "agent_brief"
   | "command_reply";
 
 export interface InterventionCandidate {

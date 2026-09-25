@@ -1,6 +1,7 @@
 // Machine-readable views of room state (spec §31, §32, §41). Pure functions
 // from RoomState to JSON; the HTTP layer only routes and authenticates.
 
+import { agentBrief } from "../insights.ts";
 import { completionReport } from "../rules/rules.ts";
 import type { RoomState } from "../state/room.ts";
 import type { Transition } from "../state/types.ts";
@@ -139,6 +140,13 @@ export function agentContextView(s: RoomState, agentId: string) {
       .filter((q) => q.targetIds.includes(agentId))
       .map((q) => q.id),
     your_open_questions: s.openQuestions().filter((q) => q.askerId === agentId).map((q) => q.id),
+    /** §78 "since you were last active", relative to the agent's previous message */
+    since_last_active: agentBrief(
+      s,
+      agentId,
+      s.agents.get(agentId)?.prevRoomIndex ?? 0,
+      s.agents.get(agentId)?.prevSeenAt ?? "",
+    ),
   };
 }
 

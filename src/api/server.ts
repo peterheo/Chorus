@@ -4,6 +4,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import type { ChorusRoom } from "../chorus.ts";
+import { health, interactionMap, threads } from "../insights.ts";
 import { metrics } from "../metrics.ts";
 import { agentContextView, decisionsView, historyView, openItemsView, stateView } from "./views.ts";
 
@@ -31,7 +32,7 @@ function authorized(req: IncomingMessage, token: string): boolean {
 }
 
 const ROUTE =
-  /^\/v1\/rooms\/([^/]+)(?:\/(state|open-items|decisions|events|metrics|receipts|agents\/([^/]+)\/context|objects\/([^/]+)\/history))?\/?$/;
+  /^\/v1\/rooms\/([^/]+)(?:\/(state|open-items|decisions|events|metrics|receipts|health|interactions|threads|agents\/([^/]+)\/context|objects\/([^/]+)\/history))?\/?$/;
 const KEY_ROUTE = /^\/v1\/keys\/([^/]+)\/?$/;
 
 export function createApiServer(opts: ApiOptions): Server {
@@ -66,6 +67,9 @@ export function createApiServer(opts: ApiOptions): Server {
     if (view === "decisions") return send(res, 200, decisionsView(s));
     if (view === "metrics") return send(res, 200, metrics(s));
     if (view === "receipts") return send(res, 200, { receipts: s.receipts });
+    if (view === "health") return send(res, 200, health(s));
+    if (view === "interactions") return send(res, 200, { edges: interactionMap(s) });
+    if (view === "threads") return send(res, 200, { threads: threads(s) });
     if (agentId !== undefined) return send(res, 200, agentContextView(s, decodeURIComponent(agentId)));
     if (objectId !== undefined) {
       const h = historyView(s, decodeURIComponent(objectId).toUpperCase());

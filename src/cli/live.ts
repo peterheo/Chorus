@@ -15,6 +15,8 @@
 //   RECEIPT_SIGNING_KEY  Ed25519 private key (PKCS#8 PEM) for receipts; default:
 //                        generated once and kept in .chorus/receipt-key.pem
 //   RECEIPT_KEY_ID       key ID shown on receipts (default derived from the key)
+//   CHORUS_ELECTION      "1" when several Chorus instances share a room (§78):
+//                        each announces itself; the lowest online ID speaks
 //
 // Flags:
 //   --after N            start after sequence N. Default: where the saved
@@ -95,6 +97,7 @@ const room: ChorusRoom = new ChorusRoom({
   signer,
   extractor: useClaude ? new ClaudeExtractor(claudeOpts) : new HeuristicExtractor(),
   fallbackExtractor: useClaude ? new HeuristicExtractor() : undefined,
+  election: env.CHORUS_ELECTION === "1",
   confirmer: useClaude ? new ClaudeConfirmer(claudeOpts) : new HeuristicConfirmer(),
   clock: new SystemClock(),
   config: { ...defaultConfig, mode },
