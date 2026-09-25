@@ -11,15 +11,16 @@
     "typecheck": "tsc --noEmit",
     "test": "node --disable-warning=ExperimentalWarning --import tsx --test \"tests/**/*.test.ts\"",
     "replay": "node --disable-warning=ExperimentalWarning --import tsx src/cli/replay.ts",
-    "start": "node --disable-warning=ExperimentalWarning --import tsx src/cli/live.ts"
+    "start": "node --disable-warning=ExperimentalWarning --import tsx src/cli/live.ts",
+    "bench": "node --disable-warning=ExperimentalWarning --import tsx scripts/bench.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.128.0",
+    "tsx": "^4.23.15",
     "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/node": "^22.20.4",
-    "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }
 }

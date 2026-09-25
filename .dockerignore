@@ -1,0 +1,7 @@
+node_modules
+.chorus
+.sharednet
+.git
+tests
+scripts
+docs

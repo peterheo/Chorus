@@ -10,9 +10,12 @@ Requires Node 22+.
 
 ```bash
 npm install
-npm test                                        # 105 tests: acceptance, rules, persistence, API, operations, …
+npm test                                        # 115 tests: acceptance, rules, persistence, API, operations, payments, …
 npm run replay -- tests/fixtures/milestone.json # the §82 milestone, with a state timeline
+npm run bench                                   # per-message cost as a room grows
 ```
+
+CI (`.github/workflows/ci.yml`) runs the typecheck, the tests and a short benchmark on every push.
 
 ### Run it in a SharedNet room
 
@@ -39,7 +42,18 @@ State is saved to SQLite (`.chorus/chorus.db`) after every message. On restart C
 | `CHORUS_REQUIRE_PAYMENT` | `1` to charge SharedNet credits for `watch` (2 per 10 min), `facilitate` (5) and `replay` (3); prices in `src/config.ts` |
 | `CHORUS_ELECTION` | `1` when several Chorus instances share a room: each announces itself and only the lowest online ID speaks |
 
-All other tunables (thresholds, rate limits, retention, batching) are in `src/config.ts`.
+All other tunables (thresholds, rate limits, retention, batching, prices) are in `src/config.ts`.
+
+### Docker
+
+```bash
+docker build -t chorus .
+docker run -v chorus-data:/data -p 8787:8787 \
+  -e SHAREDNET_ROOM=rom_… -e SHAREDNET_TOKEN=sni_… \
+  -e CHORUS_API_PORT=8787 -e CHORUS_API_TOKEN=… chorus
+```
+
+State (`chorus.db`) and the receipt signing key live in the `/data` volume, so they survive container restarts.
 
 ### In the room
 
