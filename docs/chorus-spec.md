@@ -3,8 +3,31 @@
 **Product name:** Chorus  
 **Category:** Agent-to-agent conversation coordination  
 **Primary environment:** SharedNet / SharedOS multi-agent rooms  
-**Document status:** Build-ready MVP specification  
+**Document status:** Build-ready MVP specification — revision 2  
 **Target:** Hackathon implementation with a path to production
+
+---
+
+## Revision 2 — Change Summary
+
+This revision resolves the gaps found in the v1 review. Key changes:
+
+| Area | Change | Sections |
+|---|---|---|
+| Claims | New `claim` event type and `Claim` object; conflicts are built from claims | 9.4, 10.7, 10.5, 22 |
+| Self-ingestion | Chorus never extracts from its own messages; they do not count as room activity | 11.1 |
+| Time-based rules | Per-room tick scheduler; injectable clock; unanswered threshold uses OR with a wall-clock fallback | 17.1, 19, 47, 72 |
+| Scope | Chorus only points to items already in room state — it never invents sub-tasks | 1, 18, 61 |
+| Requests | Targeted requests become Handoffs; untargeted requests become Questions (`kind: "request"`) | 9.4, 10.1, 12 |
+| Throughput | Two-phase processing (parallel extraction, serial apply), pre-filter, batching | 11.2 |
+| Schema | SQL aligned with the domain model; per-room short IDs; room-scoped agents; missing tables added | 33 |
+| Naming | LLM output is snake_case and mapped to camelCase; agent name/mention resolution defined | 12.1, 46 |
+| MVP scope | Completion check moved into MVP; handoff demo marked post-MVP; day-0 SharedNet spike | 44, 61, 75, 76, 82 |
+| State machines | Unblock transition, deadline-only expiry, handoff → commitment link, "optional" commitments | 10, 16, 25 |
+| Reliability | Processing markers, intervention idempotency keys, edit/delete handling | 35 |
+| Security | Feedback commands are permission-checked; receipts are signed; RFC 8785 canonical JSON | 54, 60, 63 |
+| LLM I/O | Structured output + one retry; duplicate detection is two-stage | 18, 40, 48 |
+| Stack | Hackathon profile: one process, no Redis required | 7 |
 
 ---
 
@@ -40,9 +63,11 @@ Agent B:
 I'll research the pricing too.
 
 Chorus:
-Agent A is already handling pricing.
-Agent B, the unresolved item is integration compatibility.
+Agent A is already handling pricing (C4).
+Agent B, Q9 "Is the integration compatible with v2?" is still unclaimed.
 ```
+
+Chorus only points to items that already exist in room state (open questions, unclaimed requests). It never invents sub-tasks.
 
 Another example:
 
@@ -119,8 +144,12 @@ Decisions
 ├── D7 → use Vendor X
 └── D8 → JSON output format
 
+Claims
+├── K5 → A: streaming supported
+└── K6 → B: streaming not supported
+
 Conflicts
-└── X2 → streaming capability disagreement
+└── X2 → streaming capability disagreement (K5 vs K6)
 
 Dependencies
 └── Agent C waiting on Agent A
@@ -144,6 +173,7 @@ Chorus should:
    - requests;
    - commitments;
    - handoffs;
+   - factual claims;
    - acknowledgements;
    - dependencies;
    - decisions.
@@ -189,6 +219,7 @@ The MVP should **not** attempt to:
 
 - manage Git repositories;
 - act as a general project-management platform;
+- decompose the room's goal into sub-tasks or suggest work that no participant has raised;
 - decide which agent is “best”;
 - score intelligence or competence;
 - arbitrate factual truth;
@@ -369,16 +400,23 @@ This separation is important because the system must remain debuggable.
 
 # 7. Recommended Technology Stack
 
-For a fast hackathon implementation:
+Two deployment profiles share the same interfaces (`RoomTransport`, `StateStore`, `JobQueue`, `Lock`):
+
+| Profile | Process layout | Storage | Queue / lock |
+|---|---|---|---|
+| **Hackathon** (default for the MVP) | one Node process (API + worker) | PostgreSQL, or SQLite via `better-sqlite3` | in-process queue; no lock needed |
+| **Production** | separate API and worker apps | PostgreSQL (+ `pgvector`) | Redis / BullMQ; per-room lock (§68) |
+
+Build against the interfaces so moving from hackathon to production is a configuration change, not a rewrite. Redis is **not required** for the MVP.
 
 ## Backend
 
 - **TypeScript**
 - **Node.js 22+**
 - **Fastify** or **Express**
-- **PostgreSQL**
-- **Redis**
-- **Zod** for runtime schemas
+- **PostgreSQL** (or SQLite in the hackathon profile)
+- **Redis** (production profile only)
+- **Zod v4** for runtime schemas (pin the major version; the examples below use the v4 API)
 - **Drizzle ORM** or **Prisma**
 - **Pino** for structured logging
 
@@ -395,6 +433,8 @@ Use an LLM only for:
 Do not let the LLM directly mutate room state.
 
 All LLM output must pass a deterministic schema validator.
+
+Request output through the provider's **structured output / tool-calling** mode rather than free-text JSON. On a schema failure, retry once with the validation error appended; if the retry also fails, record the message as `extraction_failed` (it produces no events) and continue. A malformed response must never stall the room's pipeline.
 
 ## Optional
 
@@ -423,6 +463,7 @@ chorus/
 │       │   ├── extract.ts
 │       │   ├── resolve.ts
 │       │   ├── rules.ts
+│       │   ├── tick.ts
 │       │   └── intervene.ts
 │       └── package.json
 │
@@ -460,6 +501,15 @@ chorus/
 
 Chorus should model the room explicitly.
 
+### Identifiers
+
+Every state object has two identifiers:
+
+- `id` — a UUID, used internally and as the database primary key;
+- `shortId` — a per-room, per-type human label (`Q17`, `C4`, `H3`, `D2`, `X3`, `K9` for claims, `P1` for dependencies), allocated from a per-room counter.
+
+Interventions, commands, the API and receipts show `shortId`. The API accepts either.
+
 ## 9.1 Room
 
 ```ts
@@ -469,6 +519,7 @@ interface Room {
   createdAt: string;
   status: "active" | "closing" | "closed";
   lastMessageSeq: number;
+  chorusAgentId: string; // Chorus's own identity in this room (see §11.1)
 }
 ```
 
@@ -476,11 +527,15 @@ interface Room {
 
 ## 9.2 Agent
 
+Agents are **room-scoped**. The same external agent in two rooms is two `Agent` rows, which matches the privacy rule in §65.
+
 ```ts
 interface Agent {
   id: string;
+  roomId: string;
   externalAgentId: string;
   displayName?: string;
+  aliases: string[]; // names/handles the agent is addressed by in this room
   firstSeenAt: string;
   lastSeenAt: string;
   presence:
@@ -512,6 +567,10 @@ interface Message {
   replyToMessageId?: string;
   contentHash: string;
   metadata: Record<string, unknown>;
+  isFromChorus: boolean;
+  editedAt?: string;
+  deletedAt?: string;
+  processedAt?: string; // set once state has been applied (§35)
 }
 ```
 
@@ -533,6 +592,7 @@ type InteractionEventType =
   | "dependency"
   | "status_update"
   | "completion"
+  | "claim"
   | "disagreement"
   | "correction"
   | "withdrawal";
@@ -550,16 +610,43 @@ interface InteractionEvent {
 }
 ```
 
+### Event type notes
+
+- **`claim`** — a factual assertion about the world ("Refunds are supported."), whether or not it answers a question. Claims are what conflict detection compares (§22). An `answer` that asserts a fact produces **both** an `answer` and a `claim` event.
+- **`request`** — the state engine maps a request to an existing object type; there is no separate Request object:
+  - a request with a **named target agent** ("B, check X", "B, please take over X") → a **Handoff** (§10.3);
+  - a request with **no target** ("Can someone check X?") → a **Question** with `kind: "request"` (§10.1).
+- **`handoff`** is kept as an event type for explicit transfers of existing work ("B, take over my C4"); it links the handoff to the transferred commitment.
+
 ---
 
 # 10. Core Objects
 
-## 10.1 Question
+## 10.0 Common fields
+
+Every core object below also carries:
 
 ```ts
-interface Question {
-  id: string;
+interface Provenance {
+  id: string;               // UUID
+  shortId: string;          // per-room label, e.g. "Q17" (§9)
   roomId: string;
+  createdAt: string;
+  updatedAt: string;
+  derivedFromMessageIds: string[];  // every message that created or changed this object
+  extractorConfidence: number;      // confidence of the event that created it
+}
+```
+
+The interfaces below list only type-specific fields.
+
+## 10.1 Question
+
+Also represents **untargeted requests** ("Can someone check X?") with `kind: "request"`.
+
+```ts
+interface Question extends Provenance {
+  kind: "question" | "request";
   sourceMessageId: string;
   askerAgentId: string;
   targetAgentIds: string[];
@@ -567,13 +654,13 @@ interface Question {
 
   status:
     | "open"
-    | "acknowledged"
+    | "acknowledged"   // someone said they will answer; still counts as open (§25)
     | "answered"
     | "superseded"
     | "withdrawn";
 
   answerMessageIds: string[];
-  createdAt: string;
+  claimedByCommitmentId?: string; // a request someone took on (§18 uses this)
   resolvedAt?: string;
 }
 ```
@@ -583,25 +670,25 @@ interface Question {
 ## 10.2 Commitment
 
 ```ts
-interface Commitment {
-  id: string;
-  roomId: string;
+interface Commitment extends Provenance {
   ownerAgentId: string;
   sourceMessageId: string;
 
   action: string;
 
   status:
-    | "proposed"
-    | "accepted"
-    | "in_progress"
+    | "proposed"     // conditional or tentative offer: "If nobody else can, I could check later."
+    | "accepted"     // a proposed commitment or handoff the owner confirmed, not yet started
+    | "in_progress"  // "I'll do X" / "Checking X now"
     | "completed"
     | "blocked"
     | "cancelled"
-    | "expired";
+    | "expired";    // only when an explicit deadline passed (§16.2)
 
-  deadline?: string;
-  dependsOn: string[];
+  optional: boolean;          // true for proposed/conditional offers; excluded from completion (§25)
+  deadline?: string;          // only if stated in the room
+  dependsOn: string[];        // Dependency ids
+  fromHandoffId?: string;     // set when created by accepting a handoff (§16.3)
   completionMessageId?: string;
 }
 ```
@@ -610,25 +697,27 @@ interface Commitment {
 
 ## 10.3 Handoff
 
-```ts
-interface Handoff {
-  id: string;
-  roomId: string;
+Also represents **targeted requests** ("B, check X").
 
+```ts
+interface Handoff extends Provenance {
   fromAgentId: string;
   toAgentId: string;
 
   action: string;
   sourceMessageId: string;
+  transfersCommitmentId?: string; // "B, take over my C4"
 
   status:
     | "pending"
     | "accepted"
     | "declined"
     | "completed"
+    | "cancelled"
     | "expired";
 
   acknowledgementMessageId?: string;
+  resultingCommitmentId?: string; // commitment created on acceptance (§16.3)
 }
 ```
 
@@ -637,9 +726,7 @@ interface Handoff {
 ## 10.4 Decision
 
 ```ts
-interface Decision {
-  id: string;
-  roomId: string;
+interface Decision extends Provenance {
   canonicalStatement: string;
   sourceMessageIds: string[];
 
@@ -656,24 +743,13 @@ interface Decision {
 
 ## 10.5 Conflict
 
-```ts
-interface Conflict {
-  id: string;
-  roomId: string;
+A conflict groups **all** incompatible claims on one subject, so three agents who disagree produce one conflict, not three pairs.
 
+```ts
+interface Conflict extends Provenance {
   subject: string;
 
-  claimA: {
-    agentId: string;
-    messageId: string;
-    claim: string;
-  };
-
-  claimB: {
-    agentId: string;
-    messageId: string;
-    claim: string;
-  };
+  claimIds: string[];   // >= 2 Claim ids with incompatible positions
 
   status:
     | "candidate"
@@ -682,18 +758,18 @@ interface Conflict {
     | "dismissed";
 
   resolutionMessageIds: string[];
+  resolvedByClaimId?: string; // the claim the room settled on, if any
 }
 ```
+
+A new claim that is incompatible with an existing unresolved conflict's subject is **added** to that conflict instead of creating a new one.
 
 ---
 
 ## 10.6 Dependency
 
 ```ts
-interface Dependency {
-  id: string;
-  roomId: string;
-
+interface Dependency extends Provenance {
   blockedAgentId: string;
   blockingObjectType:
     | "question"
@@ -712,22 +788,70 @@ interface Dependency {
 
 ---
 
+## 10.7 Claim
+
+A factual assertion made in the room. Claims are the input to conflict detection (§22) and the repeated-question rule (§23).
+
+```ts
+interface Claim extends Provenance {
+  agentId: string;
+  messageId: string;
+
+  subject: string;        // "refund support"
+  predicate: string;      // "supported"
+  polarity: "positive" | "negative";
+  conditions: string[];   // ["within first 24 hours", "prepaid plans"]; [] if unconditional
+  hedged: boolean;        // "I think…", "probably…"
+
+  status: "active" | "retracted" | "superseded";
+  answersQuestionId?: string;
+}
+```
+
+Two claims on the same subject with opposite polarity are **candidate** conflicts only when their `conditions` overlap or either list is empty. Hedged claims can form candidates but are never auto-confirmed (§22).
+
+---
+
 # 11. Message Processing Pipeline
 
 For every inbound message:
 
 ```text
 1. Receive
-2. Normalize
-3. Persist raw message
-4. Extract interaction events
-5. Resolve references
-6. Update state
-7. Evaluate coordination rules
-8. Score intervention candidates
-9. Maybe post an intervention
-10. Persist intervention + evidence
+2. Normalize (resolve author, detect Chorus's own messages)
+3. Persist raw message (idempotent, §35)
+4. Pre-filter
+5. Extract interaction events
+6. Resolve references
+7. Update state
+8. Evaluate coordination rules
+9. Score intervention candidates
+10. Maybe post an intervention
+11. Persist intervention + evidence; mark message processed
 ```
+
+Time-based rules also run on a per-room **tick** with no inbound message (§17.1).
+
+## 11.1 Chorus's own messages
+
+Chorus's messages come back through the transport like any other message. They are:
+
+- **persisted** (for audit and for `@chorus` command replies);
+- **never extracted** — they produce no interaction events, claims or questions;
+- **not counted** as room activity — they are excluded from every message-count threshold (§19, §20, §26) and from `age_messages`.
+
+Detection: compare the author with `room.chorusAgentId`. When the transport returns the external message ID from `sendMessage`, also record it so the echo can be matched even if author metadata is missing.
+
+## 11.2 Throughput model
+
+Extraction takes current room state as input, so a naïve implementation processes one message at a time per room. At ~2 s per LLM call, any room busier than ~0.5 messages/second builds an unbounded backlog. Use a two-phase model:
+
+1. **Pre-filter (no LLM).** Skip extraction for messages that cannot carry an obligation: very short acknowledgements ("ok", "thanks", "👍") that do not reply to a pending handoff, and `@chorus` commands. Pure acknowledgements that *do* reply to something are handled by a deterministic rule.
+2. **Parallel extraction.** Extract each message concurrently against a state snapshot that is at most a few messages stale. Extraction output refers to objects by `shortId` and text, not by position.
+3. **Serial apply.** A single per-room applier consumes extraction results **in sequence order** and re-runs reference resolution (§14) against the current state before applying. Stale references that no longer resolve fall back to "unresolved".
+4. **Batching under load.** When the per-room backlog exceeds a threshold (default 5 messages), extract the backlog in one LLM call that returns events per message.
+
+Track `extraction_backlog` per room as a metric (§59).
 
 ---
 
@@ -739,11 +863,14 @@ The extractor receives:
 - author;
 - reply target;
 - last N relevant messages;
-- current structured state.
+- current structured state (open objects by `shortId`);
+- the room roster: each agent's display name and aliases (§12.1).
 
-It returns strict JSON.
+It returns output that matches a strict schema, requested through structured output / tool calling (§7).
 
-Example schema:
+**The LLM output uses snake_case field names.** The Zod schema in §46 validates this snake_case shape exactly; a separate mapping step converts it to the camelCase domain types. Never validate LLM output directly against the camelCase domain interfaces.
+
+Example output:
 
 ```json
 {
@@ -752,58 +879,60 @@ Example schema:
       "type": "commitment",
       "confidence": 0.96,
       "target_agents": [],
+      "references": [],
       "payload": {
         "action": "check refund support",
-        "deadline": null
+        "deadline": null,
+        "conditional": false
+      }
+    },
+    {
+      "type": "claim",
+      "confidence": 0.93,
+      "target_agents": [],
+      "references": ["Q17"],
+      "payload": {
+        "subject": "refund support",
+        "predicate": "supported",
+        "polarity": "positive",
+        "conditions": ["first 24 hours"],
+        "hedged": false
       }
     }
   ]
 }
 ```
 
-## Required extraction rules
+`target_agents` contains **names exactly as written in the message** ("Verifier", "@research_b", "B"). The extractor never produces agent IDs. `references` contains `shortId`s or free-text referents ("that", "the pricing issue") that §14 resolves.
+
+## 12.1 Agent name resolution
+
+The state engine maps each `target_agents` entry to an `Agent` of the current room:
+
+1. exact match on `externalAgentId` or an `@mention` token from transport metadata;
+2. case-insensitive exact match on `displayName` or any alias;
+3. unique prefix match on `displayName` (e.g. "Research" → only if exactly one agent starts with it);
+4. otherwise unresolved — the event is kept, but targeted rules (§20) do not fire for it.
+
+Aliases are learned only from explicit evidence: the transport's display name, or an agent self-identifying ("I'm the verifier").
+
+## 12.2 Required extraction rules
 
 The model should distinguish:
 
-```text
-"I can check X"
-```
-
-from:
-
-```text
-"I'll check X"
-```
-
-The first is capability.
-
-The second is a commitment.
-
-Likewise:
-
-```text
-"Can B check X?"
-```
-
-is a request.
-
-```text
-"B, check X."
-```
-
-is an assignment/request.
-
-```text
-"Checking X now."
-```
-
-is an in-progress status.
-
-```text
-"Checked X. It works."
-```
-
-is both completion and answer.
+| Message | Events |
+|---|---|
+| "I can check X" | none — capability, not commitment |
+| "If nobody else can do it, I could check later." | `commitment` with `conditional: true` → `proposed`, `optional` |
+| "I'll check X" | `commitment` → `in_progress` |
+| "Can someone check X?" | `request` with no target → Question `kind: "request"` |
+| "Can B check X?" / "B, check X." | `request` targeting B → Handoff |
+| "B, take over my C4." | `handoff` with `transfers: C4` |
+| "Checking X now." | `status_update` (in progress) |
+| "Checked X. It works." | `completion` + `answer` (if a matching question is open) + `claim` |
+| "Refunds are supported." | `claim` (+ `answer` if it resolves an open question) |
+| "I think refunds are supported." | `claim` with `hedged: true` |
+| "A said refunds are supported." | none — reported speech is not the author's claim |
 
 ---
 
@@ -822,7 +951,8 @@ Do not infer:
 - hidden intent;
 - future commitments from mere capability;
 - task completion from silence;
-- acknowledgements from unrelated replies.
+- acknowledgements from unrelated replies;
+- claims from quoted or reported speech.
 
 Allowed event types:
 question
@@ -835,14 +965,16 @@ decision
 dependency
 status_update
 completion
+claim
 disagreement
 correction
 withdrawal
 
-Return valid JSON only.
+Refer to agents by the names used in the message.
+Refer to existing objects by their short IDs when you can.
 ```
 
-Then include the structured schemas.
+Then include the structured schemas and the room content, serialized as data (§64).
 
 ---
 
@@ -862,12 +994,13 @@ Chorus needs a resolver.
 
 Resolution order:
 
-1. explicit reply reference;
-2. explicit agent mention;
-3. exact topic match;
-4. semantic similarity to recent open objects;
-5. unresolved object recency;
-6. otherwise leave unresolved.
+1. explicit `shortId` ("Q17") in the message;
+2. explicit reply reference;
+3. explicit agent mention (§12.1) combined with that agent's open objects;
+4. exact topic match;
+5. semantic similarity to recent open objects;
+6. unresolved object recency;
+7. otherwise leave unresolved.
 
 Never force a low-confidence match.
 
@@ -881,7 +1014,7 @@ Example:
 }
 ```
 
-If confidence < configured threshold:
+If confidence < `thresholds.reference_resolution` (default 0.80):
 
 ```json
 {
@@ -909,14 +1042,16 @@ answer
 question(answered)
 ```
 
-A message classified as an answer should not automatically resolve a question unless:
+A message classified as an answer resolves a question only when one of these holds:
 
-- the answer points to the question directly; or
-- semantic relevance exceeds the threshold.
+- the answer resolves to the question via steps 1–3 of §14 (short ID, reply, or mention); **or**
+- the answer's embedding similarity to the question is ≥ `thresholds.answer_relevance` (default 0.80) **and** no other open question scores within 0.05 of it (otherwise the match is ambiguous and the question stays open).
 
 ---
 
 # 16. State Machines
+
+Transitions not shown are rejected by the state engine and logged.
 
 ## 16.1 Question
 
@@ -926,39 +1061,43 @@ OPEN
  ├── valid answer ───→ ANSWERED
  ├── replacement ────→ SUPERSEDED
  └── withdrawal ─────→ WITHDRAWN
+
+ACKNOWLEDGED
+ ├── valid answer ───→ ANSWERED
+ ├── replacement ────→ SUPERSEDED
+ └── withdrawal ─────→ WITHDRAWN
 ```
+
+ACKNOWLEDGED still counts as open for the completion check (§25) and stays eligible for the unanswered rule (§19), with its message-count clock restarted at the acknowledgement.
 
 ---
 
 ## 16.2 Commitment
 
 ```text
-PROPOSED
-   ↓
-ACCEPTED
-   ↓
+PROPOSED   (conditional/tentative offer; optional = true)
+ ├── owner confirms ─→ ACCEPTED or IN_PROGRESS
+ └── withdrawal ─────→ CANCELLED
+
+ACCEPTED   (confirmed, not started)
+ ├── start ──────────→ IN_PROGRESS
+ └── cancel ─────────→ CANCELLED
+
 IN_PROGRESS
-  ├── completion → COMPLETED
-  ├── blocker ───→ BLOCKED
-  ├── cancel ────→ CANCELLED
-  └── timeout ───→ EXPIRED
+ ├── completion ─────→ COMPLETED
+ ├── blocker ────────→ BLOCKED
+ ├── cancel ─────────→ CANCELLED
+ └── deadline passed → EXPIRED
+
+BLOCKED
+ ├── dependency resolved / owner resumes → IN_PROGRESS
+ ├── cancel ─────────→ CANCELLED
+ └── deadline passed → EXPIRED
 ```
 
-Not every commitment requires all intermediate states.
+Not every commitment requires all intermediate states. "I'll do X." directly creates IN_PROGRESS.
 
-For example:
-
-```text
-"I'll do X."
-```
-
-may directly create:
-
-```text
-IN_PROGRESS
-```
-
-depending on phrasing.
+**EXPIRED is set only when an explicit `deadline` stated in the room has passed.** Commitments without a deadline never expire automatically; the stale-commitment rule (§21) surfaces them instead. When a commitment is confirmed, `optional` becomes `false`.
 
 ---
 
@@ -968,12 +1107,19 @@ depending on phrasing.
 PENDING
  ├── acknowledge → ACCEPTED
  ├── decline ────→ DECLINED
- └── timeout ────→ EXPIRED
+ ├── cancel ─────→ CANCELLED   (sender withdraws)
+ └── deadline passed → EXPIRED
 
 ACCEPTED
  ├── completion → COMPLETED
- └── cancel ────→ DECLINED
+ └── cancel ────→ CANCELLED
 ```
+
+**Handoff → commitment link.** When a handoff is ACCEPTED, the state engine creates a Commitment owned by the recipient (`fromHandoffId` set, status IN_PROGRESS) and stores it as `resultingCommitmentId`. From then on, **the commitment is the live object**: completion, blocking and staleness are tracked on the commitment, and the handoff mirrors its terminal state (commitment COMPLETED → handoff COMPLETED; commitment CANCELLED → handoff CANCELLED). Count the work once: counts and the completion check use the commitment, not the accepted handoff.
+
+If the handoff transfers an existing commitment (`transfersCommitmentId`), acceptance cancels the original with reason `transferred`.
+
+Like commitments, handoffs expire only when an explicit deadline passes. Otherwise the missing-acknowledgement rule (§20) handles them.
 
 ---
 
@@ -985,7 +1131,7 @@ The rule engine consumes current state and emits `InterventionCandidate` objects
 interface InterventionCandidate {
   id: string;
   roomId: string;
-  type: string;
+  type: InterventionType; // §27
 
   severity: "low" | "medium" | "high";
 
@@ -993,13 +1139,40 @@ interface InterventionCandidate {
   relatedObjectIds: string[];
   evidenceMessageIds: string[];
 
-  confidence: number;
-  urgency: number;
-  expectedValue: number;
+  confidence: number;    // 0..1
+  urgency: number;       // 0..1
+  expectedValue: number; // 0..1 — rule's estimate of benefit; used in §26 scoring
 
+  idempotencyKey: string; // type + sorted relatedObjectIds; used for dedup (§26, §35)
   createdAt: string;
 }
 ```
+
+## 17.1 Rule triggers and the tick scheduler
+
+Rules are evaluated by two triggers:
+
+| Trigger | When | Rules |
+|---|---|---|
+| **State change** | after each applied message | duplicate work, conflict, repeated question, dependency resolved, decision reminder |
+| **Tick** | every `tick_seconds` (default 15 s) per active room, even if no message arrives | unanswered question, missing acknowledgement, stale commitment, deadline expiry |
+
+```ts
+interface CoordinationRule {
+  id: string;
+  trigger: "state_change" | "tick" | "both";
+  evaluate(state: RoomState, ctx: RuleContext): InterventionCandidate[];
+}
+
+interface RuleContext {
+  now: Date;              // from an injected Clock, never Date.now() directly
+  event?: RoomStateEvent; // present for state_change triggers
+}
+```
+
+All time comes from an injected `Clock`. Live mode uses the system clock; replay mode (§47, §58) uses a **virtual clock** that advances to each fixture message's timestamp and can be advanced explicitly between messages. Ticks in replay are simulated at every virtual `tick_seconds` boundary.
+
+In the hackathon profile, the tick is a `setInterval` in the single process. In production, it is a repeatable job per active room.
 
 ---
 
@@ -1007,47 +1180,47 @@ interface InterventionCandidate {
 
 Trigger when:
 
-1. two active commitments exist;
+1. two active (non-optional) commitments exist;
 2. owned by different agents;
-3. semantic similarity exceeds threshold;
+3. they are confirmed as the same work by the two-stage check below;
 4. neither commitment explicitly represents collaboration;
 5. both are unresolved.
+
+Duplicate detection is **two-stage**, like conflict detection. A cosine threshold alone depends too much on the embedding model: short phrases such as "check pricing" and "check authentication" can score close together.
+
+**Stage 1 — candidates (cheap):** cosine similarity ≥ `thresholds.duplicate_candidate` (default 0.75; tune per embedding model on replay data).
+
+**Stage 2 — confirmation (LLM):** ask "Would completing commitment A also accomplish commitment B, or substantially overlap it?" and accept `same | overlapping | different`. Only `same` or `overlapping` with confidence ≥ `thresholds.duplicate_confirm` (default 0.85) creates a candidate.
 
 Pseudo-code:
 
 ```ts
 if (
   a.ownerAgentId !== b.ownerAgentId &&
-  isActive(a) &&
-  isActive(b) &&
-  cosineSimilarity(a.embedding, b.embedding) >= DUPLICATE_THRESHOLD &&
-  !linkedAsCollaboration(a, b)
+  isActive(a) && isActive(b) &&
+  !a.optional && !b.optional &&
+  cosineSimilarity(a.embedding, b.embedding) >= DUPLICATE_CANDIDATE &&
+  !linkedAsCollaboration(a, b) &&
+  (await confirmDuplicate(a, b)).confidence >= DUPLICATE_CONFIRM
 ) {
   createCandidate("duplicate_work");
 }
 ```
-
-Suggested initial threshold:
-
-```text
-0.87
-```
-
-But use task-specific evaluation.
 
 Intervention:
 
 ```text
 Potential duplicate effort:
 
-Agent A: checking refund behavior
-Agent B: checking refund support
+A → C4 checking refund behavior
+B → C5 checking refund support
 
-Agent A started first.
+A started first.
 
-Unresolved nearby item:
-payment timeout behavior
+Still unclaimed: Q9 — What is the payment timeout behavior?
 ```
+
+The "still unclaimed" line is included **only** if an open Question (`kind: "request"` or `"question"`) with no `claimedByCommitmentId` exists in room state. Pick the oldest one, or the one most similar to B's commitment. If none exists, omit the line. Chorus never invents work (§4).
 
 Do not automatically reassign B.
 
@@ -1055,26 +1228,24 @@ Do not automatically reassign B.
 
 # 19. Rule: Unanswered Question
 
-Trigger when:
+Trigger (tick-evaluated) when:
 
 ```text
-question.status == open
-AND age > unanswered_threshold
+question.status IN (open, acknowledged)
 AND no qualifying response
-```
-
-Threshold should depend on message activity rather than wall-clock time alone.
-
-Recommended:
-
-```text
-max(
-  90 seconds,
-  12 room messages
+AND (
+      subsequent_room_messages >= min_subsequent_messages   (default 12)
+   OR age_seconds >= max_wait_seconds                        (default 300)
 )
+AND age_seconds >= min_seconds                               (default 30)
 ```
 
-In high-volume rooms, message-count thresholds are more useful than time.
+- `subsequent_room_messages` excludes Chorus's own messages (§11.1).
+- The **message-count** condition is the main trigger in busy rooms.
+- The **wall-clock fallback** (`max_wait_seconds`) makes sure questions in quiet rooms are still surfaced.
+- The **floor** (`min_seconds`) stops a burst of messages from surfacing a question seconds after it was asked.
+
+Each question is surfaced at most once per `resurface_cooldown_messages` (default 20).
 
 ---
 
@@ -1084,9 +1255,9 @@ Trigger when:
 
 ```text
 handoff.status == pending
-AND sufficient subsequent activity exists
-AND target agent has posted messages
-AND none acknowledge the handoff
+AND handoff.toAgentId is resolved (§12.1)
+AND target agent has posted >= 3 messages since the handoff (Chorus messages excluded)
+AND none acknowledge or decline the handoff
 ```
 
 This is stronger than merely waiting N seconds.
@@ -1106,41 +1277,41 @@ Now Chorus has evidence the handoff may have been missed.
 
 A stale commitment should not mean “agent took too long.”
 
-Instead use multiple signals.
-
-Example score:
+Instead use multiple signals, each normalized to 0..1:
 
 ```text
 stale_score =
-    0.35 * normalized_age
-  + 0.25 * room_activity_since_commitment
-  + 0.20 * owner_activity_without_update
-  + 0.20 * blocked_dependents
+    0.35 * min(age_seconds / stale_age_ref_seconds, 1)            (ref default 600)
+  + 0.25 * min(room_messages_since / stale_room_ref_messages, 1)  (ref default 30)
+  + 0.20 * min(owner_messages_without_update / 5, 1)
+  + 0.20 * min(blocked_dependents / 2, 1)
 ```
 
-Intervene only above threshold.
+Tick-evaluated. Intervene only when `stale_score ≥ thresholds.stale` (default 0.7). Optional commitments are skipped.
 
 ---
 
 # 22. Rule: Conflict Detection
 
-Use a two-stage approach.
+Conflicts are detected between **claims** (§10.7), not raw messages. Use a two-stage approach.
 
-## Stage 1 — candidate generation
+## Stage 1 — candidate generation (deterministic + embeddings)
 
-Embedding/topic similarity:
+For each new active claim `k`, find existing active claims `j` from a **different agent** where:
 
 ```text
-same topic
-+
-opposing polarity / incompatible predicates
+similarity(k.subject, j.subject) >= thresholds.conflict_subject   (default 0.85)
+AND (k.polarity != j.polarity OR predicates are incompatible)
+AND conditions overlap (either list empty, or the LLM judges them overlapping)
 ```
+
+If an unresolved conflict already exists for the subject, add `k` to it (§10.5) rather than creating a new one.
 
 Example:
 
 ```text
-A: refunds are supported
-B: refunds are not supported
+A: refunds are supported           → K1 {subject: refund support, polarity: +, conditions: []}
+B: refunds are not supported       → K2 {subject: refund support, polarity: −, conditions: []}
 ```
 
 ## Stage 2 — LLM confirmation
@@ -1155,18 +1326,22 @@ Return:
 
 ```json
 {
-  "conflict": true,
+  "verdict": "conflict",
   "subject": "refund support",
   "reason": "direct contradiction",
   "confidence": 0.97
 }
 ```
 
-The model must be allowed to return:
+`verdict` is one of `conflict | not_conflict | unclear`.
 
-```text
-not_conflict
-```
+Status assignment:
+
+| Stage 2 result | Conflict status |
+|---|---|
+| `conflict`, confidence ≥ `thresholds.conflict_confidence` (0.90), neither claim hedged | `confirmed` |
+| `conflict` below threshold, or either claim hedged | `candidate` (not announced unsolicited) |
+| `not_conflict` / `unclear` | no conflict stored |
 
 Examples that should **not** be treated as conflicts:
 
@@ -1175,6 +1350,10 @@ A: refunds are supported for prepaid plans.
 B: refunds are not supported for monthly plans.
 ```
 
+(disjoint `conditions`, so Stage 1 never pairs them.)
+
+**Resolution:** a conflict becomes `resolved` when (a) one claimant retracts or corrects their claim (`correction` / `withdrawal`), (b) a later claim from any agent explicitly settles the subject and is not itself contested, or (c) an agent issues `@chorus resolved X3` (§60). It becomes `dismissed` via `@chorus wrong X3`.
+
 ---
 
 # 23. Rule: Repeated Question
@@ -1182,8 +1361,9 @@ B: refunds are not supported for monthly plans.
 If a new question is semantically equivalent to an answered historical question:
 
 ```text
-Q33 ≈ Q12
+similarity(Q33, Q12) >= thresholds.repeated_question   (default 0.90)
 AND Q12.status == answered
+AND Q12's answering claims are not part of an unresolved conflict
 ```
 
 Chorus can reply:
@@ -1191,14 +1371,31 @@ Chorus can reply:
 ```text
 This appears to match Q12, which was previously answered.
 
-Answer:
-...
+Answer (B, #124): Refunds are supported within 24 hours.
 
-Source messages:
-#118, #124
+Source messages: #118, #124
 ```
 
+The answer text is taken from the claims linked to Q12 (`answersQuestionId`), quoted with their author and message number. Chorus does not paraphrase an answer into a new assertion. If Q12's answer is contested, the rule does not fire. The conflict rule covers that case.
+
 This is one of the highest-value low-risk interventions.
+
+## 23.1 Rule: Decision Reminder
+
+Trigger when a new claim, question or commitment directly contradicts or reopens an **active** decision:
+
+```text
+similarity(new_object, decision.canonicalStatement) >= thresholds.decision_match   (default 0.85)
+AND LLM check: "Does this message propose something incompatible with decision D?" == yes (confidence >= 0.85)
+AND the message does not explicitly reopen the decision ("let's revisit D2")
+```
+
+```text
+Note: this differs from D2 — "Output format = JSON" (decided at #88).
+Reply "@chorus reopen D2" if the room is revisiting it.
+```
+
+An explicit reopen moves the decision to `reopened` and does not trigger a reminder.
 
 ---
 
@@ -1207,15 +1404,17 @@ This is one of the highest-value low-risk interventions.
 Suppose:
 
 ```text
-Agent C is waiting on C12.
+Agent C is waiting on C12 (dependency P3).
 ```
 
 When C12 completes:
 
 ```text
 Chorus:
-Agent C — the dependency you were waiting on is now resolved.
+Agent C — P3 is resolved: C12 "verify endpoint" was completed by A at #240.
 ```
+
+If C's own commitment was BLOCKED on P3, it returns to IN_PROGRESS (§16.2).
 
 This prevents unnecessary polling.
 
@@ -1223,16 +1422,35 @@ This prevents unnecessary polling.
 
 # 25. Rule: Completion Check
 
-A room can be considered coordination-complete when:
+A room is **coordination-complete** when:
 
 ```text
-open_questions == 0
-pending_handoffs == 0
-active_required_commitments == 0
-confirmed_conflicts == 0
+questions with status IN (open, acknowledged)                 == 0
+handoffs with status == pending                               == 0
+commitments with status IN (accepted, in_progress, blocked)
+  AND optional == false                                       == 0
+conflicts with status == confirmed                            == 0
 ```
 
-But Chorus should distinguish:
+Definitions:
+
+- **Required vs optional commitments.** Every commitment is required unless `optional == true`. `optional` is set only for PROPOSED (conditional or tentative) offers (§16.2). Optional items are listed as "optional follow-ups" and do not block completion.
+- **Accepted handoffs** are not counted separately. Their resulting commitment is counted (§16.3).
+- **Candidate conflicts** (unconfirmed) are listed as warnings and do not block completion.
+
+Output:
+
+```text
+READY TO CLOSE
+
+0 open questions
+0 pending handoffs
+0 unresolved conflicts
+0 required active commitments
+1 optional follow-up: C9 (B) "could re-check pricing later"
+```
+
+Chorus should distinguish:
 
 ```text
 COORDINATION COMPLETE
@@ -1246,6 +1464,8 @@ TASK SUCCESS
 
 Chorus cannot know whether the domain task itself is objectively correct.
 
+The completion check runs on `@chorus close-check` and in the `room.ready_to_close` event (§32). In **facilitate** mode, Chorus may also post **one** unsolicited "READY TO CLOSE" message the first time the room transitions to complete after at least one obligation existed. The message is not repeated.
+
 ---
 
 # 26. Intervention Policy
@@ -1254,58 +1474,61 @@ The most important product constraint:
 
 > Chorus must not become spam.
 
-Every intervention candidate receives a score.
+Every intervention candidate receives a score in 0..1:
 
 ```text
 score =
-  severity_weight
-+ urgency_weight
-+ confidence_weight
-+ blocked_agents_weight
-- recent_chorus_messages_penalty
-- duplicate_intervention_penalty
-- low_consequence_penalty
+    0.30 * severity            (low 0.2, medium 0.5, high 1.0)
+  + 0.20 * urgency
+  + 0.20 * confidence
+  + 0.15 * expectedValue
+  + 0.15 * min(blocked_agents / 3, 1)
+  - 0.10 * chorus_messages_in_last_10_room_messages
+  - 1.00 * (same idempotencyKey posted within cooldown)   // hard dedup
 ```
 
-Only intervene above a threshold.
+Post when `score ≥ interventions.min_score` (default 0.55; tune on replay data).
 
-Recommended limits:
+Recommended limits (Chorus's own messages and command replies do not count as room messages):
 
 ```text
 max 1 unsolicited Chorus message per 8 room messages
 max 3 unsolicited Chorus messages per 5 minutes
 ```
 
-High-severity events may bypass the first limit:
+High-severity events may bypass the **first** limit, never the second:
 
-- direct contradictory commitments;
-- explicit dependency deadlock;
-- unresolved handoff blocking multiple agents.
+- a confirmed conflict between two commitments that cannot both be done;
+- explicit dependency deadlock (a cycle in `Dependency`);
+- a pending handoff that ≥ 2 agents are blocked on.
+
+Replies to explicit `@chorus` commands are **solicited**. They are exempt from both limits and never count toward them.
 
 ---
 
 # 27. Intervention Types
 
-Chorus should support:
+Each type has exactly one rule that produces it:
 
-```text
-duplicate_work
-unanswered_question
-missing_acknowledgement
-stale_commitment
-conflict_detected
-dependency_resolved
-repeated_question
-decision_reminder
-completion_check
-context_request
-```
+| Type | Rule | Trigger |
+|---|---|---|
+| `duplicate_work` | §18 | state change |
+| `unanswered_question` | §19 | tick |
+| `missing_acknowledgement` | §20 | tick |
+| `stale_commitment` | §21 | tick |
+| `conflict_detected` | §22 | state change |
+| `repeated_question` | §23 | state change |
+| `decision_reminder` | §23.1 | state change |
+| `dependency_resolved` | §24 | state change |
+| `completion_check` | §25 | state change (facilitate mode only, once) |
+
+v1's `context_request` has been removed: no rule defined it.
 
 ---
 
 # 28. Intervention Format
 
-Messages should be concise.
+Messages should be concise. Every unsolicited intervention **must** cite at least one source message number (`#N`) and use short IDs.
 
 Bad:
 
@@ -1319,8 +1542,8 @@ Good:
 ```text
 Potential duplicate work:
 
-A → checking refund support
-B → checking refund behavior
+A → C4 checking refund support (#12)
+B → C5 checking refund behavior (#14)
 
 A began first.
 ```
@@ -1328,7 +1551,7 @@ A began first.
 For conflicts:
 
 ```text
-Unresolved conflict: streaming support
+Unresolved conflict X2: streaming support
 
 A (#182): supported
 B (#196): unsupported
@@ -1346,24 +1569,26 @@ Q17 — Does the seller support refunds?
 Asked by A at #211.
 ```
 
+Interventions are generated from **templates** filled with state fields. An LLM may rephrase the connecting text but never the quoted claims, IDs or message numbers. Those fields are checked against the template output after generation.
+
 ---
 
 # 29. Chorus Commands
 
-Agents should be able to query Chorus explicitly.
+Agents can query Chorus explicitly. Commands are parsed deterministically and do not need an LLM.
 
-Recommended commands:
-
-```text
-@chorus status
-@chorus open
-@chorus decisions
-@chorus commitments
-@chorus conflicts
-@chorus what-am-i-waiting-on
-@chorus what-needs-attention
-@chorus close-check
-```
+| Command | Machine action | Phase | Tier |
+|---|---|---|---|
+| `@chorus status` | `chorus.status` | MVP | free |
+| `@chorus open` | `chorus.open` | MVP | free |
+| `@chorus conflicts` | `chorus.conflicts` | MVP | free |
+| `@chorus commitments` | `chorus.commitments` | MVP | free |
+| `@chorus close-check` | `chorus.close_check` | MVP | free |
+| `@chorus decisions` | `chorus.decisions` | post-MVP | free |
+| `@chorus what-needs-attention` | `chorus.attention` | post-MVP | free |
+| `@chorus what-am-i-waiting-on` | `chorus.waiting_on` | post-MVP (needs dependencies) | free |
+| `@chorus mode observe\|assist\|facilitate` | `chorus.mode` | MVP | — |
+| feedback commands | see §60 | MVP | — |
 
 Machine equivalent:
 
@@ -1373,6 +1598,8 @@ Machine equivalent:
 }
 ```
 
+Command names use hyphens in chat and underscores in machine actions. That mapping is the only difference between them.
+
 ---
 
 # 30. `@chorus status`
@@ -1380,22 +1607,26 @@ Machine equivalent:
 Example:
 
 ```text
-ROOM STATUS
+ROOM STATUS (as of #288)
 
 Agents active: 5
 
 Open questions: 2
 Commitments in progress: 3
 Pending handoffs: 1
-Unresolved conflicts: 1
+Unresolved conflicts: 1 (+1 unconfirmed)
 
 Highest priority:
 Q17 has been unanswered for 18 messages.
 ```
 
+"Agents active" counts agents who posted within the last `presence.active_window_messages` (default 30) room messages. Chorus never reports an agent as offline unless the transport exposes reliable presence (§9.2).
+
 ---
 
 # 31. Machine-Readable API
+
+All object references in API responses use `shortId`. The API accepts either `shortId` or UUID in paths.
 
 ## GET `/v1/rooms/:roomId/state`
 
@@ -1405,6 +1636,7 @@ Returns:
 {
   "room_id": "rom_123",
   "status": "active",
+  "as_of_sequence": 288,
 
   "questions": {
     "open": 2,
@@ -1413,7 +1645,8 @@ Returns:
 
   "commitments": {
     "in_progress": 3,
-    "blocked": 1
+    "blocked": 1,
+    "optional": 1
   },
 
   "handoffs": {
@@ -1421,8 +1654,11 @@ Returns:
   },
 
   "conflicts": {
-    "unresolved": 1
-  }
+    "confirmed": 1,
+    "candidate": 1
+  },
+
+  "coordination_complete": false
 }
 ```
 
@@ -1438,11 +1674,14 @@ Returns:
       "id": "Q17",
       "summary": "Does seller support refunds?",
       "owner": null,
-      "age_messages": 18
+      "age_messages": 18,
+      "source_message": 211
     }
   ]
 }
 ```
+
+`age_messages` excludes Chorus's own messages.
 
 ---
 
@@ -1460,13 +1699,17 @@ Returns interaction context relevant to one agent.
 {
   "agent_id": "agent_c",
   "commitments": [],
-  "waiting_on": ["C12"],
+  "waiting_on": ["P3"],
   "handoffs_to_you": ["H4"],
   "questions_targeted_to_you": ["Q17"]
 }
 ```
 
 This endpoint could become especially valuable for autonomous agents joining or resuming a room.
+
+## Authentication
+
+API and SSE access is scoped to rooms the caller participates in. In the hackathon profile, a per-room bearer token issued when Chorus joins the room is enough.
 
 ---
 
@@ -1483,11 +1726,14 @@ Example:
 ```json
 {
   "event": "question.opened",
+  "sequence": 211,
   "data": {
     "question_id": "Q17"
   }
 }
 ```
+
+Every event carries the room message `sequence` that caused it, and SSE `id:` is set to a monotonically increasing event number so clients can resume with `Last-Event-ID`.
 
 Possible events:
 
@@ -1496,8 +1742,10 @@ question.opened
 question.answered
 commitment.created
 commitment.completed
+commitment.blocked
 handoff.pending
 handoff.accepted
+claim.recorded
 conflict.detected
 conflict.resolved
 dependency.resolved
@@ -1510,24 +1758,46 @@ room.ready_to_close
 
 # 33. Database Schema
 
-Minimal PostgreSQL tables:
+PostgreSQL tables. In the hackathon SQLite profile, use `TEXT` for UUIDs, `TEXT` (JSON) for `JSONB` and arrays, and a separate table or JSON column for embeddings.
+
+Conventions: every state table has `short_id`, `derived_from_message_ids`, `extractor_confidence`, `created_at`, `updated_at` (§10.0). Status columns use `CHECK` constraints matching §10.
 
 ```sql
+CREATE EXTENSION IF NOT EXISTS vector;  -- production profile only
+
 CREATE TABLE rooms (
     id UUID PRIMARY KEY,
     external_room_id TEXT UNIQUE NOT NULL,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active','closing','closed')),
+    mode TEXT NOT NULL DEFAULT 'assist' CHECK (mode IN ('observe','assist','facilitate')),
+    chorus_agent_id UUID,                      -- FK added after agents is created
     last_message_seq BIGINT NOT NULL DEFAULT 0,
+    last_processed_seq BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Per-room counters for short IDs (Q17, C4, ...)
+CREATE TABLE short_id_counters (
+    room_id UUID NOT NULL REFERENCES rooms(id),
+    prefix TEXT NOT NULL,                      -- 'Q','C','H','D','X','K','P'
+    next_value INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (room_id, prefix)
+);
+
+-- Room-scoped: the same external agent in two rooms is two rows (§65)
 CREATE TABLE agents (
     id UUID PRIMARY KEY,
+    room_id UUID NOT NULL REFERENCES rooms(id),
     external_agent_id TEXT NOT NULL,
     display_name TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(external_agent_id)
+    aliases TEXT[] NOT NULL DEFAULT '{}',
+    presence TEXT NOT NULL DEFAULT 'unknown',
+    first_seen_at TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (room_id, external_agent_id)
 );
+
+ALTER TABLE rooms ADD FOREIGN KEY (chorus_agent_id) REFERENCES agents(id);
 
 CREATE TABLE messages (
     id UUID PRIMARY KEY,
@@ -1537,10 +1807,33 @@ CREATE TABLE messages (
     author_agent_id UUID NOT NULL REFERENCES agents(id),
     text TEXT NOT NULL,
     content_hash TEXT NOT NULL,
-    reply_to_message_id UUID,
+    reply_to_message_id UUID REFERENCES messages(id),
+    metadata JSONB NOT NULL DEFAULT '{}',
+    is_from_chorus BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL,
-    UNIQUE(room_id, external_message_id),
-    UNIQUE(room_id, sequence)
+    edited_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
+    processing_state TEXT NOT NULL DEFAULT 'received'
+        CHECK (processing_state IN ('received','extracted','applied','skipped','extraction_failed')),
+    processed_at TIMESTAMPTZ,
+    UNIQUE (room_id, external_message_id),
+    UNIQUE (room_id, sequence)
+);
+
+-- Raw LLM responses, for debugging and offline evaluation (§48)
+CREATE TABLE llm_calls (
+    id UUID PRIMARY KEY,
+    room_id UUID NOT NULL REFERENCES rooms(id),
+    message_ids UUID[] NOT NULL,               -- >1 when batched (§11.2)
+    purpose TEXT NOT NULL,                     -- 'extraction','conflict_confirm','duplicate_confirm',...
+    model TEXT NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    raw_response TEXT NOT NULL,
+    parsed_ok BOOLEAN NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    latency_ms INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE interaction_events (
@@ -1548,63 +1841,166 @@ CREATE TABLE interaction_events (
     room_id UUID NOT NULL REFERENCES rooms(id),
     message_id UUID NOT NULL REFERENCES messages(id),
     actor_agent_id UUID NOT NULL REFERENCES agents(id),
+    llm_call_id UUID REFERENCES llm_calls(id),
+    ordinal SMALLINT NOT NULL,                 -- position within the message's events
     type TEXT NOT NULL,
+    target_agent_ids UUID[] NOT NULL DEFAULT '{}',
     payload JSONB NOT NULL,
     confidence REAL NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (message_id, ordinal)               -- re-processing cannot duplicate events
 );
 
 CREATE TABLE questions (
     id UUID PRIMARY KEY,
     room_id UUID NOT NULL REFERENCES rooms(id),
+    short_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('question','request')),
     source_message_id UUID NOT NULL REFERENCES messages(id),
     asker_agent_id UUID NOT NULL REFERENCES agents(id),
+    target_agent_ids UUID[] NOT NULL DEFAULT '{}',
     canonical_text TEXT NOT NULL,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open','acknowledged','answered','superseded','withdrawn')),
+    answer_message_ids UUID[] NOT NULL DEFAULT '{}',
+    claimed_by_commitment_id UUID,
+    embedding vector(1536),
+    derived_from_message_ids UUID[] NOT NULL,
+    extractor_confidence REAL NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    resolved_at TIMESTAMPTZ
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    UNIQUE (room_id, short_id)
 );
 
 CREATE TABLE commitments (
     id UUID PRIMARY KEY,
     room_id UUID NOT NULL REFERENCES rooms(id),
+    short_id TEXT NOT NULL,
     owner_agent_id UUID NOT NULL REFERENCES agents(id),
     source_message_id UUID NOT NULL REFERENCES messages(id),
     action TEXT NOT NULL,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('proposed','accepted','in_progress','completed','blocked','cancelled','expired')),
+    optional BOOLEAN NOT NULL DEFAULT FALSE,
     deadline TIMESTAMPTZ,
-    completion_message_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    from_handoff_id UUID,
+    completion_message_id UUID REFERENCES messages(id),
+    embedding vector(1536),
+    derived_from_message_ids UUID[] NOT NULL,
+    extractor_confidence REAL NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (room_id, short_id)
 );
+
+ALTER TABLE questions ADD FOREIGN KEY (claimed_by_commitment_id) REFERENCES commitments(id);
 
 CREATE TABLE handoffs (
     id UUID PRIMARY KEY,
     room_id UUID NOT NULL REFERENCES rooms(id),
+    short_id TEXT NOT NULL,
     from_agent_id UUID NOT NULL REFERENCES agents(id),
     to_agent_id UUID NOT NULL REFERENCES agents(id),
     source_message_id UUID NOT NULL REFERENCES messages(id),
     action TEXT NOT NULL,
-    status TEXT NOT NULL,
-    acknowledgement_message_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    status TEXT NOT NULL CHECK (status IN ('pending','accepted','declined','completed','cancelled','expired')),
+    deadline TIMESTAMPTZ,
+    transfers_commitment_id UUID REFERENCES commitments(id),
+    resulting_commitment_id UUID REFERENCES commitments(id),
+    acknowledgement_message_id UUID REFERENCES messages(id),
+    derived_from_message_ids UUID[] NOT NULL,
+    extractor_confidence REAL NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (room_id, short_id)
 );
+
+ALTER TABLE commitments ADD FOREIGN KEY (from_handoff_id) REFERENCES handoffs(id);
 
 CREATE TABLE decisions (
     id UUID PRIMARY KEY,
     room_id UUID NOT NULL REFERENCES rooms(id),
+    short_id TEXT NOT NULL,
     canonical_statement TEXT NOT NULL,
-    status TEXT NOT NULL,
-    superseded_by UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    source_message_ids UUID[] NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active','superseded','reopened')),
+    superseded_by UUID REFERENCES decisions(id),
+    embedding vector(1536),
+    derived_from_message_ids UUID[] NOT NULL,
+    extractor_confidence REAL NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (room_id, short_id)
+);
+
+CREATE TABLE claims (
+    id UUID PRIMARY KEY,
+    room_id UUID NOT NULL REFERENCES rooms(id),
+    short_id TEXT NOT NULL,
+    agent_id UUID NOT NULL REFERENCES agents(id),
+    message_id UUID NOT NULL REFERENCES messages(id),
+    subject TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    polarity TEXT NOT NULL CHECK (polarity IN ('positive','negative')),
+    conditions TEXT[] NOT NULL DEFAULT '{}',
+    hedged BOOLEAN NOT NULL DEFAULT FALSE,
+    status TEXT NOT NULL CHECK (status IN ('active','retracted','superseded')),
+    answers_question_id UUID REFERENCES questions(id),
+    subject_embedding vector(1536),
+    derived_from_message_ids UUID[] NOT NULL,
+    extractor_confidence REAL NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (room_id, short_id)
 );
 
 CREATE TABLE conflicts (
     id UUID PRIMARY KEY,
     room_id UUID NOT NULL REFERENCES rooms(id),
+    short_id TEXT NOT NULL,
     subject TEXT NOT NULL,
-    claim_a JSONB NOT NULL,
-    claim_b JSONB NOT NULL,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('candidate','confirmed','resolved','dismissed')),
+    resolution_message_ids UUID[] NOT NULL DEFAULT '{}',
+    resolved_by_claim_id UUID REFERENCES claims(id),
+    confirm_confidence REAL,
+    derived_from_message_ids UUID[] NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (room_id, short_id)
+);
+
+CREATE TABLE conflict_claims (
+    conflict_id UUID NOT NULL REFERENCES conflicts(id),
+    claim_id UUID NOT NULL REFERENCES claims(id),
+    PRIMARY KEY (conflict_id, claim_id)
+);
+
+CREATE TABLE dependencies (
+    id UUID PRIMARY KEY,
+    room_id UUID NOT NULL REFERENCES rooms(id),
+    short_id TEXT NOT NULL,
+    blocked_agent_id UUID NOT NULL REFERENCES agents(id),
+    blocked_commitment_id UUID REFERENCES commitments(id),  -- optional: which of their commitments is blocked
+    blocking_object_type TEXT NOT NULL CHECK (blocking_object_type IN ('question','commitment','handoff','decision')),
+    blocking_object_id UUID NOT NULL,                       -- polymorphic; validated by the state engine
+    status TEXT NOT NULL CHECK (status IN ('waiting','resolved','cancelled')),
+    derived_from_message_ids UUID[] NOT NULL,
+    extractor_confidence REAL NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (room_id, short_id)
+);
+
+-- Append-only audit of every state transition (§41)
+CREATE TABLE state_transitions (
+    id BIGSERIAL PRIMARY KEY,
+    room_id UUID NOT NULL REFERENCES rooms(id),
+    object_type TEXT NOT NULL,
+    object_id UUID NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    cause_event_id UUID REFERENCES interaction_events(id),
+    cause_message_id UUID REFERENCES messages(id),
+    cause TEXT NOT NULL,                       -- 'event','tick','command','feedback'
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -1612,10 +2008,55 @@ CREATE TABLE interventions (
     id UUID PRIMARY KEY,
     room_id UUID NOT NULL REFERENCES rooms(id),
     type TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    text TEXT NOT NULL,
+    involved_agent_ids UUID[] NOT NULL,
+    related_object_ids UUID[] NOT NULL,
     evidence_message_ids UUID[] NOT NULL,
     score REAL NOT NULL,
-    posted BOOLEAN NOT NULL DEFAULT FALSE,
-    output_message_id TEXT,
+    solicited BOOLEAN NOT NULL DEFAULT FALSE,
+    state TEXT NOT NULL DEFAULT 'queued'
+        CHECK (state IN ('queued','suppressed','sending','posted','failed')),
+    suppressed_reason TEXT,
+    output_external_message_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    posted_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX interventions_one_in_flight
+    ON interventions (room_id, idempotency_key)
+    WHERE state IN ('queued','sending');
+
+CREATE TABLE feedback (
+    id UUID PRIMARY KEY,
+    room_id UUID NOT NULL REFERENCES rooms(id),
+    agent_id UUID NOT NULL REFERENCES agents(id),
+    message_id UUID NOT NULL REFERENCES messages(id),
+    command TEXT NOT NULL,                     -- 'correct','wrong','resolved','ignore','reopen'
+    target_short_id TEXT,
+    target_intervention_id UUID REFERENCES interventions(id),
+    authorized BOOLEAN NOT NULL,               -- §60
+    applied BOOLEAN NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE snapshots (
+    id UUID PRIMARY KEY,
+    room_id UUID NOT NULL REFERENCES rooms(id),
+    at_sequence BIGINT NOT NULL,
+    state JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (room_id, at_sequence)
+);
+
+CREATE TABLE receipts (
+    id UUID PRIMARY KEY,
+    room_id UUID NOT NULL REFERENCES rooms(id),
+    operation TEXT NOT NULL,
+    body JSONB NOT NULL,                       -- canonicalized per RFC 8785 before hashing
+    sha256 TEXT NOT NULL,
+    signature TEXT NOT NULL,                   -- Ed25519 over sha256 (§54)
+    key_id TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
@@ -1632,21 +2073,41 @@ Define:
 export interface RoomTransport {
   connect(roomId: string): Promise<void>;
 
+  /** What this transport can actually provide. Filled in by the day-0 spike (§75). */
+  capabilities(): TransportCapabilities;
+
   onMessage(
     callback: (message: ExternalRoomMessage) => Promise<void>
   ): void;
 
+  onEdit?(callback: (edit: ExternalMessageEdit) => Promise<void>): void;
+  onDelete?(callback: (del: ExternalMessageDelete) => Promise<void>): void;
+
   sendMessage(
     roomId: string,
     message: OutboundRoomMessage
-  ): Promise<SendResult>;
+  ): Promise<SendResult>; // SendResult includes externalMessageId when available (§11.1)
 
   fetchHistory?(
     roomId: string,
     cursor?: string
   ): Promise<HistoryPage>;
 }
+
+export interface TransportCapabilities {
+  sequenceNumbers: boolean;  // server-assigned, gap-free per room
+  orderedDelivery: boolean;
+  replyReferences: boolean;
+  mentions: boolean;
+  presence: boolean;
+  history: boolean;
+  edits: boolean;
+  deletes: boolean;
+  selfEcho: boolean;         // does Chorus receive its own messages?
+}
 ```
+
+Features degrade based on `capabilities()`: without `replyReferences`, §14 step 2 is skipped. Without `presence`, presence stays `unknown`. Without `history`, recovery starts at rejoin (§70).
 
 Then implement:
 
@@ -1664,7 +2125,9 @@ The exact SharedNet connection/authentication calls should be implemented agains
 
 # 35. Idempotency
 
-SharedNet reconnects or retries may result in duplicate delivery.
+SharedNet reconnects or retries may result in duplicate delivery. Chorus itself may crash at any step.
+
+## Inbound
 
 Every inbound message must have:
 
@@ -1674,20 +2137,38 @@ external_message_id
 content_hash
 ```
 
-Before processing:
+1. `INSERT ... ON CONFLICT (room_id, external_message_id) DO NOTHING RETURNING id`.
+   - A row returned means a new message: continue.
+   - No row returned: load the existing row. If `processing_state` is `applied`, `skipped` or `extraction_failed`, **stop**. Otherwise resume from the recorded state (the worker previously crashed mid-message).
+2. Events are written with `UNIQUE (message_id, ordinal)`, so re-running extraction cannot duplicate events.
+3. State changes, `state_transitions` rows, and the update to `processing_state = 'applied'` / `last_processed_seq` are written in **one transaction**.
+4. On startup, the worker resumes every message with `processing_state IN ('received','extracted')` in sequence order.
 
-```sql
-INSERT ...
-ON CONFLICT DO NOTHING;
-```
+No message produces events twice, and no message is silently dropped.
 
-No message should produce events twice.
+## Outbound
+
+Interventions follow a small outbox:
+
+1. Insert with `state = 'queued'` and an `idempotency_key` (the partial unique index prevents two in-flight copies).
+2. Set `state = 'sending'`, then call `transport.sendMessage`.
+3. On success, set `state = 'posted'` and store `output_external_message_id`.
+4. On restart, rows still `sending` are checked against recent room history (by self-echo or text match). They are marked `posted` if found and retried once if not.
+
+## Edits and deletes
+
+`content_hash` detects edits when a message is redelivered under the same `external_message_id` with different content.
+
+- **Edit:** store the new text and set `edited_at`. Re-extract the message. For objects whose **only** source is this message, apply the difference: objects no longer supported are `withdrawn`/`cancelled` with cause `edit`, and new ones are created. Objects already changed by later messages are left unchanged, and the edit is logged.
+- **Delete:** set `deleted_at`. Objects whose only source is the deleted message become `withdrawn`/`cancelled` with cause `delete`. Interventions already posted are not retracted.
+
+If the transport cannot report edits or deletes (§34), ignore them.
 
 ---
 
 # 36. Ordering
 
-Use room sequence numbers when available.
+Use room sequence numbers when `capabilities().sequenceNumbers` is true.
 
 If events arrive out of order:
 
@@ -1705,11 +2186,17 @@ Recommended:
 250–1000 ms reorder window
 ```
 
+If the gap is not filled when the window closes, process what arrived and record the gap. A late message is still persisted and extracted, but it only produces events for objects that are still open. It does not reorder already-applied transitions.
+
+If the transport has **no** sequence numbers, Chorus assigns `sequence` on arrival from a per-room counter, and message order is arrival order.
+
 If SharedNet guarantees order, keep the abstraction but disable buffering.
 
 ---
 
 # 37. Redis Usage
+
+**Production profile only.** The hackathon profile keeps these in process memory behind the same interfaces.
 
 Use Redis for:
 
@@ -1735,13 +2222,15 @@ Generate embeddings for:
 - question canonical text;
 - commitment action;
 - decision statement;
-- conflict claims.
+- claim subject (for conflict candidates) and claim full text (for repeated-question answers).
 
-Suggested representation:
+Suggested representation for commitments:
 
 ```text
 embedding(subject + "\n" + action)
 ```
+
+Record the embedding model name alongside each vector. Every similarity threshold in §72 is tied to that model and must be re-tuned when it changes.
 
 Do not embed entire room histories repeatedly.
 
@@ -1754,9 +2243,10 @@ Do not send the entire room every time.
 For each message, construct:
 
 ```text
+ROOM ROSTER (names + aliases)
 CURRENT MESSAGE
 REPLY TARGET
-RECENT LOCAL WINDOW
+RECENT LOCAL WINDOW (Chorus messages excluded)
 OPEN OBJECTS INVOLVING AUTHOR
 RECENT OBJECTS WITH SEMANTIC SIMILARITY
 ACTIVE DECISIONS
@@ -1767,6 +2257,7 @@ Target context should remain bounded.
 Example:
 
 ```text
+roster: all agents in room (names only)
 current message: 1
 reply target: 1
 recent messages: 10
@@ -1777,6 +2268,8 @@ semantic candidates: <= 5
 ---
 
 # 40. Confidence Policy
+
+`confidence` is the model's own rating of itself. Self-reported LLM confidence is **poorly calibrated**, so treat the bands below as starting points and calibrate them before relying on them (see "Calibration" below).
 
 Recommended confidence bands:
 
@@ -1794,13 +2287,20 @@ store as candidate only
 discard
 ```
 
-These values should be tuned on replay data.
+**Corroborated** means at least one of the following independent signals agrees with the event:
+
+- a structural signal: the message is a reply to, or explicitly mentions (§12.1), the object or agent the event concerns;
+- a second event in the same message implying the same transition (e.g. `completion` + `answer` for the same object);
+- a follow-up message from a different agent that confirms it (e.g. an acknowledgement of a claimed answer);
+- a lexical rule match (e.g. the commitment regex `\bI('ll| will)\b` for commitments).
+
+**Calibration.** Before the demo, run the labeled replay set (§55) and bucket events by reported confidence. Use the resulting precision per bucket (not the raw number) to place the band edges. Re-run it whenever the model or prompt changes.
 
 ---
 
 # 41. Explainability
 
-Every state object should record provenance.
+Every state object records provenance (§10.0), and every status change is written to `state_transitions` with its cause (§33).
 
 Example:
 
@@ -1815,7 +2315,7 @@ Example:
 }
 ```
 
-A conflict should retain both claims.
+A conflict retains all of its claims (and through them, their messages).
 
 A commitment completion should retain:
 
@@ -1823,6 +2323,8 @@ A commitment completion should retain:
 commitment creation message
 completion message
 ```
+
+`GET /v1/rooms/:roomId/objects/:shortId/history` returns the object's transition log with source messages.
 
 Chorus should never produce an unexplained “trust me” result.
 
@@ -1856,23 +2358,19 @@ If SharedOS supports scoped grants, grant only the current room.
 
 # 43. Suggested Product Surface
 
-Expose three levels of service.
+Expose two levels of service.
 
 ## Free
 
-```text
-chorus.status
-chorus.open
-chorus.close_check
-```
+Every read-only command in §29 (`chorus.status`, `chorus.open`, `chorus.conflicts`, `chorus.commitments`, `chorus.close_check`, …), in any mode.
 
 ## Paid
 
-```text
-chorus.watch
-chorus.facilitate
-chorus.replay
-```
+| Operation | What it is | Effect |
+|---|---|---|
+| `chorus.watch` | Time-boxed **facilitate** mode | Room switches to facilitate mode for N minutes, then reverts to its previous mode. A receipt is issued at the end (§54). |
+| `chorus.facilitate` | Facilitate mode until the room closes or it is cancelled | Same, with no time limit. Receipt on close. |
+| `chorus.replay` | Post-room analysis | Runs the replay harness (§58) over the room's history. Returns a receipt listing the obligations surfaced, resolved and left open. Requires `history` capability or Chorus's own stored messages. |
 
 Possible pricing:
 
@@ -1884,31 +2382,47 @@ full facilitation       5 credits
 post-room analysis      3 credits
 ```
 
+Payment integration is transport-specific and **out of MVP scope**. For the demo, paid operations can be enabled by config.
+
 For the hackathon, pricing matters less than proving another agent has a rational reason to purchase the service.
 
 ---
 
 # 44. MVP Scope
 
-Build these five features first:
+Build these features first:
 
-1. question tracking;
+1. question tracking (including untargeted requests);
 2. commitment tracking;
-3. duplicate-work detection;
-4. missing-answer detection;
-5. conflict detection.
+3. claim extraction;
+4. duplicate-work detection;
+5. unanswered-question detection;
+6. conflict detection;
+7. completion check (`@chorus close-check`). It only counts state that items 1–6 already track, so it is cheap.
 
 Then add:
 
-6. handoff acknowledgement;
-7. dependency tracking;
-8. completion check.
+8. handoffs and handoff acknowledgement;
+9. dependency tracking;
+10. decision tracking and decision reminders.
 
 Do **not** begin with every feature in this document.
 
 ---
 
 # 45. MVP Build Plan
+
+## Phase 0 — SharedNet capability spike (≤ 1 hour, day 0)
+
+Before writing any Chorus code, connect a throwaway script to a SharedNet room and fill in `TransportCapabilities` (§34):
+
+- Are there server-assigned sequence numbers? Is delivery ordered?
+- Do messages carry reply references? Mentions? Author display names?
+- Is history fetchable? Is presence exposed?
+- Does the sender receive its own messages back? What does `send` return?
+- Are edits/deletes delivered?
+
+Record the answers in `README.md`. They decide which parts of §14, §35, §36 and §70 apply.
 
 ## Phase 1 — Repository and Infrastructure
 
@@ -1928,10 +2442,16 @@ npm install -D turbo typescript tsx
 
 Create workspaces.
 
-Install runtime dependencies:
+Install runtime dependencies (hackathon profile):
 
 ```bash
-npm install fastify zod pg ioredis pino
+npm install fastify zod@^4 pg pino
+```
+
+Add for the production profile:
+
+```bash
+npm install ioredis bullmq
 ```
 
 Optional:
@@ -1947,60 +2467,90 @@ npm install -D drizzle-kit
 
 Implement Zod schemas before business logic.
 
-Example:
+There are **two** layers:
+
+1. **LLM output schemas** (snake_case, names as written) — validate exactly what the model returns.
+2. **Domain types** (camelCase, resolved IDs) — produced by a mapping step that resolves agent names (§12.1) and references (§14).
+
+Example (Zod v4):
 
 ```ts
 import { z } from "zod";
 
-export const InteractionEventSchema = z.object({
-  type: z.enum([
-    "question",
-    "request",
-    "commitment",
-    "handoff",
-    "acknowledgement",
-    "answer",
-    "decision",
-    "dependency",
-    "status_update",
-    "completion",
-    "disagreement",
-    "correction",
-    "withdrawal"
-  ]),
+export const EventTypeSchema = z.enum([
+  "question",
+  "request",
+  "commitment",
+  "handoff",
+  "acknowledgement",
+  "answer",
+  "decision",
+  "dependency",
+  "status_update",
+  "completion",
+  "claim",
+  "disagreement",
+  "correction",
+  "withdrawal"
+]);
 
+// Layer 1: what the LLM returns
+export const ExtractedEventSchema = z.object({
+  type: EventTypeSchema,
   confidence: z.number().min(0).max(1),
+  target_agents: z.array(z.string()),   // names as written, not IDs
+  references: z.array(z.string()),      // short IDs or free-text referents
+  payload: z.record(z.string(), z.unknown())
+});
 
-  targetAgentIds: z.array(z.string()),
+export const ExtractionResultSchema = z.object({
+  events: z.array(ExtractedEventSchema)
+});
 
-  payload: z.record(z.unknown())
+// Per-type payload schemas, checked after the envelope passes
+export const ClaimPayloadSchema = z.object({
+  subject: z.string().min(1),
+  predicate: z.string().min(1),
+  polarity: z.enum(["positive", "negative"]),
+  conditions: z.array(z.string()),
+  hedged: z.boolean()
+});
+
+export const CommitmentPayloadSchema = z.object({
+  action: z.string().min(1),
+  deadline: z.string().datetime().nullable(),
+  conditional: z.boolean()
 });
 ```
 
-Reject invalid model output.
+Reject invalid model output. An event whose payload fails its per-type schema is dropped and logged, and the other events from the message are kept.
 
 ---
 
 # 47. Phase 3 — Mock Transport First
 
-Before SharedNet integration, build a replayable room simulator.
+Before SharedNet integration, build a replayable room simulator with a **virtual clock** (§17.1).
 
 Input fixture:
 
 ```json
-[
-  {
-    "seq": 1,
-    "agent": "A",
-    "text": "I'll check refund support."
-  },
-  {
-    "seq": 2,
-    "agent": "B",
-    "text": "I'll investigate refunds too."
-  }
-]
+{
+  "room": "fixture-duplicate-01",
+  "agents": [
+    { "id": "A", "display_name": "ResearchA" },
+    { "id": "B", "display_name": "ResearchB" }
+  ],
+  "messages": [
+    { "seq": 1, "t": "+0s",  "agent": "A", "text": "I'll check refund support." },
+    { "seq": 2, "t": "+5s",  "agent": "B", "text": "I'll investigate refunds too." }
+  ],
+  "advance_clock_to": "+120s"
+}
 ```
+
+- `t` is an offset from the fixture start. The virtual clock jumps to each message's `t` before delivery.
+- `advance_clock_to` runs ticks up to that point after the last message, so time-based rules (§19, §20, §21) can be tested without real waiting.
+- If `t` is omitted, messages are spaced `default_spacing` (5 s) apart.
 
 Expected output:
 
@@ -2008,7 +2558,8 @@ Expected output:
 {
   "interventions": [
     {
-      "type": "duplicate_work"
+      "type": "duplicate_work",
+      "related": ["C1", "C2"]
     }
   ]
 }
@@ -2024,19 +2575,25 @@ Pseudo-code:
 
 ```ts
 async function extractEvents(message: Message, context: Context) {
-  const raw = await llm.generate({
-    prompt: buildExtractionPrompt(message, context)
-  });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const raw = await llm.generateStructured({
+      prompt: buildExtractionPrompt(message, context, attempt > 0 ? lastError : undefined),
+      schema: ExtractionResultSchema // provider structured output / tool call
+    });
 
-  const parsed = ExtractionResultSchema.parse(
-    JSON.parse(raw)
-  );
+    await llmCalls.record(message, raw); // always store the raw response
 
-  return parsed.events;
+    const result = ExtractionResultSchema.safeParse(raw.json);
+    if (result.success) return result.data.events;
+    lastError = result.error;
+  }
+
+  await messages.markExtractionFailed(message.id);
+  return [];
 }
 ```
 
-Store raw LLM response separately for debugging.
+Store the raw LLM response in `llm_calls` for debugging (§33).
 
 ---
 
@@ -2054,8 +2611,16 @@ function applyEvent(
     case "question":
       return openQuestion(state, event);
 
+    case "request":
+      return event.targetAgentIds.length > 0
+        ? openHandoff(state, event)
+        : openQuestion(state, { ...event, kind: "request" });
+
     case "answer":
       return applyAnswer(state, event);
+
+    case "claim":
+      return recordClaim(state, event);
 
     case "commitment":
       return createCommitment(state, event);
@@ -2063,11 +2628,20 @@ function applyEvent(
     case "completion":
       return completeCommitment(state, event);
 
+    case "acknowledgement":
+      return applyAcknowledgement(state, event);
+
+    case "correction":
+    case "withdrawal":
+      return applyRetraction(state, event);
+
     default:
       return state;
   }
 }
 ```
+
+Every function checks the transition against §16 and writes a `state_transitions` row. Invalid transitions are rejected and logged, never forced.
 
 The model never edits database rows directly.
 
@@ -2075,32 +2649,25 @@ The model never edits database rows directly.
 
 # 50. Phase 6 — Rule Engine
 
-Rules should be pure where possible.
-
-```ts
-interface CoordinationRule {
-  id: string;
-
-  evaluate(
-    state: RoomState,
-    event: RoomStateEvent
-  ): InterventionCandidate[];
-}
-```
+Rules should be pure where possible. The interface and trigger model are in §17.1.
 
 Example:
 
 ```ts
 class DuplicateCommitmentRule implements CoordinationRule {
-  id = "duplicate_commitment";
+  id = "duplicate_work";
+  trigger = "state_change" as const;
 
-  evaluate(state: RoomState): InterventionCandidate[] {
+  evaluate(state: RoomState, ctx: RuleContext): InterventionCandidate[] {
     // deterministic filtering
-    // semantic similarity
+    // stage 1: embedding similarity
+    // stage 2: LLM confirmation (cached per commitment pair)
     // return candidates
   }
 }
 ```
+
+Rules that need an LLM (duplicate and conflict confirmation) cache results per object pair so each pair is confirmed at most once.
 
 ---
 
@@ -2113,13 +2680,13 @@ Queue candidates:
 ```text
 candidate
    ↓
-dedup
+dedup (idempotencyKey)
    ↓
-priority score
+priority score (§26)
    ↓
-rate limit
+rate limit (§26)
    ↓
-post
+outbox → post (§35)
 ```
 
 A higher-priority candidate may absorb a lower-priority candidate.
@@ -2138,6 +2705,8 @@ send:
 ```text
 Q17 is still unanswered and Agent B is blocked on it.
 ```
+
+Candidates that are rate-limited stay queued for up to `interventions.queue_ttl_messages` (default 16) room messages. The scheduler re-checks them against current state before posting and drops any that no longer hold.
 
 ---
 
@@ -2160,9 +2729,10 @@ transport.onMessage(async (externalMessage) => {
 Outbound:
 
 ```ts
-await transport.sendMessage(roomId, {
+const result = await transport.sendMessage(roomId, {
   text: intervention.text
 });
+await interventions.markPosted(intervention.id, result.externalMessageId);
 ```
 
 Keep SharedNet-specific authentication and room joining inside the adapter.
@@ -2176,22 +2746,24 @@ Intercept messages directed at Chorus.
 Example:
 
 ```ts
-if (text.startsWith("@chorus")) {
+if (/^@chorus\b/i.test(text.trim())) {
   return commandRouter.handle(message);
 }
 ```
 
-Implement:
+Implement the MVP commands from §29:
 
 ```text
 status
 open
-decisions
 conflicts
+commitments
 close-check
+mode
+feedback commands (§60)
 ```
 
-These should not require an LLM unless natural-language formatting is desired.
+These should not require an LLM unless natural-language formatting is desired. Command messages skip extraction (§11.2).
 
 ---
 
@@ -2211,17 +2783,21 @@ Example:
   "active_commitments": ["C12", "C14"],
   "conflicts": ["X3"],
 
-  "generated_at": "..."
+  "generated_at": "...",
+  "key_id": "chorus-2026-09"
 }
 ```
 
-Hash it:
+Canonicalize with **RFC 8785 (JSON Canonicalization Scheme)**, then:
 
 ```text
-sha256(canonical_json)
+digest    = sha256(jcs(receipt))
+signature = ed25519_sign(chorus_private_key, digest)
 ```
 
-Store the hash with the record.
+Store the digest, signature and `key_id` with the record, and post the receipt with its signature. Publish the public key at `GET /v1/keys/:keyId`.
+
+A hash alone proves nothing to a third party, because Chorus could recompute it after changing the record. The signature lets any agent verify that Chorus issued the receipt, and that it has not been changed since.
 
 ---
 
@@ -2231,18 +2807,20 @@ Store the hash with the record.
 
 Test:
 
-- state transitions;
+- state transitions (including rejected invalid transitions);
 - duplicate suppression;
 - thresholds;
-- idempotency;
+- idempotency (redelivery, crash-resume, outbox);
+- Chorus self-message exclusion;
 - superseded decisions;
-- intervention scoring.
+- intervention scoring;
+- tick rules under the virtual clock.
 
 ---
 
 ## Extraction tests
 
-Create a labeled dataset.
+Create a labeled dataset (target ≥ 100 messages before tuning thresholds).
 
 Example:
 
@@ -2267,6 +2845,16 @@ Example:
   "text": "B, can you verify this?",
   "expected_events": [
     "request"
+  ],
+  "expected_state": "handoff to B"
+}
+```
+
+```json
+{
+  "text": "Refunds are supported.",
+  "expected_events": [
+    "claim"
   ]
 }
 ```
@@ -2286,6 +2874,8 @@ negation
 corrections
 withdrawals
 conditional offers
+prompt-injection text (§63)
+Chorus's own messages replayed as input (must produce nothing)
 ```
 
 Example:
@@ -2294,7 +2884,7 @@ Example:
 "If nobody else can do it, I could check later."
 ```
 
-Should **not** immediately become an active commitment.
+Should become a **proposed, optional** commitment, not an active one.
 
 ---
 
@@ -2307,18 +2897,35 @@ A: API supports refunds.
 B: API does not support refunds.
 ```
 
-Negative:
+Negative (disjoint conditions):
 
 ```text
 A: API supports refunds within 24 hours.
 B: API does not support refunds after 24 hours.
 ```
 
-Negative:
+Negative (no claim from B):
 
 ```text
 A: I think refunds are supported.
 B: I haven't checked.
+```
+
+Grouping (three agents, one conflict):
+
+```text
+A: Streaming is supported.
+B: Streaming is not supported.
+C: No, streaming is not available.
+→ one conflict X1 with claims {A, B, C}
+```
+
+Hedged (candidate only):
+
+```text
+A: I think streaming is supported.
+B: Streaming is not supported.
+→ conflict status = candidate, not announced unsolicited
 ```
 
 ---
@@ -2330,7 +2937,7 @@ This should be a first-class feature.
 Input:
 
 ```text
-room transcript
+room transcript (fixture format §47, with optional expected annotations)
 ```
 
 Output:
@@ -2352,16 +2959,21 @@ npm run replay -- fixtures/room-01.json
 Output:
 
 ```text
-SEQ 14
+SEQ 14  (t=+62s)
 Detected commitment C4
 
-SEQ 18
+SEQ 18  (t=+80s)
 Detected duplicate C5 ≈ C4
 Intervention candidate created
 
-SEQ 19
+SEQ 19  (t=+84s)
 Intervention posted
+
+TICK   (t=+300s)
+Q2 surfaced (wall-clock fallback)
 ```
+
+The harness uses the virtual clock (§17.1). With `--record`, it caches LLM responses by prompt hash so a replay is deterministic and free to re-run. With `--live-llm`, it calls the model again.
 
 This will make debugging dramatically easier.
 
@@ -2382,12 +2994,18 @@ commitments_completed
 duplicates_detected
 duplicates_confirmed
 
+claims_recorded
 conflicts_detected
 conflicts_resolved
 
 interventions_posted
+interventions_suppressed
 interventions_ignored
 interventions_followed
+
+extraction_failures
+extraction_backlog
+llm_tokens_per_room_message
 
 false_positive_feedback
 ```
@@ -2398,6 +3016,8 @@ Most important product metric:
 useful_interventions / total_interventions
 ```
 
+An intervention is **useful** if, within 10 room messages, an involved agent acts on it (answers, acknowledges, re-scopes, resolves) or sends `@chorus correct`. It is **not useful** if an agent sends `@chorus wrong`, or if nobody acts on it.
+
 Chorus should optimize for usefulness, not activity.
 
 ---
@@ -2407,13 +3027,28 @@ Chorus should optimize for usefulness, not activity.
 Allow agents to respond:
 
 ```text
-@chorus correct
-@chorus wrong
-@chorus resolved
+@chorus correct            (about the latest intervention, or one given by id)
+@chorus wrong [id]
+@chorus resolved X3
 @chorus ignore Q17
+@chorus reopen D2
 ```
 
-These signals should modify room state and become evaluation data.
+**Authorization.** Feedback that changes state is permission-checked. Otherwise any agent could close any obligation:
+
+| Command | Who may use it | Effect |
+|---|---|---|
+| `correct`, `wrong` on an intervention | any involved agent | recorded as evaluation data; `wrong` also suppresses that `idempotencyKey` for the room |
+| `resolved Q…` | the asker, or an agent whose message is a recorded answer | question → answered |
+| `resolved C…` | the owner | commitment → completed |
+| `resolved X…` / `wrong X…` | any agent with a claim in the conflict | conflict → resolved / dismissed |
+| `ignore <id>` | the object's asker/owner/claimant | object excluded from unsolicited interventions (still shown in status) |
+| `reopen D…` | any agent | decision → reopened |
+| `mode …` | any agent in hackathon profile; room owner in production | changes room mode |
+
+Unauthorized commands get a short reply naming who may use the command. They are recorded as feedback (`authorized = false`) and change no state.
+
+These signals become evaluation data.
 
 Do not immediately perform online model fine-tuning during the hackathon.
 
@@ -2442,21 +3077,29 @@ Prompt:
 Evaluate Vendor X.
 ```
 
-Both researchers independently volunteer to inspect pricing.
+Early on, the Writer asks an open request:
+
+```text
+Writer:
+Can someone find out how Vendor X handles refunds?
+```
+
+Then both researchers independently volunteer to inspect pricing.
 
 Expected Chorus intervention:
 
 ```text
 Potential duplicate work:
 
-ResearchA → pricing
-ResearchB → pricing
+ResearchA → C1 pricing (#4)
+ResearchB → C2 pricing (#5)
 
-Unclaimed:
-refund behavior
+Still unclaimed: Q1 — How does Vendor X handle refunds? (Writer, #2)
 ```
 
-ResearchB switches.
+ResearchB switches to Q1.
+
+The "still unclaimed" line comes from the Writer's existing request Q1. Chorus does not come up with "refunds" itself (§18).
 
 ---
 
@@ -2470,12 +3113,15 @@ Does Vendor X expose a receipt endpoint?
 
 Conversation continues.
 
-After sufficient room activity:
+After 12 non-Chorus messages (or 5 minutes in a quiet room, §19):
 
 ```text
 Chorus:
 Still unanswered:
-Does Vendor X expose a receipt endpoint?
+
+Q2 — Does Vendor X expose a receipt endpoint?
+
+Asked by Verifier at #7.
 ```
 
 Seller or researcher responds.
@@ -2495,14 +3141,21 @@ Refunds are not supported.
 Chorus:
 
 ```text
-Unresolved conflict: refund support.
+Unresolved conflict X1: refund support
+
+ResearchA (#21): supported
+ResearchB (#23): not supported
+
+No resolution has been recorded.
 ```
 
-The room investigates and resolves the issue.
+The room investigates. ResearchB posts "Correction: refunds are supported within 24 hours," which retracts their claim, and X1 becomes resolved.
 
 ---
 
-## Demo Scenario D — Handoff
+## Demo Scenario D — Handoff (post-MVP, §44 item 8)
+
+Only include this scenario if handoffs have been built. The core demo is A, B, C and E.
 
 ```text
 ResearchA:
@@ -2535,7 +3188,7 @@ Response:
 NOT READY
 
 1 unresolved conflict:
-X3 — refund policy
+X1 — refund support
 ```
 
 After resolution:
@@ -2559,7 +3212,7 @@ This produces a strong end-to-end narrative.
 
 Mitigation:
 
-- high similarity threshold;
+- two-stage detection (embedding candidates + LLM confirmation, §18);
 - account for different sub-scopes;
 - ask rather than command.
 
@@ -2594,7 +3247,16 @@ Mitigation:
 - intervention budget;
 - cooldowns;
 - candidate merging;
-- explicit `quiet` mode.
+- `@chorus mode observe` to silence it completely (§71).
+
+---
+
+## Chorus reacts to its own messages
+
+Mitigation:
+
+- Chorus's own messages are never extracted or counted (§11.1);
+- a replay test feeds Chorus's own interventions back in and expects no new state (§56).
 
 ---
 
@@ -2639,6 +3301,13 @@ Messages are data.
 Only validated structured events can reach the state engine.
 
 The state engine should enforce transitions independently.
+
+Other threats:
+
+- **State tampering through feedback commands.** Commands that change state are permission-checked (§60).
+- **Claimed identity.** An agent's identity comes from transport metadata only, never from message text ("This is ResearchA speaking"). Aliases are learned only as described in §12.1.
+- **Chorus output as instructions.** Other agents may treat Chorus messages as authoritative. Interventions are phrased as observations ("Potential duplicate work"), never as commands, and they quote claims without endorsing them (§23).
+- **Cost exhaustion.** A flood of messages drives LLM cost. Apply the pre-filter (§11.2), a per-room LLM budget (`llm.max_calls_per_minute`), and batching under load. When the budget is exhausted, drop to observe-only extraction of messages that mention Chorus or reply to open objects.
 
 ---
 
@@ -2729,7 +3398,9 @@ total intervention   < 3 s typical
 
 Not every rule needs immediate response.
 
-Unanswered-question rules are intentionally delayed.
+These targets apply to state-change rules only. Tick rules (§17.1) are intentionally delayed: unanswered-question, missing-acknowledgement and stale-commitment alerts fire at their thresholds, up to `tick_seconds` later.
+
+If `extraction_backlog` exceeds 5 messages, batching (§11.2) takes over and per-message latency targets are relaxed.
 
 ---
 
@@ -2751,7 +3422,7 @@ Kafka partition by room_id
 Postgres advisory lock
 ```
 
-For hackathon scale, a simple per-room Redis lock is sufficient.
+In the hackathon profile (one process), no lock is needed: a per-room in-memory serial queue is sufficient. Add a Postgres advisory lock or Redis lock only when running more than one worker.
 
 ---
 
@@ -2765,10 +3436,17 @@ Periodically persist:
   "at_sequence": 422,
   "open_questions": [...],
   "commitments": [...],
+  "handoffs": [...],
+  "claims": [...],
   "decisions": [...],
-  "conflicts": [...]
+  "conflicts": [...],
+  "dependencies": [...],
+  "short_id_counters": {"Q": 18, "C": 15, ...},
+  "rate_limit_window": [...]
 }
 ```
+
+Snapshot every 50 applied messages and on graceful shutdown.
 
 This allows fast recovery after worker restart.
 
@@ -2779,9 +3457,11 @@ This allows fast recovery after worker restart.
 On restart:
 
 1. load latest snapshot;
-2. determine last processed sequence;
-3. fetch or replay later messages;
-4. continue.
+2. re-apply `state_transitions` recorded after the snapshot's `at_sequence` (cheap, no LLM);
+3. resume any messages with `processing_state IN ('received','extracted')` (§35);
+4. fetch history after `last_processed_seq` if the transport supports it;
+5. resolve outbox rows stuck in `sending` (§35);
+6. continue.
 
 If SharedNet history is unavailable, document that recovery begins from the point the Chorus agent rejoins.
 
@@ -2808,7 +3488,9 @@ Responds to explicit @chorus commands
 Only high-confidence unsolicited alerts
 ```
 
-Recommended default.
+"High-confidence" means only these intervention types, and only when the candidate's `confidence ≥ 0.90`: `conflict_detected` (confirmed only), `repeated_question`, `dependency_resolved`.
+
+Recommended default for production rooms.
 
 ## Facilitate
 
@@ -2816,29 +3498,68 @@ Recommended default.
 Actively surfaces coordination failures
 ```
 
-Use during demos.
+All intervention types in §27, subject to the §26 policy. Use during demos and for paid `chorus.watch` / `chorus.facilitate` (§43).
+
+The mode is set per room: first from `CHORUS_MODE`, then changed with `@chorus mode …` (§60).
 
 ---
 
 # 72. Config
 
-Example:
+Every threshold in this document is listed here. Similarity thresholds are tied to the embedding model (§38).
 
 ```yaml
-mode: facilitate
+mode: assist          # production default; set CHORUS_MODE=facilitate for demos (§71)
+profile: hackathon    # hackathon | production (§7)
+
+tick_seconds: 15
 
 thresholds:
-  duplicate_similarity: 0.87
-  conflict_confidence: 0.90
-  extraction_auto_apply: 0.90
+  extraction_auto_apply: 0.90   # §40
+  extraction_corroborated: 0.75
+  extraction_candidate: 0.55
+  reference_resolution: 0.80    # §14
+  answer_relevance: 0.80        # §15
+  duplicate_candidate: 0.75     # §18 stage 1 (cosine)
+  duplicate_confirm: 0.85       # §18 stage 2 (LLM)
+  conflict_subject: 0.85        # §22 stage 1 (cosine)
+  conflict_confidence: 0.90     # §22 stage 2 (LLM)
+  repeated_question: 0.90       # §23
+  decision_match: 0.85          # §23.1
+  stale: 0.70                   # §21
 
 interventions:
+  min_score: 0.55               # §26
   max_per_5_minutes: 3
-  min_room_messages_between: 8
+  min_room_messages_between: 8  # Chorus messages excluded
+  queue_ttl_messages: 16        # §51
+  cooldown_messages: 20         # same idempotencyKey
 
-unanswered:
-  min_seconds: 90
+unanswered:                     # §19 — fires on (count OR wall-clock) AND floor
   min_subsequent_messages: 12
+  max_wait_seconds: 300
+  min_seconds: 30
+  resurface_cooldown_messages: 20
+
+handoff:
+  min_target_messages: 3        # §20
+
+stale:                          # §21
+  age_ref_seconds: 600
+  room_ref_messages: 30
+
+extraction:
+  batch_when_backlog_over: 5    # §11.2
+  recent_window: 10             # §39
+
+llm:
+  max_calls_per_minute: 60      # per room (§63)
+
+presence:
+  active_window_messages: 30    # §30
+
+snapshots:
+  every_messages: 50            # §69
 
 retention:
   days: 7
@@ -2850,12 +3571,17 @@ retention:
 
 ```bash
 DATABASE_URL=
-REDIS_URL=
+REDIS_URL=              # production profile only
 
-CHORUS_MODE=facilitate
+CHORUS_MODE=assist      # use facilitate for demos
+CHORUS_PROFILE=hackathon
 
 LLM_API_KEY=
 LLM_MODEL=
+EMBEDDING_MODEL=
+
+RECEIPT_SIGNING_KEY=    # Ed25519 private key (§54)
+RECEIPT_KEY_ID=
 
 SHAREDNET_ROOM=
 SHAREDNET_TOKEN=
@@ -2876,7 +3602,7 @@ Recommended local development:
 ```yaml
 services:
   postgres:
-    image: postgres:17
+    image: pgvector/pgvector:pg17   # postgres:17 + pgvector
     environment:
       POSTGRES_PASSWORD: chorus
       POSTGRES_USER: chorus
@@ -2884,11 +3610,14 @@ services:
     ports:
       - "5432:5432"
 
-  redis:
+  redis:                            # production profile only
     image: redis:7
+    profiles: ["production"]
     ports:
       - "6379:6379"
 ```
+
+`docker compose up` starts Postgres only. Use `docker compose --profile production up` to add Redis.
 
 Run API/worker locally during early development.
 
@@ -2899,24 +3628,27 @@ Run API/worker locally during early development.
 Build in this exact order:
 
 ```text
-1. schemas
-2. replay transport
-3. persistence
-4. event extraction
-5. question state
-6. commitment state
-7. duplicate detection
-8. unanswered detection
-9. conflict detection
-10. intervention throttling
-11. commands
-12. SharedNet adapter
-13. handoffs
-14. dependencies
-15. completion checks
+0.  SharedNet capability spike (§45 Phase 0) — ≤ 1 hour, informs everything below
+1.  schemas (LLM layer + domain layer, §46)
+2.  replay transport + virtual clock (§47)
+3.  persistence (idempotent ingest, processing states, §35)
+4.  event extraction (structured output, retry, self-message skip, pre-filter)
+5.  question state (incl. untargeted requests)
+6.  commitment state
+7.  claim state
+8.  duplicate detection
+9.  tick scheduler + unanswered detection
+10. conflict detection
+11. intervention throttling + outbox
+12. commands (incl. close-check and feedback permissions)
+13. SharedNet adapter
+--- MVP complete (§76) ---
+14. handoffs (+ handoff → commitment link)
+15. dependencies
+16. decisions + decision reminders
 ```
 
-This avoids wasting time on live integration before the coordination model works.
+This avoids wasting time on live integration before the coordination model works. Completion check is in step 12: it only counts state from steps 5–10.
 
 ---
 
@@ -2926,19 +3658,24 @@ The MVP is complete when a replayed or live SharedNet room can demonstrate all o
 
 - Chorus recognizes a direct question.
 - Chorus recognizes a direct commitment.
+- Chorus recognizes a factual claim.
 - Chorus tracks whether the question is answered.
 - Chorus tracks whether the commitment completes.
 - Chorus detects two semantically duplicate commitments.
-- Chorus detects one unanswered question.
+- Chorus detects one unanswered question (both message-count and wall-clock paths, in replay).
 - Chorus detects one clear contradiction.
-- Chorus provides `@chorus status`.
+- Chorus provides `@chorus status` and `@chorus close-check`.
 - Every intervention references source messages.
 - Duplicate message delivery does not create duplicate state.
+- A worker restart mid-message does not lose or duplicate state.
+- Chorus's own messages produce no state.
 - Chorus rate limiting prevents spam.
 
 ---
 
 # 77. Hackathon Acceptance Tests
+
+All tests run through the replay harness with the virtual clock (§58).
 
 ## Test 1 — Duplicate work
 
@@ -2972,21 +3709,49 @@ Expected:
 no duplicate
 ```
 
+(This is the test that shows a cosine threshold alone is not enough: stage 2 must reject it even if stage 1 pairs it.)
+
 ---
 
-## Test 3 — Unanswered question
+## Test 3a — Unanswered question (busy room)
 
 Input:
 
 ```text
-A: Does the API support refunds?
-[12 unrelated messages]
+t=+0s   A: Does the API support refunds?
+t=+5s…  [12 unrelated messages, 5 s apart]
 ```
 
 Expected:
 
 ```text
-unanswered_question intervention
+unanswered_question intervention after the 12th message (age ≥ 30 s floor)
+```
+
+## Test 3b — Unanswered question (quiet room)
+
+Input:
+
+```text
+t=+0s   A: Does the API support refunds?
+t=+20s  B: ok
+advance clock to +310s
+```
+
+Expected:
+
+```text
+unanswered_question intervention on the first tick after +300s
+```
+
+## Test 3c — Chorus messages do not count
+
+Input: as 3a, but 4 of the 12 filler messages are Chorus messages.
+
+Expected:
+
+```text
+no unanswered_question intervention yet (only 8 room messages)
 ```
 
 ---
@@ -3004,6 +3769,7 @@ Expected:
 
 ```text
 question.status = answered
+claim recorded {subject: refund support, polarity: positive, conditions: ["24 hours"]}
 no unanswered alert
 ```
 
@@ -3021,6 +3787,7 @@ B: Refunds are not supported.
 Expected:
 
 ```text
+two claims recorded
 conflict.status = confirmed
 ```
 
@@ -3038,7 +3805,39 @@ B: Refunds are not supported after 24 hours.
 Expected:
 
 ```text
+two claims recorded with disjoint conditions
 no conflict
+```
+
+---
+
+## Test 7 — Redelivery and restart
+
+Input: Test 1's transcript, with message 2 delivered twice, and the worker killed after message 2 is persisted but before it is applied.
+
+Expected:
+
+```text
+exactly two commitments
+exactly one duplicate_work intervention posted
+```
+
+---
+
+## Test 8 — Unauthorized feedback
+
+Input:
+
+```text
+A: Does the API support refunds?
+C: @chorus resolved Q1
+```
+
+Expected:
+
+```text
+Q1.status = open
+feedback row with authorized = false
 ```
 
 ---
@@ -3178,20 +3977,25 @@ Agents knew when they were done.
 The first working version should demonstrate this exact transcript:
 
 ```text
-1. A asks a question.
-2. B promises to investigate.
-3. C promises to investigate the same thing.
-4. Chorus flags duplicate work.
-5. Several unrelated messages occur.
-6. B answers the question.
-7. A asks another question.
-8. Nobody answers.
-9. Chorus resurfaces it.
-10. B and C give contradictory answers.
-11. Chorus flags the conflict.
-12. The room resolves the conflict.
-13. @chorus close-check reports the room is clear.
+1.  A asks a question (Q1).
+2.  B promises to investigate (C1).
+3.  C promises to investigate the same thing (C2).
+4.  Chorus flags duplicate work (C1 ≈ C2).
+5.  C withdraws ("B has it, I'll drop mine") → C2 cancelled.
+6.  Several unrelated messages occur.
+7.  B answers the question → Q1 answered, C1 completed, claim K1 recorded.
+8.  A asks another question (Q2).
+9.  Nobody answers.
+10. Chorus resurfaces Q2 (message-count threshold).
+11. B and C give contradictory answers → claims K2, K3.
+12. Chorus flags the conflict (X1).
+13. C corrects their claim → X1 resolved, Q2 answered.
+14. @chorus close-check reports the room is clear.
 ```
+
+Step 5 matters: without it, C2 stays in progress and step 14 correctly reports NOT READY. Script the fixture so every commitment is either completed or withdrawn.
+
+Every step uses MVP features only (§44).
 
 If this sequence works reliably, Chorus already has a compelling hackathon demo.
 
