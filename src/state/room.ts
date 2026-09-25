@@ -50,6 +50,8 @@ export class RoomState {
   readonly candidateFirstSeen = new Map<string, number>();
   /** facilitate-mode READY TO CLOSE already announced (§25) */
   completionAnnounced = false;
+  /** coordination-complete as of the last commit; drives room.ready_to_close (§32) */
+  readyToClose = false;
 
   /** number of non-Chorus messages seen (spec §11.1) */
   roomIndex = 0;
@@ -137,6 +139,7 @@ export class RoomState {
       lastProcessedSeq: this.lastProcessedSeq,
       counters: { ...this.counters },
       completionAnnounced: this.completionAnnounced,
+      readyToClose: this.readyToClose,
       agents: [...this.agents.values()],
       messages: this.messages,
       questions: [...this.questions.values()],
@@ -162,6 +165,7 @@ export class RoomState {
     s.lastProcessedSeq = j.lastProcessedSeq;
     s.counters = { ...j.counters };
     s.completionAnnounced = j.completionAnnounced;
+    s.readyToClose = j.readyToClose ?? false;
     for (const a of j.agents) s.agents.set(a.id, a);
     for (const m of j.messages) {
       s.messages.push(m);
@@ -190,6 +194,7 @@ export interface RoomSnapshot {
   lastProcessedSeq: number;
   counters: Record<string, number>;
   completionAnnounced: boolean;
+  readyToClose?: boolean;
   agents: Agent[];
   messages: Message[];
   questions: Question[];

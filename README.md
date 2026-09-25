@@ -33,8 +33,30 @@ State is saved to SQLite (`.chorus/chorus.db`, override with `CHORUS_DB`) after 
 | `CHORUS_EXTRACTOR` | `heuristic` (default, deterministic) or `claude` (needs Anthropic credentials) |
 | `LLM_MODEL` | model for the Claude extractor; default `claude-opus-5` |
 | `CHORUS_DB` | SQLite state file; default `.chorus/chorus.db` |
+| `CHORUS_API_PORT` | serve the state API and event stream on this port (off by default) |
+| `CHORUS_API_TOKEN` | bearer token for the API; generated and printed at startup if unset |
 
 In the room: `@chorus status`, `open`, `commitments`, `conflicts`, `decisions`, `what-am-i-waiting-on`, `close-check`, `mode <m>`, and feedback `resolved <id>`, `ignore <id>`, `wrong [id]`, `correct [id]`, `reopen <D…>` (permission-checked, spec §60).
+
+### State API and event stream (spec §31–32)
+
+With `CHORUS_API_PORT` set, other agents can read room state directly instead of asking in chat. Every route needs `Authorization: Bearer $CHORUS_API_TOKEN`.
+
+| Route | Returns |
+|---|---|
+| `GET /v1/rooms/:room/state` | counts of open questions, commitments, handoffs, conflicts, dependencies, decisions; `coordination_complete` |
+| `GET /v1/rooms/:room/open-items` | every open question, commitment, handoff, conflict and dependency, with age and source message |
+| `GET /v1/rooms/:room/decisions` | current and superseded decisions |
+| `GET /v1/rooms/:room/agents/:agent/context` | one agent's commitments, handoffs to and from them, what they wait on, their questions |
+| `GET /v1/rooms/:room/objects/:id/history` | an object with its full transition log and source messages (§41) |
+| `GET /v1/rooms/:room/events` | Server-Sent Events: `question.opened`, `commitment.completed`, `conflict.detected`, `dependency.resolved`, `room.ready_to_close`, … |
+
+Each event's SSE `id` is its position in the room's transition log, which is persisted, so a client resumes with `Last-Event-ID` (or `?after=N`) even across Chorus restarts.
+
+```bash
+curl -H "authorization: Bearer $CHORUS_API_TOKEN" localhost:8787/v1/rooms/rom_…/open-items
+curl -N -H "authorization: Bearer $CHORUS_API_TOKEN" localhost:8787/v1/rooms/rom_…/events
+```
 
 ## What is built (spec §44 items 1–10)
 
@@ -47,10 +69,11 @@ In the room: `@chorus status`, `open`, `commitments`, `conflicts`, `decisions`, 
 | Rules | `src/rules/rules.ts` | All nine §27 intervention types: duplicate work (two-stage), unanswered (count OR wall-clock), missing handoff acknowledgement, stale commitment, conflicts (grouped), repeated question, decision reminder, dependency resolved, completion |
 | Persistence | `src/store.ts`, `src/state/room.ts` | SQLite snapshot + resume cursor committed per message; message and intervention audit log; deterministic post idempotency keys (§35) |
 | Policy | `src/policy.ts` | §26 score, mode filter, dedup, rate limits, queue TTL |
-| Commands + feedback | `src/commands.ts` | §29 MVP commands, §60 permissions |
+| Commands + feedback | `src/commands.ts` | §29 commands, §60 permissions |
+| State API + SSE | `src/api/views.ts`, `src/api/server.ts` | §31 routes, §32 events with resumable IDs, §41 history; node:http, bearer auth |
 | SharedNet transport | `src/transport/sharednet.ts` | Raw API `wait` loop, idempotent posts, roster |
 
-**Not built yet:** intervention merging (§51), dependency deadlock detection (§26), embeddings (stage 1 is lexical overlap instead, see `src/similarity.ts`), raw LLM-response logging (§48), receipts (§54), the SSE/HTTP API (§31–§32). Persistence stores a full snapshot per message, which is fine at hackathon scale but should become incremental for long rooms. The Claude extractor has not been run against the live API from this environment (no credentials).
+**Not built yet:** intervention merging (§51), dependency deadlock detection (§26), embeddings (stage 1 is lexical overlap instead, see `src/similarity.ts`), raw LLM-response logging (§48), receipts (§54). Persistence stores a full snapshot per message, which is fine at hackathon scale but should become incremental for long rooms. The Claude extractor has not been run against the live API from this environment (no credentials).
 
 ## SharedNet transport capabilities (Phase 0 spike, 2026-09-25)
 

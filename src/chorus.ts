@@ -8,9 +8,11 @@ import { COMMAND, runCommand } from "./commands.ts";
 import type { ChorusConfig } from "./config.ts";
 import type { Confirmer } from "./confirm.ts";
 import type { Extractor, ExtractionContext } from "./extract/types.ts";
+import { transitionEvent, type RoomEvent } from "./api/views.ts";
 import { InterventionPolicy } from "./policy.ts";
 import {
   completion,
+  completionReport,
   conflicts,
   duplicateWork,
   decisionReminders,
@@ -71,6 +73,9 @@ export class ChorusRoom {
   private timer: NodeJS.Timeout | null = null;
   /** interventions posted since the last commit */
   private pending: InterventionRow[] = [];
+  private readonly listeners = new Set<(e: RoomEvent) => void>();
+  /** transitions already published to subscribers */
+  private published = 0;
 
   constructor(private readonly opts: ChorusOptions) {
     this.store = opts.store ?? new MemoryStore();
@@ -81,6 +86,23 @@ export class ChorusRoom {
 
   get state(): RoomState {
     return this._state;
+  }
+
+  /** Receive state-change events as they are committed (§32). Returns an unsubscribe function. */
+  subscribe(listener: (e: RoomEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  /** Events after `lastId` (exclusive), for SSE Last-Event-ID resume. */
+  eventsSince(lastId: number): RoomEvent[] {
+    const out: RoomEvent[] = [];
+    const t = this._state.transitions;
+    for (let i = Math.max(0, lastId + 1); i < t.length; i++) {
+      const e = transitionEvent(this._state, t[i]!, i);
+      if (e) out.push(e);
+    }
+    return out;
   }
 
   private emit(e: ChorusEvent): void {
@@ -110,6 +132,7 @@ export class ChorusRoom {
     const saved = this.store.load(this.roomKey);
     if (saved) {
       this._state = RoomState.fromJSON(saved.state);
+      this.published = this._state.transitions.length;
       this.emit({
         kind: "state",
         detail: `restored ${this.roomKey} at #${saved.lastProcessedSeq} (mode ${this._state.mode})`,
@@ -139,6 +162,20 @@ export class ChorusRoom {
   }
 
   private commit(message?: MessageRow): void {
+    const s = this._state;
+    const complete = completionReport(s).complete && s.transitions.some((t) => t.kind !== "room");
+    if (complete !== s.readyToClose) {
+      s.readyToClose = complete;
+      s.record({
+        objectId: "room",
+        kind: "room",
+        from: complete ? "active" : "ready_to_close",
+        to: complete ? "ready_to_close" : "active",
+        cause: message ? "event" : "tick",
+        messageId: message?.externalId,
+        at: this.opts.clock.now().toISOString(),
+      });
+    }
     this.store.commit(this.roomKey, {
       seq: this._state.lastProcessedSeq,
       state: this._state.toJSON(),
@@ -146,6 +183,12 @@ export class ChorusRoom {
       interventions: this.pending,
     });
     this.pending = [];
+    // Publish only after the state is durable.
+    const t = s.transitions;
+    for (; this.published < t.length; this.published++) {
+      const e = transitionEvent(s, t[this.published]!, this.published);
+      if (e) for (const l of this.listeners) l(e);
+    }
   }
 
   private ensureAgent(id: string, name?: string): void {

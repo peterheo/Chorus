@@ -10,14 +10,18 @@
 //   CHORUS_EXTRACTOR     heuristic (default) | claude
 //   LLM_MODEL            model for the claude extractor (default claude-opus-5)
 //   CHORUS_DB            SQLite file for room state (default .chorus/chorus.db)
+//   CHORUS_API_PORT      serve the state API + SSE (spec §31–32) on this port
+//   CHORUS_API_TOKEN     bearer token for the API (generated and printed if unset)
 //
 // Flags:
 //   --after N            start after sequence N. Default: where the saved
 //                        state left off, or the room's latest message on a
 //                        first run (so history is not re-announced).
 
+import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { createApiServer } from "../api/server.ts";
 import { ChorusRoom } from "../chorus.ts";
 import { SystemClock } from "../clock.ts";
 import { defaultConfig, type Mode } from "../config.ts";
@@ -92,8 +96,23 @@ const room = new ChorusRoom({
 await room.start({ tick: true });
 log(`Chorus listening in ${roomId} as ${transport.selfId()} (mode ${mode}, extractor ${useClaude ? "claude" : "heuristic"}, after #${after})`);
 
+const apiPort = env.CHORUS_API_PORT ? Number(env.CHORUS_API_PORT) : undefined;
+const api =
+  apiPort === undefined
+    ? undefined
+    : (() => {
+        const apiToken = env.CHORUS_API_TOKEN ?? randomBytes(24).toString("base64url");
+        const server = createApiServer({ rooms: new Map([[roomId, room]]), token: apiToken });
+        server.listen(apiPort, () => {
+          log(`State API on http://localhost:${apiPort}/v1/rooms/${roomId}/state`);
+          if (!env.CHORUS_API_TOKEN) log(`API token (set CHORUS_API_TOKEN to fix it): ${apiToken}`);
+        });
+        return server;
+      })();
+
 const shutdown = async () => {
   log("shutting down");
+  api?.close();
   await room.stop();
   store.close();
   process.exit(0);

@@ -139,7 +139,8 @@ export interface Dependency extends Provenance {
 
 export interface Transition {
   objectId: string;
-  kind: ObjectKind;
+  /** "room" for room-level changes such as ready_to_close (§32) */
+  kind: ObjectKind | "room";
   from: string | null;
   to: string;
   cause: "event" | "tick" | "command" | "feedback";
