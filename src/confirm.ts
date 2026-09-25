@@ -1,5 +1,5 @@
 // Stage-2 confirmation interface (spec §18, §22) and its deterministic
-// implementation. The Claude implementation lives in extract/claude.ts.
+// implementation. The LLM implementation lives in extract/llm.ts.
 
 import type { ConflictVerdict, DuplicateVerdict } from "./schemas/llm.ts";
 import { conditionsOverlap, contentTokens, overlap } from "./similarity.ts";

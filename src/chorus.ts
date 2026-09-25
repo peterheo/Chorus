@@ -29,7 +29,7 @@ import {
 import { applyDeadlines, applyEvents, settle } from "./state/engine.ts";
 import { RoomState } from "./state/room.ts";
 import type { InterventionCandidate, Message } from "./state/types.ts";
-import type { LlmCall } from "./extract/claude.ts";
+import type { LlmCall } from "./extract/llm.ts";
 import { agentBrief } from "./insights.ts";
 import { endExpiredSession, settleOrders } from "./operations.ts";
 import { ReceiptSigner } from "./receipts.ts";

@@ -7,7 +7,8 @@ import { ChorusRoom } from "../src/chorus.ts";
 import { VirtualClock } from "../src/clock.ts";
 import { defaultConfig } from "../src/config.ts";
 import { HeuristicConfirmer } from "../src/confirm.ts";
-import { ClaudeExtractor, type LlmCall } from "../src/extract/claude.ts";
+import { ClaudeExtractor } from "../src/extract/claude.ts";
+import type { LlmCall } from "../src/extract/llm.ts";
 import { HeuristicExtractor } from "../src/extract/heuristic.ts";
 import { ReplayTransport } from "../src/transport/replay.ts";
 

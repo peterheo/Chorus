@@ -1,5 +1,5 @@
-// Stage-1 similarity (spec §18, §22, §15). Anthropic has no embeddings
-// endpoint, so the hackathon profile uses a lexical overlap coefficient over
+// Stage-1 similarity (spec §18, §22, §15). Without an embeddings
+// dependency, the hackathon profile uses a lexical overlap coefficient over
 // stemmed content words. Stage-2 confirmation (confirm.ts) is where an LLM
 // judges meaning; this layer only has to find candidates cheaply.
 

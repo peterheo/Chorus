@@ -7,8 +7,13 @@
 //   SHAREDNET_SEAT_FILE  path to a seat file written by `sharednet join`
 //                        (~/.config/sharednet/rooms/<room>/<member>.json)
 //   CHORUS_MODE          observe | assist (default) | facilitate
-//   CHORUS_EXTRACTOR     heuristic (default) | claude
-//   LLM_MODEL            model for the claude extractor (default claude-opus-5)
+//   CHORUS_EXTRACTOR     heuristic | gemini | claude. Default: gemini when
+//                        GEMINI_API_KEY is set, otherwise heuristic
+//   GEMINI_API_KEY       Google AI Studio key for the gemini extractor
+//   LLM_MODEL            model for the LLM extractor (default gemini-3.8-flash
+//                        for gemini, claude-opus-5 for claude)
+//   GEMINI_FALLBACK_MODELS  comma-separated models to try when the primary is
+//                        overloaded (default gemini-flash-latest,gemini-flash-lite-latest)
 //   CHORUS_DB            SQLite file for room state (default .chorus/chorus.db)
 //   CHORUS_API_PORT      serve the state API + SSE (spec §31–32) on this port
 //   CHORUS_API_TOKEN     bearer token for the API (generated and printed if unset)
@@ -32,8 +37,8 @@ import { ChorusRoom } from "../chorus.ts";
 import { SystemClock } from "../clock.ts";
 import { defaultConfig, type Mode } from "../config.ts";
 import { HeuristicConfirmer } from "../confirm.ts";
-import { ClaudeConfirmer, ClaudeExtractor } from "../extract/claude.ts";
 import { HeuristicExtractor } from "../extract/heuristic.ts";
+import { extractorKind, llmComponents } from "../extract/select.ts";
 import { ReceiptSigner } from "../receipts.ts";
 import { SqliteStore } from "../store.ts";
 import { SharedNetTransport } from "../transport/sharednet.ts";
@@ -84,7 +89,7 @@ const afterIdx = process.argv.indexOf("--after");
 const after =
   afterIdx >= 0 ? Number(process.argv[afterIdx + 1]) : saved ? saved.lastProcessedSeq : await latestSequence();
 
-const useClaude = env.CHORUS_EXTRACTOR === "claude";
+const kind = extractorKind(env);
 const transport = new SharedNetTransport({ baseUrl, roomId, token, after, log });
 const signer = ReceiptSigner.load({
   pem: env.RECEIPT_SIGNING_KEY,
@@ -92,14 +97,14 @@ const signer = ReceiptSigner.load({
   keyId: env.RECEIPT_KEY_ID,
 });
 // LLM calls are logged to SQLite and counted (§48, §59); `room` is assigned below.
-const claudeOpts = { model: env.LLM_MODEL, log, onCall: (c: Parameters<ChorusRoom["recordLlmCall"]>[0]) => room.recordLlmCall(c) };
+const llm = llmComponents(kind, env, { log, onCall: (c) => room.recordLlmCall(c) });
 const room: ChorusRoom = new ChorusRoom({
   transport,
   signer,
-  extractor: useClaude ? new ClaudeExtractor(claudeOpts) : new HeuristicExtractor(),
-  fallbackExtractor: useClaude ? new HeuristicExtractor() : undefined,
+  extractor: llm?.extractor ?? new HeuristicExtractor(),
+  fallbackExtractor: llm ? new HeuristicExtractor() : undefined,
   election: env.CHORUS_ELECTION === "1",
-  confirmer: useClaude ? new ClaudeConfirmer(claudeOpts) : new HeuristicConfirmer(),
+  confirmer: llm?.confirmer ?? new HeuristicConfirmer(),
   clock: new SystemClock(),
   config: {
     ...defaultConfig,
@@ -115,7 +120,7 @@ const room: ChorusRoom = new ChorusRoom({
 });
 
 await room.start({ tick: true });
-log(`Chorus listening in ${roomId} as ${transport.selfId()} (mode ${mode}, extractor ${useClaude ? "claude" : "heuristic"}, after #${after})`);
+log(`Chorus listening in ${roomId} as ${transport.selfId()} (mode ${mode}, extractor ${kind}${llm ? ` ${llm.model}` : ""}, after #${after})`);
 log(`Receipts signed with key ${signer.keyId}`);
 
 const apiPort = env.CHORUS_API_PORT ? Number(env.CHORUS_API_PORT) : undefined;

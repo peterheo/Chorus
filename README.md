@@ -10,8 +10,9 @@ Requires Node 22+.
 
 ```bash
 npm install
-npm test                                        # 115 tests: acceptance, rules, persistence, API, operations, payments, …
+npm test                                        # 128 tests: acceptance, rules, persistence, API, operations, payments, …
 npm run replay -- tests/fixtures/milestone.json # the §82 milestone, with a state timeline
+GEMINI_API_KEY=… npm run replay -- tests/fixtures/milestone.json --llm gemini   # same, with Gemini extraction
 npm run bench                                   # per-message cost as a room grows
 ```
 
@@ -33,8 +34,10 @@ State is saved to SQLite (`.chorus/chorus.db`) after every message. On restart C
 | Variable | Values |
 |---|---|
 | `CHORUS_MODE` | `observe` (silent), `assist` (default: commands, confirmed conflicts, repeated questions, resolved dependencies, deadlocks), `facilitate` (everything) |
-| `CHORUS_EXTRACTOR` | `heuristic` (default, deterministic) or `claude` (needs Anthropic credentials; falls back to `heuristic` over 60 calls/minute) |
-| `LLM_MODEL` | model for the Claude extractor; default `claude-opus-5` |
+| `CHORUS_EXTRACTOR` | `heuristic` (deterministic rules), `gemini` or `claude`. Default: `gemini` when `GEMINI_API_KEY` is set, otherwise `heuristic`. The LLM extractors fall back to `heuristic` over 60 calls/minute or when a call fails |
+| `GEMINI_API_KEY` | Google AI Studio API key for the Gemini extractor and confirmer |
+| `LLM_MODEL` | model for the LLM extractor; default `gemini-3.8-flash` (Gemini) or `claude-opus-5` (Claude) |
+| `GEMINI_FALLBACK_MODELS` | comma-separated models tried when the primary is overloaded (HTTP 503/429); default `gemini-flash-latest,gemini-flash-lite-latest`; empty disables |
 | `CHORUS_DB` | SQLite state file; default `.chorus/chorus.db` |
 | `CHORUS_API_PORT` | serve the state API and event stream on this port (off by default) |
 | `CHORUS_API_TOKEN` | bearer token for the API; generated and printed at startup if unset |
@@ -100,7 +103,7 @@ Receipts (§54) are RFC 8785-canonical JSON, hashed with SHA-256 and signed with
 |---|---|
 | Pipeline (inbox, batching, rollback, commits) | `src/chorus.ts` |
 | Schemas (LLM layer + domain) | `src/schemas/llm.ts`, `src/state/types.ts` |
-| Extraction | `src/extract/heuristic.ts` (rules), `src/extract/claude.ts` (Claude, structured output) |
+| Extraction | `src/extract/heuristic.ts` (rules); `src/extract/llm.ts` (LLM extractor/confirmer, prompts, retry) with backends `src/extract/gemini.ts` (Gemini REST, JSON-schema output) and `src/extract/claude.ts` (Claude, structured output); `src/extract/select.ts` picks one from the environment |
 | State engine and room state | `src/state/engine.ts`, `src/state/room.ts`, `src/deadline.ts` |
 | Rules, policy, commands | `src/rules/rules.ts`, `src/policy.ts`, `src/commands.ts` |
 | Operations, receipts, metrics, insights | `src/operations.ts`, `src/receipts.ts`, `src/metrics.ts`, `src/insights.ts` |
@@ -110,8 +113,8 @@ Receipts (§54) are RFC 8785-canonical JSON, hashed with SHA-256 and signed with
 
 ## Known limitations
 
-- **Not run against the live Claude API** from the build environment (no credentials). The Claude path is covered by tests with a fake client; set `CHORUS_EXTRACTOR=claude` and Anthropic credentials to use it.
-- **Stage-1 similarity is lexical**, not embeddings (Anthropic has no embeddings endpoint); stage-2 confirmation uses Claude when enabled. The rule-based extractor covers the phrasing in the spec and tests, not open-ended language.
+- **LLM extraction is opt-in.** Set `GEMINI_API_KEY` to use Gemini. On 12 natural phrasings (commitments like "Leave pricing to me", dependencies like "Can't move on the summary until Alice's numbers land", decisions like "Let's just go with JSON") the Gemini extractor read 11 correctly and the rule-based one 6. The rule-based extractor covers the phrasing in the spec and tests, not open-ended language. Replaying `tests/fixtures/milestone.json` through Gemini posts the same interventions as the rules. Latency is 1–2 s per message when the model is not overloaded; Gemini often answers 503 under load, which Chorus retries with backoff and then moves to the fallback models. The Claude backend is covered by tests with a fake client only.
+- **Stage-1 similarity is lexical**, not embeddings; stage-2 confirmation uses the LLM when enabled.
 - **Scale.** Messages and transitions are stored append-only, and rules work incrementally, so per-message cost grows only with the number of *objects* (questions, commitments, …), not with messages. A synthetic 4,000-message room with ~3,000 open objects runs at 3 ms/message early and 20 ms/message at the end (`node --import tsx` benchmark, heuristic extractor). Rooms far larger than that would want objects in their own tables too (spec §33).
 - **Paid operations are off by default.** With `CHORUS_REQUIRE_PAYMENT=1`, Chorus quotes a price and an order memo (`sharednet pay <chorus> <n> --memo chorus:ord_…`) and starts the operation when the transfer arrives; the receipt cites the transfer. This is tested against a mocked API only: a live paid flow needs a payer on a different SharedNet account (transfers to yourself are refused). There are no refunds.
 - **Edits and deletes** are not handled because SharedNet does not deliver them.
