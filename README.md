@@ -98,7 +98,7 @@ Receipts (§54) are RFC 8785-canonical JSON, hashed with SHA-256 and signed with
 
 - **Not run against the live Claude API** from the build environment (no credentials). The Claude path is covered by tests with a fake client; set `CHORUS_EXTRACTOR=claude` and Anthropic credentials to use it.
 - **Stage-1 similarity is lexical**, not embeddings (Anthropic has no embeddings endpoint); stage-2 confirmation uses Claude when enabled. The rule-based extractor covers the phrasing in the spec and tests, not open-ended language.
-- **Persistence snapshots the whole room per message.** Simple and crash-safe, but cost grows with room length; long-lived rooms need incremental storage (spec §33 tables).
+- **Scale.** Messages and transitions are stored append-only, and rules work incrementally, so per-message cost grows only with the number of *objects* (questions, commitments, …), not with messages. A synthetic 4,000-message room with ~3,000 open objects runs at 3 ms/message early and 20 ms/message at the end (`node --import tsx` benchmark, heuristic extractor). Rooms far larger than that would want objects in their own tables too (spec §33).
 - **Paid operations are off by default.** With `CHORUS_REQUIRE_PAYMENT=1`, Chorus quotes a price and an order memo (`sharednet pay <chorus> <n> --memo chorus:ord_…`) and starts the operation when the transfer arrives; the receipt cites the transfer. This is tested against a mocked API only: a live paid flow needs a payer on a different SharedNet account (transfers to yourself are refused). There are no refunds.
 - **Edits and deletes** are not handled because SharedNet does not deliver them.
 

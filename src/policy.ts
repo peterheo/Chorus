@@ -7,12 +7,16 @@ import type { InterventionCandidate } from "./state/types.ts";
 
 const SEVERITY = { low: 0.2, medium: 0.5, high: 1.0 } as const;
 
-export function score(state: RoomState, c: InterventionCandidate): number {
+/** Unsolicited Chorus messages among the last 10 room messages (the §26 noise penalty input). */
+export function recentChorusNoise(state: RoomState): number {
   // Only unsolicited Chorus messages count as noise; replies to commands don't.
-  const unsolicitedIds = new Set(state.posted.filter((p) => !p.solicited && p.messageId).map((p) => p.messageId));
-  const recentChorus = state.messages
-    .slice(-10)
-    .filter((m) => m.isFromChorus && unsolicitedIds.has(m.id)).length;
+  const recent = state.messages.slice(-10).filter((m) => m.isFromChorus);
+  if (recent.length === 0) return 0;
+  const ids = new Set(recent.map((m) => m.id));
+  return state.posted.filter((p) => !p.solicited && p.messageId && ids.has(p.messageId)).length;
+}
+
+export function score(state: RoomState, c: InterventionCandidate, recentChorus = recentChorusNoise(state)): number {
   return (
     0.3 * SEVERITY[c.severity] +
     0.2 * c.urgency +
@@ -70,6 +74,7 @@ export class InterventionPolicy {
       (p) => now.getTime() - new Date(p.postedAt).getTime() < 5 * 60_000,
     ).length;
 
+    const noise = recentChorusNoise(state);
     const eligible: Array<{ c: InterventionCandidate; s: number }> = [];
     for (const c of candidates) {
       if (postedKeys.has(c.idempotencyKey)) continue; // hard dedup
@@ -87,7 +92,7 @@ export class InterventionPolicy {
         suppressed.push({ candidate: c, reason: "queue TTL expired" });
         continue;
       }
-      const s = score(state, c);
+      const s = score(state, c, noise);
       if (s < cfg.minScore) {
         suppressed.push({ candidate: c, reason: `score ${s.toFixed(2)} < ${cfg.minScore}` });
         continue;

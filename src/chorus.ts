@@ -10,7 +10,7 @@ import type { Confirmer } from "./confirm.ts";
 import type { Extractor, ExtractionContext } from "./extract/types.ts";
 import type { ExtractedEvent } from "./schemas/llm.ts";
 import { transitionEvent, type RoomEvent } from "./api/views.ts";
-import { InterventionPolicy } from "./policy.ts";
+import { InterventionPolicy, keyFamily } from "./policy.ts";
 import {
   completion,
   completionReport,
@@ -23,6 +23,7 @@ import {
   resolvedDependencies,
   staleCommitments,
   unansweredQuestions,
+  newDuplicateCache,
   type RuleContext,
 } from "./rules/rules.ts";
 import { applyDeadlines, applyEvents, settle } from "./state/engine.ts";
@@ -109,6 +110,12 @@ export class ChorusRoom {
   /** start times of recent LLM extraction calls, for the §63 budget */
   private llmWindow: number[] = [];
   private lastPruneAt = 0;
+  /** retention cutoff to apply to storage in the next commit (§65) */
+  private pendingPrune: string | undefined;
+  /** incremental duplicate-work comparisons (rebuilt on restart, reset on rollback) */
+  private duplicates = newDuplicateCache();
+  /** how many messages/transitions the store already has (append-only logs) */
+  private committed = { messages: 0, transitions: 0 };
   private lastRosterAt = 0;
   private lastPaymentPollAt = 0;
   /** a welcome-back brief for the author of the message being processed (§78) */
@@ -158,7 +165,7 @@ export class ChorusRoom {
     this.lastPruneAt = now.getTime();
     const cutoff = new Date(now.getTime() - this.opts.config.retention.days * 86_400_000).toISOString();
     const n = this._state.prune(cutoff);
-    this.store.prune?.(this.roomKey, cutoff);
+    this.pendingPrune = cutoff; // applied to storage inside the next commit
     if (n) this.emit({ kind: "state", detail: `retention: pruned text of ${n} messages older than ${cutoff}` });
     return n;
   }
@@ -205,13 +212,22 @@ export class ChorusRoom {
    * nothing uncommitted is kept. The error is rethrown.
    */
   private async atomically<T>(fn: () => Promise<T>): Promise<T> {
-    const before = JSON.stringify(this._state.toJSON());
+    // Only the core is copied; the append-only logs are restored by truncation.
+    const s = this._state;
+    const core = JSON.stringify(s.toCore());
+    const lengths = { messages: s.messages.length, transitions: s.transitions.length };
     try {
       return await fn();
     } catch (err) {
-      this._state = RoomState.fromJSON(JSON.parse(before));
+      const now = this._state;
+      this._state = RoomState.fromJSON({
+        ...JSON.parse(core),
+        messages: now.messages.slice(0, lengths.messages),
+        transitions: now.transitions.slice(0, lengths.transitions),
+      });
       this.pending = [];
       this.pendingReceipts = [];
+      this.duplicates = newDuplicateCache(); // rolled-back IDs will be reused
       throw err;
     }
   }
@@ -231,6 +247,7 @@ export class ChorusRoom {
     if (saved) {
       this._state = RoomState.fromJSON(saved.state);
       this.published = this._state.transitions.length;
+      this.committed = { ...saved.persisted };
       this.emit({
         kind: "state",
         detail: `restored ${this.roomKey} at #${saved.lastProcessedSeq} (mode ${this._state.mode})`,
@@ -363,6 +380,13 @@ export class ChorusRoom {
     }
   }
 
+  /** Keys that can never be posted again: already posted/absorbed, or suppressed by feedback. */
+  private handledKeys(): (key: string) => boolean {
+    const s = this._state;
+    const done = new Set(s.posted.flatMap((p) => [p.candidate.idempotencyKey, ...(p.candidate.absorbedKeys ?? [])]));
+    return (key) => done.has(key) || s.suppressedKeys.has(key) || s.suppressedKeys.has(keyFamily(key));
+  }
+
   /** A solicited reply (command answers, receipts): exempt from rate limits. */
   private reply(key: string, text: string, involved: string[], replyToMessageId?: string): InterventionCandidate {
     return {
@@ -421,12 +445,19 @@ export class ChorusRoom {
       });
     }
     this.store.commit(this.roomKey, {
-      seq: this._state.lastProcessedSeq,
-      state: this._state.toJSON(),
+      seq: s.lastProcessedSeq,
+      core: s.toCore(),
+      appendMessages: s.messages.slice(this.committed.messages),
+      messagesFrom: this.committed.messages,
+      appendTransitions: s.transitions.slice(this.committed.transitions),
+      transitionsFrom: this.committed.transitions,
+      pruneBefore: this.pendingPrune,
       message,
       interventions: this.pending,
       receipts: this.pendingReceipts,
     });
+    this.committed = { messages: s.messages.length, transitions: s.transitions.length };
+    this.pendingPrune = undefined;
     this.pending = [];
     this.pendingReceipts = [];
     // Publish only after the state is durable.
@@ -594,7 +625,7 @@ export class ChorusRoom {
       replyToId: ext.replyToId,
       isFromChorus,
     };
-    s.messages.push(msg);
+    s.addMessage(msg);
     const agent = s.agents.get(ext.authorId)!;
     if (!isFromChorus) {
       agent.prevRoomIndex = agent.lastRoomIndex;
@@ -703,7 +734,13 @@ export class ChorusRoom {
 
   private async evaluate(trigger: "state_change" | "tick"): Promise<void> {
     const s = this._state;
-    const ctx: RuleContext = { config: this.opts.config, confirmer: this.opts.confirmer, now: this.opts.clock.now() };
+    const ctx: RuleContext = {
+      config: this.opts.config,
+      confirmer: this.opts.confirmer,
+      now: this.opts.clock.now(),
+      duplicates: this.duplicates,
+      handled: this.handledKeys(),
+    };
     // §17.1: count-based thresholds are crossed by a message arriving, so the
     // time-based rules also run on state changes; completion is tick-only.
     const candidates: InterventionCandidate[] = [

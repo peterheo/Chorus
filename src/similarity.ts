@@ -26,13 +26,27 @@ export function stem(word: string): string {
   return w;
 }
 
+const tokenCache = new Map<string, Set<string>>();
+const TOKEN_CACHE_MAX = 20_000;
+
+/** Content tokens of `text`. Memoized: the same texts are compared many times. Treat the result as read-only. */
 export function contentTokens(text: string): Set<string> {
+  const hit = tokenCache.get(text);
+  if (hit) return hit;
+  const out = computeTokens(text);
+  if (tokenCache.size >= TOKEN_CACHE_MAX) tokenCache.clear();
+  tokenCache.set(text, out);
+  return out;
+}
+
+function computeTokens(text: string): Set<string> {
   const words = text.toLowerCase().match(/[a-z0-9']+/g) ?? [];
   const out = new Set<string>();
   for (const w of words) {
     if (STOPWORDS.has(w)) continue;
     const s = stem(w.replace(/'/g, ""));
-    if (s.length > 1 && !STOPWORDS.has(s)) out.add(s);
+    // Keep numbers of any length: "item 5" and "item 7" are different work.
+    if ((s.length > 1 || /^\d$/.test(s)) && !STOPWORDS.has(s)) out.add(s);
   }
   return out;
 }

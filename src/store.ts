@@ -1,14 +1,19 @@
 // Persistence (spec §33, §35, §69, §70), hackathon profile: SQLite via
-// Node's built-in node:sqlite. After every processed message the full room
-// state is snapshotted together with last_processed_seq in one transaction,
-// so a crash mid-message re-processes that message from the previous
-// snapshot. Messages and interventions are also kept as an audit log.
+// Node's built-in node:sqlite. After every processed message, one transaction
+// writes: the room's core state (objects, counters, interventions), only the
+// *new* room messages and transitions (append-only tables, so cost does not
+// grow with room length), and last_processed_seq. A crash mid-message
+// re-processes that message from the previous commit. Messages and
+// interventions are also kept as an audit log.
 
 import { DatabaseSync } from "node:sqlite";
 
 export interface StoredRoom {
   lastProcessedSeq: number;
+  /** full RoomSnapshot: core state with messages and transitions reassembled */
   state: unknown;
+  /** how many messages/transitions are already in the append-only tables */
+  persisted: { messages: number; transitions: number };
 }
 
 export interface MessageRow {
@@ -53,7 +58,15 @@ export interface LlmCallRow {
 
 export interface CommitPayload {
   seq: number;
-  state: unknown;
+  /** room state without messages and transitions (RoomState.toCore()) */
+  core: unknown;
+  /** messages/transitions appended since the last commit, and the index of the first */
+  appendMessages: unknown[];
+  messagesFrom: number;
+  appendTransitions: unknown[];
+  transitionsFrom: number;
+  /** §65: blank stored message text and delete audit rows older than this */
+  pruneBefore?: string;
   message?: MessageRow;
   interventions: InterventionRow[];
   receipts?: ReceiptRow[];
@@ -63,20 +76,28 @@ export interface Store {
   load(roomId: string): StoredRoom | null;
   commit(roomId: string, commit: CommitPayload): void;
   logLlmCall?(roomId: string, call: LlmCallRow): void;
-  /** §65: delete audit rows older than the cutoff */
-  prune?(roomId: string, cutoffIso: string): void;
   close(): void;
 }
 
-/** No persistence: replay and tests. */
+/** No persistence: replay and tests. Same semantics as SqliteStore. */
 export class MemoryStore implements Store {
-  private rooms = new Map<string, StoredRoom>();
+  private rooms = new Map<string, { seq: number; core: unknown; messages: unknown[]; transitions: unknown[] }>();
   load(roomId: string): StoredRoom | null {
     const r = this.rooms.get(roomId);
-    return r ? structuredClone(r) : null;
+    if (!r) return null;
+    const state = structuredClone({ ...(r.core as object), messages: r.messages, transitions: r.transitions });
+    return { lastProcessedSeq: r.seq, state, persisted: { messages: r.messages.length, transitions: r.transitions.length } };
   }
   commit(roomId: string, c: CommitPayload): void {
-    this.rooms.set(roomId, { lastProcessedSeq: c.seq, state: structuredClone(c.state) });
+    const r = this.rooms.get(roomId) ?? { seq: 0, core: {}, messages: [], transitions: [] };
+    r.seq = c.seq;
+    r.core = structuredClone(c.core);
+    c.appendMessages.forEach((m, i) => (r.messages[c.messagesFrom + i] = structuredClone(m)));
+    c.appendTransitions.forEach((t, i) => (r.transitions[c.transitionsFrom + i] = structuredClone(t)));
+    if (c.pruneBefore) {
+      for (const m of r.messages as Array<{ timestamp: string; text: string }>) if (m.timestamp < c.pruneBefore) m.text = "";
+    }
+    this.rooms.set(roomId, r);
   }
   close(): void {}
 }
@@ -105,6 +126,19 @@ export class SqliteStore implements Store {
         last_processed_seq INTEGER NOT NULL,
         state_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+      -- Append-only room logs, one JSON row per entry (idx = position).
+      CREATE TABLE IF NOT EXISTS state_messages (
+        room_id TEXT NOT NULL,
+        idx INTEGER NOT NULL,
+        json TEXT NOT NULL,
+        PRIMARY KEY (room_id, idx)
+      );
+      CREATE TABLE IF NOT EXISTS state_transitions (
+        room_id TEXT NOT NULL,
+        idx INTEGER NOT NULL,
+        json TEXT NOT NULL,
+        PRIMARY KEY (room_id, idx)
       );
       CREATE TABLE IF NOT EXISTS messages (
         room_id TEXT NOT NULL,
@@ -157,7 +191,24 @@ export class SqliteStore implements Store {
     const row = this
       .stmt("SELECT last_processed_seq, state_json FROM rooms WHERE room_id = ?")
       .get(roomId) as { last_processed_seq: number; state_json: string } | undefined;
-    return row ? { lastProcessedSeq: row.last_processed_seq, state: JSON.parse(row.state_json) } : null;
+    if (!row) return null;
+    const core = JSON.parse(row.state_json) as Record<string, unknown>;
+    if (Array.isArray(core.messages)) {
+      // A full snapshot written before the append-only tables existed. Report
+      // nothing persisted, so the next commit writes every entry and migrates it.
+      return { lastProcessedSeq: row.last_processed_seq, state: core, persisted: { messages: 0, transitions: 0 } };
+    }
+    const rows = (table: string) =>
+      (this.stmt(`SELECT json FROM ${table} WHERE room_id = ? ORDER BY idx`).all(roomId) as Array<{ json: string }>).map((r) =>
+        JSON.parse(r.json),
+      );
+    const messages = rows("state_messages");
+    const transitions = rows("state_transitions");
+    return {
+      lastProcessedSeq: row.last_processed_seq,
+      state: { ...core, messages, transitions },
+      persisted: { messages: messages.length, transitions: transitions.length },
+    };
   }
 
   commit(roomId: string, c: CommitPayload): void {
@@ -170,7 +221,23 @@ export class SqliteStore implements Store {
            ON CONFLICT (room_id) DO UPDATE SET last_processed_seq = excluded.last_processed_seq,
              state_json = excluded.state_json, updated_at = excluded.updated_at`,
         )
-        .run(roomId, c.seq, JSON.stringify(c.state), now);
+        .run(roomId, c.seq, JSON.stringify(c.core), now);
+      const append = (table: string, from: number, items: unknown[]) => {
+        const ins = this.stmt(
+          `INSERT INTO ${table} (room_id, idx, json) VALUES (?, ?, ?) ON CONFLICT (room_id, idx) DO UPDATE SET json = excluded.json`,
+        );
+        items.forEach((item, i) => ins.run(roomId, from + i, JSON.stringify(item)));
+      };
+      append("state_messages", c.messagesFrom, c.appendMessages);
+      append("state_transitions", c.transitionsFrom, c.appendTransitions);
+      if (c.pruneBefore) {
+        this.stmt(
+          `UPDATE state_messages SET json = json_set(json, '$.text', '')
+           WHERE room_id = ? AND json_extract(json, '$.timestamp') < ? AND json_extract(json, '$.text') != ''`,
+        ).run(roomId, c.pruneBefore);
+        this.stmt("DELETE FROM messages WHERE room_id = ? AND created_at < ?").run(roomId, c.pruneBefore);
+        this.stmt("DELETE FROM llm_calls WHERE room_id = ? AND created_at < ?").run(roomId, c.pruneBefore);
+      }
       if (c.message) {
         const m = c.message;
         this
@@ -210,11 +277,6 @@ export class SqliteStore implements Store {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(roomId, call.purpose, call.model, call.rawResponse, call.parsedOk ? 1 : 0, call.inputTokens, call.outputTokens, call.latencyMs, call.at);
-  }
-
-  prune(roomId: string, cutoffIso: string): void {
-    this.stmt("DELETE FROM messages WHERE room_id = ? AND created_at < ?").run(roomId, cutoffIso);
-    this.stmt("DELETE FROM llm_calls WHERE room_id = ? AND created_at < ?").run(roomId, cutoffIso);
   }
 
   close(): void {

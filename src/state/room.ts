@@ -82,8 +82,44 @@ export class RoomState {
     return `${p}${this.idCounters[p]}`;
   }
 
+  /** id → message, and agent → sorted room indexes of their messages (derived, not persisted) */
+  private readonly byId = new Map<string, Message>();
+  private readonly byAgent = new Map<string, number[]>();
+
+  /** Append a message and index it. The only way messages enter state. */
+  addMessage(m: Message): void {
+    this.messages.push(m);
+    this.messageIds.add(m.id);
+    this.byId.set(m.id, m);
+    if (!m.isFromChorus) {
+      const list = this.byAgent.get(m.authorId) ?? [];
+      list.push(m.roomIndex); // room indexes only increase
+      this.byAgent.set(m.authorId, list);
+    }
+  }
+
   message(id: string): Message | undefined {
-    return this.messages.find((m) => m.id === id);
+    return this.byId.get(id);
+  }
+
+  /** How many messages `agentId` posted with room index > `afterIndex` (binary search). */
+  agentMessagesAfter(agentId: string, afterIndex: number): number {
+    const list = this.byAgent.get(agentId);
+    if (!list) return 0;
+    let lo = 0;
+    let hi = list.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (list[mid]! <= afterIndex) lo = mid + 1;
+      else hi = mid;
+    }
+    return list.length - lo;
+  }
+
+  /** The latest non-Chorus message. */
+  lastAgentMessage(): Message | undefined {
+    for (let i = this.messages.length - 1; i >= 0; i--) if (!this.messages[i]!.isFromChorus) return this.messages[i];
+    return undefined;
   }
 
   agentName(id: string): string {
@@ -195,6 +231,12 @@ export class RoomState {
     };
   }
 
+  /** Everything except the append-only logs (messages, transitions), which are stored incrementally. */
+  toCore(): Omit<RoomSnapshot, "messages" | "transitions"> {
+    const { messages: _m, transitions: _t, ...core } = this.toJSON();
+    return core;
+  }
+
   static fromJSON(raw: unknown): RoomState {
     const j = raw as RoomSnapshot;
     if (j.version !== 1) throw new Error(`Unsupported room snapshot version ${String(j.version)}`);
@@ -212,10 +254,7 @@ export class RoomState {
     s.completionAnnounced = j.completionAnnounced;
     s.readyToClose = j.readyToClose ?? false;
     for (const a of j.agents) s.agents.set(a.id, a);
-    for (const m of j.messages) {
-      s.messages.push(m);
-      s.messageIds.add(m.id);
-    }
+    for (const m of j.messages) s.addMessage(m);
     for (const q of j.questions) s.questions.set(q.id, q);
     for (const c of j.commitments) s.commitments.set(c.id, c);
     for (const k of j.claims) s.claims.set(k.id, k);

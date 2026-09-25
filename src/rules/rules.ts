@@ -12,7 +12,28 @@ export interface RuleContext {
   config: ChorusConfig;
   confirmer: Confirmer;
   now: Date;
+  /** incremental duplicate-work state; without it every pair is compared */
+  duplicates?: DuplicateCache;
+  /**
+   * True for idempotency keys already posted, absorbed or suppressed. Rules
+   * use it to skip building candidates that could never be posted.
+   */
+  handled?: (key: string) => boolean;
 }
+
+/**
+ * Each commitment is compared with the others once, when it first becomes
+ * eligible; confirmed pairs are remembered. Per-message cost is then linear
+ * in the number of commitments, not quadratic. Not persisted: rebuilt after
+ * a restart, and must be reset if state is rolled back (IDs get reused).
+ */
+export interface DuplicateCache {
+  checked: Set<string>;
+  /** [earlier-checked id, later id, stage-2 confidence] */
+  confirmed: Array<[string, string, number]>;
+}
+
+export const newDuplicateCache = (): DuplicateCache => ({ checked: new Set(), confirmed: [] });
 
 export function describeClaim(k: Claim): string {
   const cond = k.conditions.length ? ` (${k.conditions.join(", ")})` : "";
@@ -35,20 +56,34 @@ function unclaimedItem(state: RoomState, excludeAgents: string[], near: string):
 /** §18 — two agents doing the same work. Two-stage: lexical candidates, then confirmation. */
 export async function duplicateWork(state: RoomState, ctx: RuleContext): Promise<InterventionCandidate[]> {
   const t = ctx.config.thresholds;
-  const active = state
+  const cache = ctx.duplicates ?? newDuplicateCache();
+  // Compare over every live, non-optional commitment (blocked ones too, so a
+  // pair formed while one was blocked is still found once it unblocks)…
+  const pool = state
     .activeCommitments()
-    .filter((c) => !c.optional && !c.ignored && (c.status === "in_progress" || c.status === "accepted"));
+    .filter((c) => !c.optional && (c.status === "in_progress" || c.status === "accepted" || c.status === "blocked"));
+  for (const c of pool) {
+    if (cache.checked.has(c.id)) continue;
+    for (const other of pool) {
+      if (other.id === c.id || !cache.checked.has(other.id) || other.ownerId === c.ownerId) continue;
+      if (overlap(contentTokens(c.action), contentTokens(other.action)) < t.duplicateCandidate) continue;
+      const v = await ctx.confirmer.duplicate(other.action, c.action);
+      if (v.verdict !== "different" && v.confidence >= t.duplicateConfirm) cache.confirmed.push([other.id, c.id, v.confidence]);
+    }
+    cache.checked.add(c.id);
+  }
+  // …but only announce pairs where both are currently being worked on.
+  const working = (id: string) => {
+    const c = state.commitments.get(id);
+    return !!c && !c.ignored && (c.status === "in_progress" || c.status === "accepted");
+  };
   const out: InterventionCandidate[] = [];
-  for (let i = 0; i < active.length; i++) {
-    for (let j = i + 1; j < active.length; j++) {
-      const a = active[i]!;
-      const b = active[j]!;
-      if (a.ownerId === b.ownerId) continue;
-      if (overlap(contentTokens(a.action), contentTokens(b.action)) < t.duplicateCandidate) continue;
-      const v = await ctx.confirmer.duplicate(a.action, b.action);
-      if (v.verdict === "different" || v.confidence < t.duplicateConfirm) continue;
-
+  for (const [ida, idb, confidence] of cache.confirmed) {
+    if (!working(ida) || !working(idb)) continue;
+    const a = state.commitments.get(ida)!;
+    const b = state.commitments.get(idb)!;
       const [first, second] = a.createdIndex <= b.createdIndex ? [a, b] : [b, a];
+      if (ctx.handled?.(`duplicate_work:${first.id}:${second.id}`)) continue;
       const free = unclaimedItem(state, [], second.action);
       const lines = [
         "Potential duplicate work:",
@@ -69,7 +104,7 @@ export async function duplicateWork(state: RoomState, ctx: RuleContext): Promise
         involvedAgentIds: [first.ownerId, second.ownerId],
         relatedObjectIds: [first.id, second.id],
         evidenceMessageIds: [first.sourceMessageId, second.sourceMessageId],
-        confidence: v.confidence,
+        confidence,
         urgency: 0.7,
         expectedValue: 0.8,
         blockedAgents: 0,
@@ -77,7 +112,6 @@ export async function duplicateWork(state: RoomState, ctx: RuleContext): Promise
         text: lines.join("\n"),
         createdIndex: state.roomIndex,
       });
-    }
   }
   return out;
 }
@@ -157,9 +191,7 @@ export function missingAcknowledgements(state: RoomState, ctx: RuleContext): Int
   for (const h of state.pendingHandoffs()) {
     if (h.ignored) continue;
     const since = h.lastSurfacedIndex ?? h.createdIndex;
-    const recipientMessages = state.messages.filter(
-      (m) => m.authorId === h.toAgentId && !m.isFromChorus && m.roomIndex > h.createdIndex,
-    ).length;
+    const recipientMessages = state.agentMessagesAfter(h.toAgentId, h.createdIndex);
     if (recipientMessages < cfg.minTargetMessages) continue;
     if (h.lastSurfacedIndex !== undefined && state.roomIndex - since < cfg.resurfaceCooldownMessages) continue;
     const blocked = blockedOn(state, h.id).filter((b) => b.agentId !== h.fromAgentId);
@@ -204,9 +236,7 @@ export function staleCommitments(state: RoomState, ctx: RuleContext): Interventi
     }
     const ageSeconds = (ctx.now.getTime() - new Date(c.updatedAt).getTime()) / 1000;
     const roomSince = state.roomIndex - c.updatedIndex;
-    const ownerSince = state.messages.filter(
-      (m) => m.authorId === c.ownerId && !m.isFromChorus && m.roomIndex > c.updatedIndex,
-    ).length;
+    const ownerSince = state.agentMessagesAfter(c.ownerId, c.updatedIndex);
     const blocked = blockedOn(state, c.id);
     const dependents = blocked.length;
     const score =
@@ -243,13 +273,19 @@ export function staleCommitments(state: RoomState, ctx: RuleContext): Interventi
 }
 
 /** §23 — a new question repeats one already answered; quote the answer. */
-export function repeatedQuestions(state: RoomState, _ctx: RuleContext): InterventionCandidate[] {
+export function repeatedQuestions(state: RoomState, ctx: RuleContext): InterventionCandidate[] {
   const out: InterventionCandidate[] = [];
-  for (const q of state.openQuestions()) {
-    if (!q.duplicateOf || q.ignored) continue;
-    const original = state.questions.get(q.duplicateOf);
+  const repeats = state.openQuestions().filter((q) => q.duplicateOf && !q.ignored && !ctx.handled?.(`repeated_question:${q.id}`));
+  if (repeats.length === 0) return out;
+  // Index answering claims once per pass, not once per question.
+  const answersFor = new Map<string, Claim[]>();
+  for (const k of state.claims.values()) {
+    if (k.answersQuestionId && k.status === "active") answersFor.set(k.answersQuestionId, [...(answersFor.get(k.answersQuestionId) ?? []), k]);
+  }
+  for (const q of repeats) {
+    const original = state.questions.get(q.duplicateOf!);
     if (!original) continue;
-    const answers = [...state.claims.values()].filter((k) => k.answersQuestionId === original.id && k.status === "active");
+    const answers = answersFor.get(original.id) ?? [];
     const answerMsgs = answers.length ? answers.map((k) => k.messageId) : original.answerMessageIds;
     const quoted = answerMsgs
       .map((id) => state.message(id))
@@ -281,11 +317,12 @@ export function repeatedQuestions(state: RoomState, _ctx: RuleContext): Interven
 }
 
 /** §23.1 — a claim contradicts an active decision. */
-export function decisionReminders(state: RoomState, _ctx: RuleContext): InterventionCandidate[] {
+export function decisionReminders(state: RoomState, ctx: RuleContext): InterventionCandidate[] {
   const out: InterventionCandidate[] = [];
   for (const k of state.activeClaims()) {
     const d = k.contradictsDecisionId ? state.decisions.get(k.contradictsDecisionId) : undefined;
     if (!d || d.status !== "active") continue;
+    if (ctx.handled?.(`decision_reminder:${d.id}:${k.id}`)) continue;
     out.push({
       type: "decision_reminder",
       severity: "medium",
@@ -420,10 +457,11 @@ export function dependencyDeadlocks(state: RoomState, _ctx: RuleContext): Interv
 }
 
 /** §22 — announce each confirmed conflict once. */
-export function conflicts(state: RoomState, _ctx: RuleContext): InterventionCandidate[] {
+export function conflicts(state: RoomState, ctx: RuleContext): InterventionCandidate[] {
   const out: InterventionCandidate[] = [];
   for (const x of state.conflicts.values()) {
     if (x.status !== "confirmed" || x.ignored) continue;
+    if (ctx.handled?.(`conflict_detected:${x.id}:${x.claimIds.length}`)) continue;
     const claims = x.claimIds.map((id) => state.claims.get(id)!).filter((k) => k.status === "active");
     out.push({
       type: "conflict_detected",
@@ -536,7 +574,7 @@ export const COMPLETION_QUIET_SECONDS = 60;
 export function completion(state: RoomState, ctx: RuleContext): InterventionCandidate[] {
   if (state.completionAnnounced || state.mode !== "facilitate") return [];
   const hadObligations = state.questions.size + state.commitments.size + state.conflicts.size + state.handoffs.size > 0;
-  const last = state.messages.filter((m) => !m.isFromChorus).at(-1);
+  const last = state.lastAgentMessage();
   const quiet = last ? (ctx.now.getTime() - new Date(last.timestamp).getTime()) / 1000 : 0;
   if (!hadObligations || quiet < COMPLETION_QUIET_SECONDS) return [];
   const r = completionReport(state);

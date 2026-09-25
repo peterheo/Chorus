@@ -187,10 +187,8 @@ describe("metrics (§59)", () => {
 describe("retention (§65)", () => {
   it("drops the text of old messages but keeps them citable", () => {
     const s = new RoomState("assist");
-    s.messages.push(
-      { id: "m1", seq: 1, roomIndex: 1, authorId: "A", text: "old", timestamp: "2026-01-01T00:00:00.000Z", isFromChorus: false },
-      { id: "m2", seq: 2, roomIndex: 2, authorId: "A", text: "new", timestamp: "2026-01-09T00:00:00.000Z", isFromChorus: false },
-    );
+    s.addMessage({ id: "m1", seq: 1, roomIndex: 1, authorId: "A", text: "old", timestamp: "2026-01-01T00:00:00.000Z", isFromChorus: false });
+    s.addMessage({ id: "m2", seq: 2, roomIndex: 2, authorId: "A", text: "new", timestamp: "2026-01-09T00:00:00.000Z", isFromChorus: false });
     assert.equal(s.prune("2026-01-02T00:00:00.000Z"), 1);
     assert.deepEqual(s.messages.map((m) => m.text), ["", "new"]);
     assert.equal(s.cite("m1"), "#1");

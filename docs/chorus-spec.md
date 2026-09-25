@@ -4063,7 +4063,7 @@ The build on this branch implements every section above, including the §78 stre
 |---|---|---|
 | §8 monorepo (`apps/`, `packages/`) | One package; `src/` folders match the module boundaries | Hackathon profile; nothing needs separate deployment yet |
 | §7 Fastify | `node:http` | No dependency needed for nine GET routes and SSE |
-| §33 normalized tables | In-memory `RoomState` snapshotted to SQLite (`node:sqlite`) per message, plus audit tables (messages, interventions, receipts, llm_calls) | Crash-safe with one transaction per message; incremental tables are the production path |
+| §33 normalized tables | In-memory `RoomState`; per message, one SQLite (`node:sqlite`) transaction writes the core state (objects, counters, interventions), appends only new messages and transitions to append-only tables, and updates the resume cursor; plus audit tables (messages, interventions, receipts, llm_calls) | Crash-safe and incremental in the part that grows fastest; objects in their own tables are the next step for very large rooms |
 | §35 outbox with `sending` state | Interventions are recorded only after the send succeeds; keys are deterministic, so a retry after a crash is deduplicated by SharedNet's Idempotency-Key | SharedNet replays the stored message for a repeated key (§34.1), which removes the need for echo-matching |
 | §18, §22, §38 embeddings | Stage 1 uses a lexical overlap coefficient over stemmed content words (`src/similarity.ts`); stage 2 uses the Claude confirmer when enabled | Anthropic has no embeddings endpoint |
 | §12 LLM extraction | A deterministic rule-based extractor is the default; the Claude extractor (`claude-opus-5`, structured output, `fallbacks: "default"`) is opt-in | Reproducible replays and tests without credentials |
