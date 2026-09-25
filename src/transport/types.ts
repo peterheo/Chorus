@@ -43,6 +43,24 @@ export interface RosterEntry {
   presence?: string;
 }
 
+/** A credit transfer received by Chorus's principal (SharedNet GET /credits/transfers). */
+export interface CreditTransfer {
+  id: string;
+  fromPrincipalId: string | null;
+  amount: number;
+  memo: string | null;
+  roomId: string | null;
+  createdAt: string;
+}
+
+/** Optional: transports whose platform has credits can charge for operations (§43). */
+export interface Payments {
+  /** Recent transfers received by Chorus. */
+  receivedTransfers(): Promise<CreditTransfer[]>;
+  /** How a payer sends credits, for the price quote. */
+  howToPay(amount: number, memo: string): string;
+}
+
 export interface RoomTransport {
   capabilities(): TransportCapabilities;
   /** Chorus's own member ID in this room, known after connect(). */
@@ -51,5 +69,7 @@ export interface RoomTransport {
   onMessage(callback: (message: ExternalRoomMessage) => Promise<void>): void;
   sendMessage(message: OutboundMessage): Promise<SendResult>;
   roster(): Promise<RosterEntry[]>;
+  /** Present when the platform supports credit payments. */
+  payments?: Payments;
   close(): Promise<void>;
 }

@@ -15,6 +15,7 @@
 //   RECEIPT_SIGNING_KEY  Ed25519 private key (PKCS#8 PEM) for receipts; default:
 //                        generated once and kept in .chorus/receipt-key.pem
 //   RECEIPT_KEY_ID       key ID shown on receipts (default derived from the key)
+//   CHORUS_REQUIRE_PAYMENT "1" to charge SharedNet credits for watch/facilitate/replay (§43)
 //   CHORUS_ELECTION      "1" when several Chorus instances share a room (§78):
 //                        each announces itself; the lowest online ID speaks
 //
@@ -100,7 +101,11 @@ const room: ChorusRoom = new ChorusRoom({
   election: env.CHORUS_ELECTION === "1",
   confirmer: useClaude ? new ClaudeConfirmer(claudeOpts) : new HeuristicConfirmer(),
   clock: new SystemClock(),
-  config: { ...defaultConfig, mode },
+  config: {
+    ...defaultConfig,
+    mode,
+    operations: { ...defaultConfig.operations, requirePayment: env.CHORUS_REQUIRE_PAYMENT === "1" },
+  },
   store,
   roomKey: roomId,
   onEvent: (e) => {

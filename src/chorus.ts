@@ -30,7 +30,7 @@ import { RoomState } from "./state/room.ts";
 import type { InterventionCandidate, Message } from "./state/types.ts";
 import type { LlmCall } from "./extract/claude.ts";
 import { agentBrief } from "./insights.ts";
-import { endExpiredSession } from "./operations.ts";
+import { endExpiredSession, settleOrders } from "./operations.ts";
 import { ReceiptSigner } from "./receipts.ts";
 import { MemoryStore, type InterventionRow, type MessageRow, type ReceiptRow, type Store } from "./store.ts";
 import type { ExternalRoomMessage, RoomTransport } from "./transport/types.ts";
@@ -110,6 +110,7 @@ export class ChorusRoom {
   private llmWindow: number[] = [];
   private lastPruneAt = 0;
   private lastRosterAt = 0;
+  private lastPaymentPollAt = 0;
   /** a welcome-back brief for the author of the message being processed (§78) */
   private pendingBrief: InterventionCandidate | null = null;
   /** messages received but not yet processed (§11.2) */
@@ -308,6 +309,7 @@ export class ChorusRoom {
     {
       const now = this.opts.clock.now();
       const before = { transitions: this._state.transitions.length, posted: this._state.posted.length };
+      const ordersBefore = JSON.stringify(this._state.orders.map((o) => o.status));
       const expired = applyDeadlines(this._state, now);
       for (const id of expired) this.emit({ kind: "state", detail: `${id} → ${this._state.object(id)?.status} (deadline)` });
       if (this.opts.election && now.getTime() - this.lastRosterAt >= 60_000) await this.refreshRoster();
@@ -316,6 +318,7 @@ export class ChorusRoom {
         this.pendingReceipts.push(sessionEnd.record);
         await this.post(this.reply(`session-end:${sessionEnd.record.sha256}`, sessionEnd.text, [this._state.session?.requestedBy ?? ""]), true);
       }
+      await this.checkPayments(now);
       const pruned = this.prune();
       await this.evaluate("tick");
       const s = this._state;
@@ -324,8 +327,39 @@ export class ChorusRoom {
         s.posted.length !== before.posted ||
         this.pending.length > 0 ||
         pruned > 0 ||
-        sessionEnd !== null;
+        sessionEnd !== null ||
+        JSON.stringify(this._state.orders.map((o) => o.status)) !== ordersBefore;
       if (changed) this.commit();
+    }
+  }
+
+  /**
+   * §43: while orders await payment, poll received credit transfers (at most
+   * every 20 s) and run what was paid for. Also expires unpaid orders.
+   */
+  private async checkPayments(now: Date): Promise<void> {
+    const s = this._state;
+    const payments = this.opts.transport.payments;
+    if (!payments || !s.orders.some((o) => o.status === "awaiting_payment")) return;
+    if (now.getTime() - this.lastPaymentPollAt < 20_000) return;
+    this.lastPaymentPollAt = now.getTime();
+    let transfers;
+    try {
+      transfers = await payments.receivedTransfers();
+    } catch (err) {
+      this.emit({ kind: "error", detail: `could not read credit transfers: ${(err as Error).message}` });
+      return;
+    }
+    for (const done of settleOrders(s, transfers, this.roomKey, now, this.signer)) {
+      this.emit({ kind: "state", detail: `${done.order.id} paid by ${done.order.payment!.transferId}` });
+      const messageId = await this.post(
+        this.reply(`order:${done.order.id}`, done.text, [done.order.requestedBy], done.order.requestMessageId),
+        true,
+      );
+      if (done.receipt) {
+        done.receipt.messageId = messageId;
+        this.pendingReceipts.push(done.receipt);
+      }
     }
   }
 
@@ -591,7 +625,8 @@ export class ChorusRoom {
         now: this.opts.clock.now(),
         room: this.roomKey,
         signer: this.signer,
-        operationsEnabled: this.opts.config.operations.enabled,
+        operations: this.opts.config.operations,
+        howToPay: this.opts.transport.payments?.howToPay,
       });
       this.emit({ kind: "command", seq: msg.seq, detail: msg.text.trim() });
       const messageId = await this.post(this.reply(`command:${msg.id}`, r.reply, [msg.authorId], msg.id), true);

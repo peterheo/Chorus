@@ -3,7 +3,9 @@
 
 import { z } from "zod";
 import type {
+  CreditTransfer,
   ExternalRoomMessage,
+  Payments,
   OutboundMessage,
   RoomTransport,
   RosterEntry,
@@ -49,6 +51,27 @@ export class ReplayTransport implements RoomTransport {
   readonly log: ExternalRoomMessage[] = [];
   readonly sent: ExternalRoomMessage[] = [];
   private readonly sentKeys = new Map<string, SendResult>();
+  /** transfers "received" by Chorus in replay (see pay()) */
+  readonly transfers: CreditTransfer[] = [];
+
+  readonly payments: Payments = {
+    receivedTransfers: async () => [...this.transfers].reverse(),
+    howToPay: (amount, memo) => `pay ${CHORUS_REPLAY_ID} ${amount} --memo ${memo}`,
+  };
+
+  /** Simulate an agent paying Chorus. */
+  pay(fromAgent: string, amount: number, memo: string | null): CreditTransfer {
+    const t: CreditTransfer = {
+      id: `txn_${this.transfers.length + 1}`,
+      fromPrincipalId: `p_${fromAgent}`,
+      amount,
+      memo,
+      roomId: null,
+      createdAt: this.now().toISOString(),
+    };
+    this.transfers.push(t);
+    return t;
+  }
 
   constructor(
     private readonly agents: RosterEntry[],

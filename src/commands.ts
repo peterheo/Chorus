@@ -1,17 +1,21 @@
 // `@chorus` commands (spec §29, §53) and permission-checked feedback (§60).
 // Deterministic; no LLM involved. Replies are solicited and exempt from limits.
 
-import type { Mode } from "./config.ts";
+import type { ChorusConfig, Mode } from "./config.ts";
 import { agentBrief, health, interactionMap, threads } from "./insights.ts";
 import { metrics } from "./metrics.ts";
 import {
   WATCH_DEFAULT_MINUTES,
   WATCH_MAX_MINUTES,
-  analysisBody,
+  createOrder,
   endSession,
   issueReceipt,
+  memoFor,
   openObligations,
+  priceOf,
+  runReplay,
   snapshotBody,
+  startSession,
   summarizeObligations,
 } from "./operations.ts";
 import type { ReceiptSigner } from "./receipts.ts";
@@ -36,8 +40,9 @@ export interface CommandContext {
   /** room ID as shown in receipts */
   room: string;
   signer?: ReceiptSigner;
-  /** §43 operations (watch, facilitate, replay) enabled by config */
-  operationsEnabled: boolean;
+  /** §43 operations: enabled, pricing, and how to pay on this transport */
+  operations: ChorusConfig["operations"];
+  howToPay?: (amount: number, memo: string) => string;
 }
 
 const HELP = [
@@ -272,7 +277,7 @@ function feedback(state: RoomState, verb: string, arg: string | undefined, msg: 
 }
 
 function operations(state: RoomState, verb: string, arg: string | undefined, msg: Message, ctx: CommandContext): CommandResult {
-  if (!ctx.operationsEnabled) return { reply: `@chorus ${verb} is not enabled in this room.`, changed: false };
+  if (!ctx.operations.enabled) return { reply: `@chorus ${verb} is not enabled in this room.`, changed: false };
   if (!ctx.signer) return { reply: "Receipts are not configured for this Chorus.", changed: false };
   const now = ctx.now;
 
@@ -280,17 +285,30 @@ function operations(state: RoomState, verb: string, arg: string | undefined, msg
     const r = issueReceipt(state, ctx.signer, snapshotBody(state, ctx.room, now), summarizeObligations(openObligations(state)));
     return { reply: r.text, changed: false, receipt: r.record };
   }
+  const minutes =
+    verb === "watch" ? Math.min(Math.max(Number(arg) || WATCH_DEFAULT_MINUTES, 1), WATCH_MAX_MINUTES) : undefined;
+
+  // §43: priced operations wait for a credit transfer carrying the order memo.
+  if (ctx.operations.requirePayment && (verb === "watch" || verb === "facilitate" || verb === "replay")) {
+    if (!ctx.howToPay) return { reply: "Payment is required, but this room's transport has no credits.", changed: false };
+    if (verb !== "replay" && state.session) {
+      return { reply: `A ${state.session.kind} session is already running. "@chorus stop" ends it.`, changed: false };
+    }
+    const price = priceOf(verb, minutes, ctx.operations.prices);
+    const order = createOrder(state, verb, minutes, price, msg, ctx.room, now, ctx.operations.orderTtlMinutes);
+    const what = verb === "watch" ? `a ${minutes}-minute watch` : verb === "facilitate" ? "facilitation until stopped" : "a post-room analysis";
+    return {
+      reply: [
+        `${what[0]!.toUpperCase()}${what.slice(1)} costs ${price} credit${price === 1 ? "" : "s"} (order ${order.id}).`,
+        `Pay with: ${ctx.howToPay(price, memoFor(order))}`,
+        `It starts as soon as the payment arrives. The order expires in ${ctx.operations.orderTtlMinutes} minutes.`,
+      ].join("\n"),
+      changed: true,
+    };
+  }
+
   if (verb === "replay") {
-    const m = metrics(state);
-    const ratio = m.useful_ratio === null ? "n/a" : `${Math.round(m.useful_ratio * 100)}%`;
-    const r = issueReceipt(
-      state,
-      ctx.signer,
-      analysisBody(state, ctx.room, now),
-      `Post-room analysis: ${m.questions_resolved}/${m.questions_detected} questions answered, ` +
-        `${m.commitments_completed}/${m.commitments_created} commitments completed, ` +
-        `${m.conflicts_resolved}/${m.conflicts_detected} conflicts resolved, ${m.interventions_posted} interventions (${ratio} useful).`,
-    );
+    const r = runReplay(state, ctx.room, now, ctx.signer);
     return { reply: r.text, changed: false, receipt: r.record };
   }
   if (verb === "stop") {
@@ -302,24 +320,7 @@ function operations(state: RoomState, verb: string, arg: string | undefined, msg
   if (state.session) {
     return { reply: `A ${state.session.kind} session is already running. "@chorus stop" ends it.`, changed: false };
   }
-  const minutes =
-    verb === "watch" ? Math.min(Math.max(Number(arg) || WATCH_DEFAULT_MINUTES, 1), WATCH_MAX_MINUTES) : undefined;
-  state.session = {
-    kind: verb as "watch" | "facilitate",
-    requestedBy: msg.authorId,
-    startedAt: now.toISOString(),
-    startedSeq: msg.seq,
-    until: minutes ? new Date(now.getTime() + minutes * 60_000).toISOString() : undefined,
-    previousMode: state.mode,
-  };
-  state.mode = "facilitate";
-  return {
-    reply:
-      verb === "watch"
-        ? `Watching this room for ${minutes} minutes in facilitate mode. A signed receipt follows when it ends.`
-        : `Facilitating this room until "@chorus stop". A signed receipt follows when it ends.`,
-    changed: true,
-  };
+  return { reply: startSession(state, verb as "watch" | "facilitate", minutes, msg.authorId, msg.seq, now), changed: true };
 }
 
 function metricsReply(state: RoomState): string {

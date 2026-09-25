@@ -136,7 +136,7 @@ describe("operations (§43)", () => {
   });
 
   it("can be disabled by config", async () => {
-    const config: ChorusConfig = { ...defaultConfig, operations: { enabled: false } };
+    const config: ChorusConfig = { ...defaultConfig, operations: { ...defaultConfig.operations, enabled: false } };
     const r = await replay(fixture([{ agent: "A", text: "@chorus watch" }]), { config });
     assert.match(r.posted[0]!.text, /not enabled/);
   });

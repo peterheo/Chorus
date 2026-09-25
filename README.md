@@ -36,6 +36,7 @@ State is saved to SQLite (`.chorus/chorus.db`) after every message. On restart C
 | `CHORUS_API_PORT` | serve the state API and event stream on this port (off by default) |
 | `CHORUS_API_TOKEN` | bearer token for the API; generated and printed at startup if unset |
 | `RECEIPT_SIGNING_KEY` / `RECEIPT_KEY_ID` | Ed25519 key (PKCS#8 PEM) for receipts; default: generated once into `.chorus/receipt-key.pem` |
+| `CHORUS_REQUIRE_PAYMENT` | `1` to charge SharedNet credits for `watch` (2 per 10 min), `facilitate` (5) and `replay` (3); prices in `src/config.ts` |
 | `CHORUS_ELECTION` | `1` when several Chorus instances share a room: each announces itself and only the lowest online ID speaks |
 
 All other tunables (thresholds, rate limits, retention, batching) are in `src/config.ts`.
@@ -49,7 +50,7 @@ All other tunables (thresholds, rate limits, retention, batching) are in `src/co
 | `@chorus close-check` | READY TO CLOSE or what is still open |
 | `@chorus health` · `map` · `threads` · `metrics` | health dimensions, who talks to whom, topic threads, usefulness metrics |
 | `@chorus mode observe\|assist\|facilitate` | change how much Chorus speaks |
-| `@chorus watch [min]` · `facilitate` · `stop` | time-boxed or open-ended facilitation, with a signed receipt at the end |
+| `@chorus watch [min]` · `facilitate` · `stop` | time-boxed or open-ended facilitation, with a signed receipt at the end (paid, with `CHORUS_REQUIRE_PAYMENT=1`) |
 | `@chorus receipt` · `replay` | signed snapshot of open obligations; signed post-room analysis |
 | `@chorus resolved <id>` · `ignore <id>` · `reopen <D…>` · `wrong [id]` · `correct [id]` | feedback, permission-checked (spec §60) |
 
@@ -98,7 +99,7 @@ Receipts (§54) are RFC 8785-canonical JSON, hashed with SHA-256 and signed with
 - **Not run against the live Claude API** from the build environment (no credentials). The Claude path is covered by tests with a fake client; set `CHORUS_EXTRACTOR=claude` and Anthropic credentials to use it.
 - **Stage-1 similarity is lexical**, not embeddings (Anthropic has no embeddings endpoint); stage-2 confirmation uses Claude when enabled. The rule-based extractor covers the phrasing in the spec and tests, not open-ended language.
 - **Persistence snapshots the whole room per message.** Simple and crash-safe, but cost grows with room length; long-lived rooms need incremental storage (spec §33 tables).
-- **Operations are not charged.** `watch`/`facilitate`/`replay` are enabled by config; SharedNet credit transfers are not wired in.
+- **Paid operations are off by default.** With `CHORUS_REQUIRE_PAYMENT=1`, Chorus quotes a price and an order memo (`sharednet pay <chorus> <n> --memo chorus:ord_…`) and starts the operation when the transfer arrives; the receipt cites the transfer. This is tested against a mocked API only: a live paid flow needs a payer on a different SharedNet account (transfers to yourself are refused). There are no refunds.
 - **Edits and deletes** are not handled because SharedNet does not deliver them.
 
 See the implementation notes at the end of `docs/chorus-spec.md` for every place the build differs from the spec.

@@ -35,8 +35,17 @@ export interface ChorusConfig {
   presence: { activeWindowMessages: number };
   /** §11.2: batch extraction when more than batchWhenBacklogOver messages are waiting */
   extraction: { recentWindow: number; batchWhenBacklogOver: number; maxBatch: number };
-  /** §43: watch / facilitate / replay / receipt commands */
-  operations: { enabled: boolean };
+  /**
+   * §43: watch / facilitate / replay / receipt commands. With requirePayment,
+   * priced operations start only after a matching credit transfer arrives.
+   */
+  operations: {
+    enabled: boolean;
+    requirePayment: boolean;
+    /** credits: watch is per started 10 minutes */
+    prices: { watch: number; facilitate: number; replay: number };
+    orderTtlMinutes: number;
+  };
   /** §63: per-room LLM call budget; over budget, extraction falls back to the rule-based extractor */
   llm: { maxCallsPerMinute: number };
   /** §65: message text older than this is pruned */
@@ -76,7 +85,12 @@ export const defaultConfig: ChorusConfig = {
   stale: { ageRefSeconds: 600, roomRefMessages: 30, resurfaceCooldownMessages: 30 },
   presence: { activeWindowMessages: 30 },
   extraction: { recentWindow: 10, batchWhenBacklogOver: 5, maxBatch: 10 },
-  operations: { enabled: true },
+  operations: {
+    enabled: true,
+    requirePayment: false,
+    prices: { watch: 2, facilitate: 5, replay: 3 },
+    orderTtlMinutes: 15,
+  },
   llm: { maxCallsPerMinute: 60 },
   retention: { days: 7 },
   brief: { minAbsentMessages: 30, minAbsentMinutes: 15 },

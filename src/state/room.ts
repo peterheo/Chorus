@@ -11,6 +11,7 @@ import type {
   Dependency,
   Handoff,
   FacilitationSession,
+  Order,
   Message,
   ObjectKind,
   PostedIntervention,
@@ -57,6 +58,9 @@ export class RoomState {
   readonly counters = new Map<string, number>();
   /** active chorus.watch / chorus.facilitate session (§43) */
   session: FacilitationSession | null = null;
+  /** priced operations awaiting payment, and transfers already used (§43) */
+  readonly orders: Order[] = [];
+  readonly usedTransfers = new Set<string>();
   /** other Chorus instances that announced themselves: id → announcement time (§78 election) */
   readonly chorusPeers = new Map<string, string>();
   /** signed receipts issued in this room (§54) */
@@ -171,6 +175,8 @@ export class RoomState {
       session: this.session,
       receipts: this.receipts,
       chorusPeers: [...this.chorusPeers],
+      orders: this.orders,
+      usedTransfers: [...this.usedTransfers],
       completionAnnounced: this.completionAnnounced,
       readyToClose: this.readyToClose,
       agents: [...this.agents.values()],
@@ -201,6 +207,8 @@ export class RoomState {
     s.session = j.session ?? null;
     s.receipts.push(...(j.receipts ?? []));
     for (const [k, v] of j.chorusPeers ?? []) s.chorusPeers.set(k, v);
+    s.orders.push(...(j.orders ?? []));
+    for (const t of j.usedTransfers ?? []) s.usedTransfers.add(t);
     s.completionAnnounced = j.completionAnnounced;
     s.readyToClose = j.readyToClose ?? false;
     for (const a of j.agents) s.agents.set(a.id, a);
@@ -243,6 +251,8 @@ export interface RoomSnapshot {
   session?: FacilitationSession | null;
   receipts?: SignedReceiptRecord[];
   chorusPeers?: Array<[string, string]>;
+  orders?: Order[];
+  usedTransfers?: string[];
   completionAnnounced: boolean;
   readyToClose?: boolean;
   agents: Agent[];

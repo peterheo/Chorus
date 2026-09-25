@@ -197,13 +197,14 @@ describe("SharedNet transport", () => {
     }));
     let served = false;
     const realFetch = globalThis.fetch;
-    globalThis.fetch = (async (url: string) => {
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
       if (String(url).endsWith("/instances/current")) return new Response(JSON.stringify({ instance: { id: "i_self" } }));
       if (!served) {
         served = true;
         return new Response(JSON.stringify({ items, next_cursor: "7", has_more: false }));
       }
-      return new Promise(() => {}); // later waits hang until close()
+      // later waits hang until close() aborts them
+      return new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("aborted"))));
     }) as typeof fetch;
     try {
       const t = new SharedNetTransport({ baseUrl: "https://example.test", roomId: "rom_x", token: "sni_test" });

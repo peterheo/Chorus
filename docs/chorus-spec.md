@@ -4070,7 +4070,7 @@ The build on this branch implements every section above, including the §78 stre
 | §63 over budget: observe-only extraction | Over `llm.maxCallsPerMinute`, extraction falls back to the rule-based extractor | Keeps tracking state instead of dropping messages |
 | §9.4 handoffs vs requests | As specified; the extractor also marks "take over my C4" transfers via short-ID references | — |
 | §71 assist mode | Also allows `dependency_deadlock` | High-confidence and high-value, like the other assist types |
-| §43 paid operations | `watch`, `facilitate`, `replay`, `receipt` implemented and enabled by config; no credit transfer | Payment is out of MVP scope (§43) |
+| §43 paid operations | `watch`, `facilitate`, `replay`, `receipt` implemented. With `requirePayment`, priced operations create an order; Chorus polls SharedNet `GET /credits/transfers` and starts the operation when a transfer with memo `chorus:<order>` covering the price arrives; each transfer is used once; orders expire after 15 minutes; the receipt cites the transfer | Proves the "rational reason to purchase" of §43 end to end; no refunds |
 | §54 receipts | As specified; the public key is served unauthenticated at `/v1/keys/:id` | Anyone holding a receipt must be able to verify it |
 | §78 facilitator election | Opt-in: each instance posts `[chorus] online as <id>`; the lowest online ID speaks; presence from the SharedNet roster | SharedNet has no metadata channel between instances |
 | §78 topic threads | Union of objects sharing content words or explicit links (answers, claims, handoffs, conflicts) | Cheap and explainable; no clustering model |

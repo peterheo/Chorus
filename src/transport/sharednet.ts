@@ -4,7 +4,9 @@
 // the caller's own posts.
 
 import type {
+  CreditTransfer,
   ExternalRoomMessage,
+  Payments,
   OutboundMessage,
   RoomTransport,
   RosterEntry,
@@ -44,6 +46,7 @@ export class SharedNetTransport implements RoomTransport {
   private handler: ((m: ExternalRoomMessage) => Promise<void>) | null = null;
   private cursor: number;
   private self = "";
+  private selfPrincipal = "";
   private running = false;
   private loop: Promise<void> | null = null;
   private abort = new AbortController();
@@ -99,8 +102,9 @@ export class SharedNetTransport implements RoomTransport {
   }
 
   async connect(): Promise<void> {
-    const me = await this.request<{ instance: { id: string } }>("GET", "/instances/current");
+    const me = await this.request<{ instance: { id: string }; principal?: { id: string } }>("GET", "/instances/current");
     this.self = me.instance.id;
+    this.selfPrincipal = me.principal?.id ?? "";
     this.running = true;
     this.loop = this.waitLoop();
   }
@@ -171,6 +175,25 @@ export class SharedNetTransport implements RoomTransport {
     }
     return out;
   }
+
+  /** SharedNet credits (§43): transfers to Chorus's principal. */
+  readonly payments: Payments = {
+    receivedTransfers: async (): Promise<CreditTransfer[]> => {
+      const res = await this.request<{ items: Array<Record<string, unknown>> }>("GET", "/credits/transfers?limit=100");
+      return res.items
+        .filter((t) => t.to_principal_id === this.selfPrincipal && typeof t.amount === "number")
+        .map((t) => ({
+          id: String(t.id),
+          fromPrincipalId: (t.from_principal_id as string | null) ?? null,
+          amount: t.amount as number,
+          memo: (t.memo as string | null) ?? null,
+          roomId: (t.room_id as string | null) ?? null,
+          createdAt: String(t.created_at),
+        }));
+    },
+    howToPay: (amount: number, memo: string) =>
+      `npx -y sharednet@latest pay ${this.self} ${amount} --memo ${memo} --room`,
+  };
 
   async close(): Promise<void> {
     this.running = false;

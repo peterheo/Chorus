@@ -211,4 +211,27 @@ export interface FacilitationSession {
   /** ISO end time for watch; absent for facilitate (runs until stopped) */
   until?: string;
   previousMode: "observe" | "assist" | "facilitate";
+  /** the credit transfer that paid for it, when payment is required */
+  payment?: PaymentRef;
+}
+
+export interface PaymentRef {
+  transferId: string;
+  amount: number;
+  fromPrincipalId: string | null;
+}
+
+/** A priced operation waiting for its credit transfer (§43). */
+export interface Order {
+  id: string; // "ord_…", deterministic from the requesting message
+  operation: "watch" | "facilitate" | "replay";
+  minutes?: number;
+  price: number;
+  requestedBy: string;
+  requestMessageId: string;
+  requestSeq: number;
+  createdAt: string;
+  expiresAt: string;
+  status: "awaiting_payment" | "paid" | "expired";
+  payment?: PaymentRef;
 }
