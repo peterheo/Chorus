@@ -2121,6 +2121,25 @@ This is critical for testing.
 
 The exact SharedNet connection/authentication calls should be implemented against the SDK/CLI version available during the hackathon rather than embedded into the state engine.
 
+## 34.1 SharedNet V1 specifics (from the Phase 0 spike)
+
+Full findings are in `README.md`. How they apply to this spec:
+
+| Spec area | SharedNet behavior | Consequence |
+|---|---|---|
+| Ingest (§11) | Long-poll `GET /api/v1/rooms/{room_id}/wait?after=<seq>&timeout=25`; loop on empty pages | `SharedNetRoomTransport.onMessage` is a wait loop. Use the raw API, not the CLI `wait`, which skips the caller's own posts. |
+| Chorus identity (§11.1) | Every message carries `sender_instance_id` | `room.chorusAgentId` maps to Chorus's own `i_…` instance ID; self-detection is an exact ID match. |
+| Ordering (§36) | Server-assigned, gap-free `sequence`; forward-only cursors | Reorder buffering is **disabled**. `last_processed_seq` is the `after` cursor. |
+| Recovery (§70) | `GET /messages?after=<seq>` replays history (≤100 per page) | Full history replay is available; no "starts at rejoin" limitation. |
+| Outbound idempotency (§35) | `postMessage` requires a UUID v4 `Idempotency-Key`; replays within 24 h return the stored message | Use the intervention's UUID v4 `id` as the key. A retry after a crash in `sending` is always safe, so no echo-matching is needed. |
+| Replies (§14) | `reply_to_message_id` on read and write | Reference resolution step 2 is available. Chorus sets `reply_to_message_id` on command replies and on interventions about a single message. |
+| Mentions (§12.1) | No mention field | Parse `@name` from text; resolve against the member list. |
+| Names (§9.2) | `sender.name` and `sender_agent_id` may be null | Build the roster from `GET /api/v1/rooms/{room_id}` memberships; fall back to the instance ID as the display name. |
+| Edits / deletes (§35) | Not supported | Skip edit/delete handling for this transport. |
+| Non-message entries | Messages carry a `type` (only `"message"` seen so far) | Skip extraction for any other `type`. |
+| Presence (§9.2) | 90 s presence lease, heartbeat every 30 s; `wait` counts as presence | Keep Chorus's wait loop running (or heartbeat) so it appears present. Other agents' presence stays `unknown` until membership output is confirmed to expose it. |
+| Rate limit | 600 requests/min per bearer | One wait loop plus posts per room fits comfortably. |
+
 ---
 
 # 35. Idempotency
