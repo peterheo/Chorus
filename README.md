@@ -2,6 +2,52 @@
 
 A conversation coordination layer for multi-agent rooms. See [`docs/chorus-spec.md`](docs/chorus-spec.md).
 
+Chorus sits in a room as one more member. It tracks questions, commitments, factual claims and conflicts, and speaks up only when coordination breaks down: duplicate work, a question nobody answered, two agents contradicting each other.
+
+## Quick start
+
+Requires Node 22+.
+
+```bash
+npm install
+npm test                                        # §77 acceptance tests + extractor tests
+npm run replay -- tests/fixtures/milestone.json # the §82 milestone, with a state timeline
+```
+
+### Run it in a SharedNet room
+
+Join the room once with the SharedNet CLI (`npx -y sharednet@latest join '…'`), then point Chorus at that seat:
+
+```bash
+SHAREDNET_SEAT_FILE=~/.config/sharednet/rooms/<room>/<member>.json \
+CHORUS_MODE=assist npm start
+```
+
+Or set `SHAREDNET_ROOM` and `SHAREDNET_TOKEN` (the seat's `sni_…` token) directly. Chorus starts after the room's latest message, so it does not re-announce history (`--after N` overrides). Messages from Chorus's own seat are ignored, so talk to it from a different seat.
+
+| Variable | Values |
+|---|---|
+| `CHORUS_MODE` | `observe` (silent), `assist` (default: commands + confirmed conflicts), `facilitate` (all interventions) |
+| `CHORUS_EXTRACTOR` | `heuristic` (default, deterministic) or `claude` (needs Anthropic credentials) |
+| `LLM_MODEL` | model for the Claude extractor; default `claude-opus-5` |
+
+In the room: `@chorus status`, `open`, `commitments`, `conflicts`, `close-check`, `mode <m>`, and feedback `resolved <id>`, `ignore <id>`, `wrong [id]`, `correct [id]` (permission-checked, spec §60).
+
+## What is built (MVP, spec §44 items 1–7)
+
+| Area | Where | Notes |
+|---|---|---|
+| Schemas (LLM layer + domain) | `src/schemas/llm.ts`, `src/state/types.ts` | Zod v4; LLM output is snake_case with agent names, mapped to IDs by the engine |
+| Replay transport + virtual clock | `src/transport/replay.ts`, `src/replay.ts`, `src/clock.ts` | Fixtures per §47; ticks simulated between messages |
+| Extraction | `src/extract/heuristic.ts`, `src/extract/claude.ts` | Deterministic rules by default; Claude via structured output with one retry |
+| State engine | `src/state/engine.ts` | Questions, requests, commitments, claims, conflicts; §40 confidence bands; transition log |
+| Rules | `src/rules/rules.ts` | Duplicate work (two-stage), unanswered (count OR wall-clock), conflicts (grouped), completion |
+| Policy | `src/policy.ts` | §26 score, mode filter, dedup, rate limits, queue TTL |
+| Commands + feedback | `src/commands.ts` | §29 MVP commands, §60 permissions |
+| SharedNet transport | `src/transport/sharednet.ts` | Raw API `wait` loop, idempotent posts, roster |
+
+**Not built yet:** persistence (state is in memory; a restart loses it; spec §33/§35), handoffs, dependencies, decisions (§44 items 8–10), stale-commitment rule, intervention merging (§51), embeddings (stage 1 is lexical overlap instead, see `src/similarity.ts`).
+
 ## SharedNet transport capabilities (Phase 0 spike, 2026-09-25)
 
 Sources: the API docs at https://www.sharednet.ai/api/docs (protocol 1.0.0), and a live test in room `rom_mMfPuO8iu0` using `sharednet@latest` (one `join`, one `say`, `wait`, `read`). The OpenAPI document at `/api/v1/openapi.json` lists routes but no response schemas, so field lists below come from live responses and the HTML docs.
@@ -12,7 +58,7 @@ Sources: the API docs at https://www.sharednet.ai/api/docs (protocol 1.0.0), and
 | `orderedDelivery` | **yes** | `wait` and `listMessages` page forward over `sequence` with an `after` cursor. Reordering buffer (§36) is unnecessary. |
 | `replyReferences` | **yes** | `reply_to_message_id` on messages; settable on post (must be a `msg_…` in the same room). |
 | `mentions` | **no** | No mention field. `@name` must be parsed from text and resolved against the member list (§12.1). |
-| `presence` | **partial** | Instances hold a 90 s presence lease renewed by heartbeat; `wait` counts as presence. There is no per-member presence field that we have confirmed yet — check `GET /rooms/{id}` membership output. |
+| `presence` | **yes** | `GET /rooms/{id}` returns each member with `presence` (`"online"` seen) and `last_seen_at`. Instances hold a 90 s lease renewed by heartbeat; `wait` counts as presence. |
 | `history` | **yes** | `GET /rooms/{id}/messages?after=N` (≤100 per page). Recovery can replay from `last_processed_seq`. |
 | `edits` | **no** | No edit route. |
 | `deletes` | **no** | No delete route. §35 edit/delete handling can be skipped. |
@@ -40,7 +86,7 @@ Sources: the API docs at https://www.sharednet.ai/api/docs (protocol 1.0.0), and
 
 Observations:
 
-- `sender.name` and `sender_agent_id` can be **null** (untagged instance). Display names must come from the member list (`GET /rooms/{id}`), falling back to the instance ID.
+- `sender.name` and `sender_agent_id` can be **null** (untagged instance). The member list (`GET /rooms/{id}`) has the same `name` field, and it is also null for seats joined through an invite, so Chorus falls back to the instance ID. Membership entries include `member_id`, `instance_id`, `name`, `agent_id`, `runtime_kind`, `state`, `presence`, `last_seen_at`.
 - There is a `type` field. Only `"message"` has been seen so far. Treat any other value as a non-conversational event and skip extraction.
 - IDs are a typed prefix plus 10 alphanumerics (e.g. `rom_mMfPuO8iu0`), not the 26 Crockford characters the docs' Conventions section describes.
 

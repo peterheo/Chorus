@@ -1,0 +1,130 @@
+// Layer 2 (spec §9–§10): domain objects with resolved IDs, held in memory.
+// Short IDs (Q17, C4, K9, X3) are per-room and shown everywhere a human looks.
+
+export interface Agent {
+  id: string; // external ID (SharedNet i_… or fixture name)
+  displayName: string;
+  aliases: string[];
+  firstSeenAt: string;
+  lastSeenAt: string;
+  lastRoomIndex: number;
+}
+
+export interface Message {
+  id: string; // external message ID
+  seq: number; // transport sequence, shown as #N
+  roomIndex: number; // count of non-Chorus messages up to and including this one; 0 for Chorus
+  authorId: string;
+  text: string;
+  timestamp: string;
+  replyToId?: string;
+  isFromChorus: boolean;
+}
+
+interface Provenance {
+  id: string; // short ID
+  createdAt: string;
+  createdIndex: number; // room index when created
+  derivedFromMessageIds: string[];
+  extractorConfidence: number;
+}
+
+export type QuestionStatus = "open" | "acknowledged" | "answered" | "superseded" | "withdrawn";
+
+export interface Question extends Provenance {
+  kind: "question" | "request";
+  sourceMessageId: string;
+  askerId: string;
+  targetIds: string[];
+  text: string;
+  status: QuestionStatus;
+  answerMessageIds: string[];
+  claimedByCommitmentId?: string;
+  ackIndex?: number;
+  lastSurfacedIndex?: number;
+  ignored?: boolean;
+  resolvedAt?: string;
+}
+
+export type CommitmentStatus =
+  | "proposed"
+  | "accepted"
+  | "in_progress"
+  | "completed"
+  | "blocked"
+  | "cancelled"
+  | "expired";
+
+export interface Commitment extends Provenance {
+  ownerId: string;
+  sourceMessageId: string;
+  action: string;
+  status: CommitmentStatus;
+  optional: boolean;
+  deadline?: string;
+  completionMessageId?: string;
+  ignored?: boolean;
+}
+
+export interface Claim extends Provenance {
+  agentId: string;
+  messageId: string;
+  subject: string;
+  predicate: string;
+  polarity: "positive" | "negative";
+  conditions: string[];
+  hedged: boolean;
+  status: "active" | "retracted" | "superseded";
+  answersQuestionId?: string;
+}
+
+export interface Conflict extends Provenance {
+  subject: string;
+  claimIds: string[];
+  status: "candidate" | "confirmed" | "resolved" | "dismissed";
+  resolutionMessageIds: string[];
+  confirmConfidence: number;
+  ignored?: boolean;
+}
+
+export type ObjectKind = "question" | "commitment" | "claim" | "conflict";
+
+export interface Transition {
+  objectId: string;
+  kind: ObjectKind;
+  from: string | null;
+  to: string;
+  cause: "event" | "tick" | "command" | "feedback";
+  messageId?: string;
+  at: string;
+}
+
+export type InterventionType =
+  | "duplicate_work"
+  | "unanswered_question"
+  | "conflict_detected"
+  | "completion_check";
+
+export interface InterventionCandidate {
+  type: InterventionType;
+  severity: "low" | "medium" | "high";
+  involvedAgentIds: string[];
+  relatedObjectIds: string[];
+  evidenceMessageIds: string[];
+  confidence: number;
+  urgency: number;
+  expectedValue: number;
+  blockedAgents: number;
+  idempotencyKey: string;
+  text: string;
+  replyToMessageId?: string;
+  createdIndex: number;
+}
+
+export interface PostedIntervention {
+  candidate: InterventionCandidate;
+  postedAt: string;
+  postedIndex: number;
+  messageId?: string;
+  solicited: boolean;
+}

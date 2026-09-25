@@ -1,0 +1,37 @@
+{
+  "room": "milestone",
+  "description": "Spec §82 first implementation milestone",
+  "mode": "facilitate",
+  "agents": [
+    { "id": "A", "display_name": "Asker" },
+    { "id": "B", "display_name": "ResearchB" },
+    { "id": "C", "display_name": "ResearchC" },
+    { "id": "D", "display_name": "Writer" }
+  ],
+  "messages": [
+    { "t": "+0s", "agent": "A", "text": "Does Vendor X support refunds?" },
+    { "t": "+10s", "agent": "B", "text": "I'll investigate refund support." },
+    { "t": "+20s", "agent": "C", "text": "I'll check refund support too." },
+    { "t": "+40s", "agent": "C", "text": "ResearchB has it, I'll drop mine." },
+    { "t": "+50s", "agent": "D", "text": "I'm drafting the intro section." },
+    { "t": "+60s", "agent": "D", "text": "The draft outline has four parts." },
+    { "t": "+70s", "agent": "B", "text": "Yes. Refunds are supported within 24 hours.", "reply_to": 0 },
+    { "t": "+80s", "agent": "A", "text": "Does Vendor X expose a receipt endpoint?" },
+    { "t": "+90s", "agent": "D", "text": "Intro is written." },
+    { "t": "+95s", "agent": "D", "text": "Moving to the pricing table." },
+    { "t": "+100s", "agent": "A", "text": "The budget cap is 15 credits." },
+    { "t": "+105s", "agent": "D", "text": "Pricing table has three rows." },
+    { "t": "+110s", "agent": "A", "text": "Output format will be JSON." },
+    { "t": "+115s", "agent": "D", "text": "Adding a summary paragraph." },
+    { "t": "+120s", "agent": "A", "text": "The deadline is Friday." },
+    { "t": "+125s", "agent": "D", "text": "Summary paragraph done." },
+    { "t": "+130s", "agent": "A", "text": "The review meeting is at noon." },
+    { "t": "+135s", "agent": "D", "text": "Formatting pass next." },
+    { "t": "+140s", "agent": "D", "text": "Formatting looks fine." },
+    { "t": "+145s", "agent": "D", "text": "Draft is ready for review." },
+    { "t": "+200s", "agent": "B", "text": "The receipt endpoint is available.", "reply_to": 7 },
+    { "t": "+210s", "agent": "C", "text": "The receipt endpoint is not available." },
+    { "t": "+230s", "agent": "C", "text": "Correction: the receipt endpoint is available in the v2 API." },
+    { "t": "+240s", "agent": "A", "text": "@chorus close-check" }
+  ]
+}

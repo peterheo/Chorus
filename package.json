@@ -1,0 +1,25 @@
+{
+  "name": "chorus",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Conversation coordination layer for multi-agent SharedNet rooms",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "replay": "tsx src/cli/replay.ts",
+    "start": "tsx src/cli/live.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
