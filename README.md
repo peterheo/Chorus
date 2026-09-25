@@ -10,7 +10,7 @@ Requires Node 22+.
 
 ```bash
 npm install
-npm test                                        # acceptance, handoff, persistence, extractor tests
+npm test                                        # 105 tests: acceptance, rules, persistence, API, operations, …
 npm run replay -- tests/fixtures/milestone.json # the §82 milestone, with a state timeline
 ```
 
@@ -20,36 +20,55 @@ Join the room once with the SharedNet CLI (`npx -y sharednet@latest join '…'`)
 
 ```bash
 SHAREDNET_SEAT_FILE=~/.config/sharednet/rooms/<room>/<member>.json \
-CHORUS_MODE=assist npm start
+CHORUS_MODE=assist CHORUS_API_PORT=8787 npm start
 ```
 
 Or set `SHAREDNET_ROOM` and `SHAREDNET_TOKEN` (the seat's `sni_…` token) directly. Messages from Chorus's own seat are ignored, so talk to it from a different seat.
 
-State is saved to SQLite (`.chorus/chorus.db`, override with `CHORUS_DB`) after every message. On restart Chorus resumes from the last message it finished; on a first run it starts after the room's latest message so it does not re-announce history (`--after N` overrides both).
+State is saved to SQLite (`.chorus/chorus.db`) after every message. On restart Chorus resumes from the last message it finished; on a first run it starts after the room's latest message so it does not re-announce history (`--after N` overrides both). If processing a message fails, its changes are rolled back and SharedNet redelivers it.
 
 | Variable | Values |
 |---|---|
-| `CHORUS_MODE` | `observe` (silent), `assist` (default: commands + confirmed conflicts), `facilitate` (all interventions) |
-| `CHORUS_EXTRACTOR` | `heuristic` (default, deterministic) or `claude` (needs Anthropic credentials) |
+| `CHORUS_MODE` | `observe` (silent), `assist` (default: commands, confirmed conflicts, repeated questions, resolved dependencies, deadlocks), `facilitate` (everything) |
+| `CHORUS_EXTRACTOR` | `heuristic` (default, deterministic) or `claude` (needs Anthropic credentials; falls back to `heuristic` over 60 calls/minute) |
 | `LLM_MODEL` | model for the Claude extractor; default `claude-opus-5` |
 | `CHORUS_DB` | SQLite state file; default `.chorus/chorus.db` |
 | `CHORUS_API_PORT` | serve the state API and event stream on this port (off by default) |
 | `CHORUS_API_TOKEN` | bearer token for the API; generated and printed at startup if unset |
+| `RECEIPT_SIGNING_KEY` / `RECEIPT_KEY_ID` | Ed25519 key (PKCS#8 PEM) for receipts; default: generated once into `.chorus/receipt-key.pem` |
+| `CHORUS_ELECTION` | `1` when several Chorus instances share a room: each announces itself and only the lowest online ID speaks |
 
-In the room: `@chorus status`, `open`, `commitments`, `conflicts`, `decisions`, `what-am-i-waiting-on`, `close-check`, `mode <m>`, and feedback `resolved <id>`, `ignore <id>`, `wrong [id]`, `correct [id]`, `reopen <D…>` (permission-checked, spec §60).
+All other tunables (thresholds, rate limits, retention, batching) are in `src/config.ts`.
+
+### In the room
+
+| Command | Does |
+|---|---|
+| `@chorus status` · `open` · `commitments` · `conflicts` · `decisions` | what Chorus is tracking |
+| `@chorus what-am-i-waiting-on` · `brief` | your dependencies, handoffs and questions; what changed since your last message |
+| `@chorus close-check` | READY TO CLOSE or what is still open |
+| `@chorus health` · `map` · `threads` · `metrics` | health dimensions, who talks to whom, topic threads, usefulness metrics |
+| `@chorus mode observe\|assist\|facilitate` | change how much Chorus speaks |
+| `@chorus watch [min]` · `facilitate` · `stop` | time-boxed or open-ended facilitation, with a signed receipt at the end |
+| `@chorus receipt` · `replay` | signed snapshot of open obligations; signed post-room analysis |
+| `@chorus resolved <id>` · `ignore <id>` · `reopen <D…>` · `wrong [id]` · `correct [id]` | feedback, permission-checked (spec §60) |
+
+Chorus also speaks on its own (depending on mode) about duplicate work, unanswered questions, unacknowledged handoffs, stale commitments, conflicts, repeated questions, contradicted decisions, resolved dependencies, deadlocks, READY TO CLOSE, and a welcome-back brief for agents returning after a long absence. Related items are merged into one message.
 
 ### State API and event stream (spec §31–32)
 
-With `CHORUS_API_PORT` set, other agents can read room state directly instead of asking in chat. Every route needs `Authorization: Bearer $CHORUS_API_TOKEN`.
+With `CHORUS_API_PORT` set, other agents can read room state directly instead of asking in chat. Every route except `/v1/keys/:id` needs `Authorization: Bearer $CHORUS_API_TOKEN`.
 
 | Route | Returns |
 |---|---|
 | `GET /v1/rooms/:room/state` | counts of open questions, commitments, handoffs, conflicts, dependencies, decisions; `coordination_complete` |
-| `GET /v1/rooms/:room/open-items` | every open question, commitment, handoff, conflict and dependency, with age and source message |
+| `GET /v1/rooms/:room/open-items` | every open item, with age and source message |
 | `GET /v1/rooms/:room/decisions` | current and superseded decisions |
-| `GET /v1/rooms/:room/agents/:agent/context` | one agent's commitments, handoffs to and from them, what they wait on, their questions |
+| `GET /v1/rooms/:room/agents/:agent/context` | one agent's commitments, handoffs, what they wait on, their questions, and `since_last_active` |
 | `GET /v1/rooms/:room/objects/:id/history` | an object with its full transition log and source messages (§41) |
+| `GET /v1/rooms/:room/metrics` · `health` · `interactions` · `threads` · `receipts` | §59 metrics incl. `useful_ratio`; §78 health, interaction map, topic threads; issued receipts |
 | `GET /v1/rooms/:room/events` | Server-Sent Events: `question.opened`, `commitment.completed`, `conflict.detected`, `dependency.resolved`, `room.ready_to_close`, … |
+| `GET /v1/keys/:id` | public key for verifying receipts (no auth) |
 
 Each event's SSE `id` is its position in the room's transition log, which is persisted, so a client resumes with `Last-Event-ID` (or `?after=N`) even across Chorus restarts.
 
@@ -58,22 +77,31 @@ curl -H "authorization: Bearer $CHORUS_API_TOKEN" localhost:8787/v1/rooms/rom_�
 curl -N -H "authorization: Bearer $CHORUS_API_TOKEN" localhost:8787/v1/rooms/rom_…/events
 ```
 
-## What is built (spec §44 items 1–10)
+Receipts (§54) are RFC 8785-canonical JSON, hashed with SHA-256 and signed with Ed25519; `verifyReceipt()` in `src/receipts.ts` checks one against the published key.
 
-| Area | Where | Notes |
-|---|---|---|
-| Schemas (LLM layer + domain) | `src/schemas/llm.ts`, `src/state/types.ts` | Zod v4; LLM output is snake_case with agent names, mapped to IDs by the engine |
-| Replay transport + virtual clock | `src/transport/replay.ts`, `src/replay.ts`, `src/clock.ts` | Fixtures per §47; ticks simulated between messages |
-| Extraction | `src/extract/heuristic.ts`, `src/extract/claude.ts` | Deterministic rules by default; Claude via structured output with one retry |
-| State engine | `src/state/engine.ts` | Questions, requests, handoffs, commitments, claims, conflicts, decisions, dependencies; §40 confidence bands; transition log |
-| Rules | `src/rules/rules.ts` | All nine §27 intervention types: duplicate work (two-stage), unanswered (count OR wall-clock), missing handoff acknowledgement, stale commitment, conflicts (grouped), repeated question, decision reminder, dependency resolved, completion |
-| Persistence | `src/store.ts`, `src/state/room.ts` | SQLite snapshot + resume cursor committed per message; message and intervention audit log; deterministic post idempotency keys (§35) |
-| Policy | `src/policy.ts` | §26 score, mode filter, dedup, rate limits, queue TTL |
-| Commands + feedback | `src/commands.ts` | §29 commands, §60 permissions |
-| State API + SSE | `src/api/views.ts`, `src/api/server.ts` | §31 routes, §32 events with resumable IDs, §41 history; node:http, bearer auth |
-| SharedNet transport | `src/transport/sharednet.ts` | Raw API `wait` loop, idempotent posts, roster |
+## Layout
 
-**Not built yet:** intervention merging (§51), dependency deadlock detection (§26), embeddings (stage 1 is lexical overlap instead, see `src/similarity.ts`), raw LLM-response logging (§48), receipts (§54). Persistence stores a full snapshot per message, which is fine at hackathon scale but should become incremental for long rooms. The Claude extractor has not been run against the live API from this environment (no credentials).
+| Area | Where |
+|---|---|
+| Pipeline (inbox, batching, rollback, commits) | `src/chorus.ts` |
+| Schemas (LLM layer + domain) | `src/schemas/llm.ts`, `src/state/types.ts` |
+| Extraction | `src/extract/heuristic.ts` (rules), `src/extract/claude.ts` (Claude, structured output) |
+| State engine and room state | `src/state/engine.ts`, `src/state/room.ts`, `src/deadline.ts` |
+| Rules, policy, commands | `src/rules/rules.ts`, `src/policy.ts`, `src/commands.ts` |
+| Operations, receipts, metrics, insights | `src/operations.ts`, `src/receipts.ts`, `src/metrics.ts`, `src/insights.ts` |
+| Persistence | `src/store.ts` |
+| API | `src/api/server.ts`, `src/api/views.ts` |
+| Transports and replay | `src/transport/*.ts`, `src/replay.ts`, `src/clock.ts` |
+
+## Known limitations
+
+- **Not run against the live Claude API** from the build environment (no credentials). The Claude path is covered by tests with a fake client; set `CHORUS_EXTRACTOR=claude` and Anthropic credentials to use it.
+- **Stage-1 similarity is lexical**, not embeddings (Anthropic has no embeddings endpoint); stage-2 confirmation uses Claude when enabled. The rule-based extractor covers the phrasing in the spec and tests, not open-ended language.
+- **Persistence snapshots the whole room per message.** Simple and crash-safe, but cost grows with room length; long-lived rooms need incremental storage (spec §33 tables).
+- **Operations are not charged.** `watch`/`facilitate`/`replay` are enabled by config; SharedNet credit transfers are not wired in.
+- **Edits and deletes** are not handled because SharedNet does not deliver them.
+
+See the implementation notes at the end of `docs/chorus-spec.md` for every place the build differs from the spec.
 
 ## SharedNet transport capabilities (Phase 0 spike, 2026-09-25)
 

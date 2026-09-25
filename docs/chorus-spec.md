@@ -3507,7 +3507,7 @@ Responds to explicit @chorus commands
 Only high-confidence unsolicited alerts
 ```
 
-"High-confidence" means only these intervention types, and only when the candidate's `confidence ≥ 0.90`: `conflict_detected` (confirmed only), `repeated_question`, `dependency_resolved`.
+"High-confidence" means only these intervention types, and only when the candidate's `confidence ≥ 0.90`: `conflict_detected` (confirmed only), `repeated_question`, `dependency_resolved`, `dependency_deadlock`.
 
 Recommended default for production rooms.
 
@@ -4052,3 +4052,27 @@ This room has no remaining coordination obligations.
 ```
 
 and prove every statement from the room history.
+
+---
+
+# 84. Implementation Notes (as built)
+
+The build on this branch implements every section above, including the §78 stretch features. Where it differs from the text, the difference is deliberate and listed here.
+
+| Spec | As built | Why |
+|---|---|---|
+| §8 monorepo (`apps/`, `packages/`) | One package; `src/` folders match the module boundaries | Hackathon profile; nothing needs separate deployment yet |
+| §7 Fastify | `node:http` | No dependency needed for nine GET routes and SSE |
+| §33 normalized tables | In-memory `RoomState` snapshotted to SQLite (`node:sqlite`) per message, plus audit tables (messages, interventions, receipts, llm_calls) | Crash-safe with one transaction per message; incremental tables are the production path |
+| §35 outbox with `sending` state | Interventions are recorded only after the send succeeds; keys are deterministic, so a retry after a crash is deduplicated by SharedNet's Idempotency-Key | SharedNet replays the stored message for a repeated key (§34.1), which removes the need for echo-matching |
+| §18, §22, §38 embeddings | Stage 1 uses a lexical overlap coefficient over stemmed content words (`src/similarity.ts`); stage 2 uses the Claude confirmer when enabled | Anthropic has no embeddings endpoint |
+| §12 LLM extraction | A deterministic rule-based extractor is the default; the Claude extractor (`claude-opus-5`, structured output, `fallbacks: "default"`) is opt-in | Reproducible replays and tests without credentials |
+| §63 over budget: observe-only extraction | Over `llm.maxCallsPerMinute`, extraction falls back to the rule-based extractor | Keeps tracking state instead of dropping messages |
+| §9.4 handoffs vs requests | As specified; the extractor also marks "take over my C4" transfers via short-ID references | — |
+| §71 assist mode | Also allows `dependency_deadlock` | High-confidence and high-value, like the other assist types |
+| §43 paid operations | `watch`, `facilitate`, `replay`, `receipt` implemented and enabled by config; no credit transfer | Payment is out of MVP scope (§43) |
+| §54 receipts | As specified; the public key is served unauthenticated at `/v1/keys/:id` | Anyone holding a receipt must be able to verify it |
+| §78 facilitator election | Opt-in: each instance posts `[chorus] online as <id>`; the lowest online ID speaks; presence from the SharedNet roster | SharedNet has no metadata channel between instances |
+| §78 topic threads | Union of objects sharing content words or explicit links (answers, claims, handoffs, conflicts) | Cheap and explainable; no clustering model |
+| §35 edits/deletes | Not handled | SharedNet does not deliver edits or deletes (§34.1) |
+
