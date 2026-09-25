@@ -10,6 +10,7 @@ import type {
   Decision,
   Dependency,
   Handoff,
+  FacilitationSession,
   Message,
   ObjectKind,
   PostedIntervention,
@@ -52,12 +53,18 @@ export class RoomState {
   completionAnnounced = false;
   /** coordination-complete as of the last commit; drives room.ready_to_close (§32) */
   readyToClose = false;
+  /** operational counters for §59 metrics (LLM calls, failures, …) */
+  readonly counters = new Map<string, number>();
+  /** active chorus.watch / chorus.facilitate session (§43) */
+  session: FacilitationSession | null = null;
+  /** signed receipts issued in this room (§54) */
+  readonly receipts: SignedReceiptRecord[] = [];
 
   /** number of non-Chorus messages seen (spec §11.1) */
   roomIndex = 0;
   /** highest transport sequence fully processed; the resume cursor (§70) */
   lastProcessedSeq = 0;
-  private counters: Record<string, number> = { Q: 0, C: 0, K: 0, X: 0, H: 0, D: 0, P: 0 };
+  private idCounters: Record<string, number> = { Q: 0, C: 0, K: 0, X: 0, H: 0, D: 0, P: 0 };
 
   constructor(mode: Mode) {
     this.mode = mode;
@@ -65,8 +72,8 @@ export class RoomState {
 
   nextId(kind: ObjectKind): string {
     const p = PREFIX[kind];
-    this.counters[p] = (this.counters[p] ?? 0) + 1;
-    return `${p}${this.counters[p]}`;
+    this.idCounters[p] = (this.idCounters[p] ?? 0) + 1;
+    return `${p}${this.idCounters[p]}`;
   }
 
   message(id: string): Message | undefined {
@@ -111,6 +118,26 @@ export class RoomState {
     this.transitions.push(t);
   }
 
+  /**
+   * §65 retention: drop the text of messages older than the cutoff. The
+   * message stubs (ID, sequence, author) stay so citations like #12 still
+   * resolve. Returns how many were pruned.
+   */
+  prune(cutoffIso: string): number {
+    let n = 0;
+    for (const m of this.messages) {
+      if (m.timestamp < cutoffIso && m.text !== "") {
+        m.text = "";
+        n++;
+      }
+    }
+    return n;
+  }
+
+  count(name: string, by = 1): void {
+    this.counters.set(name, (this.counters.get(name) ?? 0) + by);
+  }
+
   openQuestions(): Question[] {
     return [...this.questions.values()].filter((q) => q.status === "open" || q.status === "acknowledged");
   }
@@ -137,7 +164,10 @@ export class RoomState {
       chorusAgentId: this.chorusAgentId,
       roomIndex: this.roomIndex,
       lastProcessedSeq: this.lastProcessedSeq,
-      counters: { ...this.counters },
+      counters: { ...this.idCounters },
+      metricCounters: [...this.counters],
+      session: this.session,
+      receipts: this.receipts,
       completionAnnounced: this.completionAnnounced,
       readyToClose: this.readyToClose,
       agents: [...this.agents.values()],
@@ -163,7 +193,10 @@ export class RoomState {
     s.chorusAgentId = j.chorusAgentId;
     s.roomIndex = j.roomIndex;
     s.lastProcessedSeq = j.lastProcessedSeq;
-    s.counters = { ...j.counters };
+    s.idCounters = { ...j.counters };
+    for (const [k, v] of j.metricCounters ?? []) s.counters.set(k, v);
+    s.session = j.session ?? null;
+    s.receipts.push(...(j.receipts ?? []));
     s.completionAnnounced = j.completionAnnounced;
     s.readyToClose = j.readyToClose ?? false;
     for (const a of j.agents) s.agents.set(a.id, a);
@@ -186,6 +219,15 @@ export class RoomState {
   }
 }
 
+export interface SignedReceiptRecord {
+  operation: string;
+  body: Record<string, unknown>;
+  sha256: string;
+  signature: string;
+  key_id: string;
+  messageId?: string;
+}
+
 export interface RoomSnapshot {
   version: 1;
   mode: Mode;
@@ -193,6 +235,9 @@ export interface RoomSnapshot {
   roomIndex: number;
   lastProcessedSeq: number;
   counters: Record<string, number>;
+  metricCounters?: Array<[string, number]>;
+  session?: FacilitationSession | null;
+  receipts?: SignedReceiptRecord[];
   completionAnnounced: boolean;
   readyToClose?: boolean;
   agents: Agent[];

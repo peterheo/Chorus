@@ -190,4 +190,17 @@ export interface PostedIntervention {
   postedIndex: number;
   messageId?: string;
   solicited: boolean;
+  /** `@chorus correct` / `@chorus wrong` from an involved agent (§60) */
+  feedback?: "correct" | "wrong";
+}
+
+/** A time-boxed or open-ended facilitation session (§43 chorus.watch / chorus.facilitate). */
+export interface FacilitationSession {
+  kind: "watch" | "facilitate";
+  requestedBy: string;
+  startedAt: string;
+  startedSeq: number;
+  /** ISO end time for watch; absent for facilitate (runs until stopped) */
+  until?: string;
+  previousMode: "observe" | "assist" | "facilitate";
 }

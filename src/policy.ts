@@ -8,9 +8,11 @@ import type { InterventionCandidate } from "./state/types.ts";
 const SEVERITY = { low: 0.2, medium: 0.5, high: 1.0 } as const;
 
 export function score(state: RoomState, c: InterventionCandidate): number {
+  // Only unsolicited Chorus messages count as noise; replies to commands don't.
+  const unsolicitedIds = new Set(state.posted.filter((p) => !p.solicited && p.messageId).map((p) => p.messageId));
   const recentChorus = state.messages
     .slice(-10)
-    .filter((m) => m.isFromChorus).length;
+    .filter((m) => m.isFromChorus && unsolicitedIds.has(m.id)).length;
   return (
     0.3 * SEVERITY[c.severity] +
     0.2 * c.urgency +

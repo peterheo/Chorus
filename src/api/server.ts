@@ -4,6 +4,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import type { ChorusRoom } from "../chorus.ts";
+import { metrics } from "../metrics.ts";
 import { agentContextView, decisionsView, historyView, openItemsView, stateView } from "./views.ts";
 
 export interface ApiOptions {
@@ -29,7 +30,9 @@ function authorized(req: IncomingMessage, token: string): boolean {
   return given.length === want.length && timingSafeEqual(given, want);
 }
 
-const ROUTE = /^\/v1\/rooms\/([^/]+)(?:\/(state|open-items|decisions|events|agents\/([^/]+)\/context|objects\/([^/]+)\/history))?\/?$/;
+const ROUTE =
+  /^\/v1\/rooms\/([^/]+)(?:\/(state|open-items|decisions|events|metrics|receipts|agents\/([^/]+)\/context|objects\/([^/]+)\/history))?\/?$/;
+const KEY_ROUTE = /^\/v1\/keys\/([^/]+)\/?$/;
 
 export function createApiServer(opts: ApiOptions): Server {
   const heartbeatMs = opts.heartbeatMs ?? 15_000;
@@ -38,6 +41,17 @@ export function createApiServer(opts: ApiOptions): Server {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (req.method !== "GET") return send(res, 405, { error: { code: "method_not_allowed" } });
     if (url.pathname === "/healthz") return send(res, 200, { ok: true });
+
+    // Public keys are public: anyone holding a receipt must be able to verify it (§54).
+    const k = KEY_ROUTE.exec(url.pathname);
+    if (k) {
+      const keyId = decodeURIComponent(k[1]!);
+      const signer = [...opts.rooms.values()].map((r) => r.signer).find((s) => s.keyId === keyId);
+      return signer
+        ? send(res, 200, { key_id: keyId, algorithm: "Ed25519", public_key_pem: signer.publicKeyPem })
+        : send(res, 404, { error: { code: "key_not_found" } });
+    }
+
     if (!authorized(req, opts.token)) return send(res, 401, { error: { code: "authentication_required" } });
 
     const m = ROUTE.exec(url.pathname);
@@ -50,6 +64,8 @@ export function createApiServer(opts: ApiOptions): Server {
     if (!view || view === "state") return send(res, 200, stateView(roomId!, s));
     if (view === "open-items") return send(res, 200, openItemsView(s));
     if (view === "decisions") return send(res, 200, decisionsView(s));
+    if (view === "metrics") return send(res, 200, metrics(s));
+    if (view === "receipts") return send(res, 200, { receipts: s.receipts });
     if (agentId !== undefined) return send(res, 200, agentContextView(s, decodeURIComponent(agentId)));
     if (objectId !== undefined) {
       const h = historyView(s, decodeURIComponent(objectId).toUpperCase());

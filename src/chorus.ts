@@ -27,7 +27,10 @@ import {
 import { applyDeadlines, applyEvents } from "./state/engine.ts";
 import { RoomState } from "./state/room.ts";
 import type { InterventionCandidate, Message } from "./state/types.ts";
-import { MemoryStore, type InterventionRow, type MessageRow, type Store } from "./store.ts";
+import type { LlmCall } from "./extract/claude.ts";
+import { endExpiredSession } from "./operations.ts";
+import { ReceiptSigner } from "./receipts.ts";
+import { MemoryStore, type InterventionRow, type MessageRow, type ReceiptRow, type Store } from "./store.ts";
 import type { ExternalRoomMessage, RoomTransport } from "./transport/types.ts";
 
 export interface ChorusEvent {
@@ -48,6 +51,10 @@ export interface ChorusOptions {
   roomKey?: string;
   /** trace sink for the replay harness and logs */
   onEvent?: (e: ChorusEvent) => void;
+  /** signs receipts (§54); an ephemeral key is generated if omitted */
+  signer?: ReceiptSigner;
+  /** used when the primary (LLM) extractor is over its call budget (§63) */
+  fallbackExtractor?: Extractor;
 }
 
 /** "I'm the verifier." / "This is Verifier." / "Hi, I am ResearchA" — the whole message. */
@@ -81,6 +88,12 @@ export class ChorusRoom {
   private timer: NodeJS.Timeout | null = null;
   /** interventions posted since the last commit */
   private pending: InterventionRow[] = [];
+  /** receipts issued since the last commit */
+  private pendingReceipts: ReceiptRow[] = [];
+  readonly signer: ReceiptSigner;
+  /** start times of recent LLM extraction calls, for the §63 budget */
+  private llmWindow: number[] = [];
+  private lastPruneAt = 0;
   private readonly listeners = new Set<(e: RoomEvent) => void>();
   /** transitions already published to subscribers */
   private published = 0;
@@ -90,6 +103,42 @@ export class ChorusRoom {
     this.roomKey = opts.roomKey ?? "room";
     this._state = new RoomState(opts.config.mode);
     this.policy = new InterventionPolicy(() => opts.config);
+    this.signer = opts.signer ?? ReceiptSigner.load({});
+  }
+
+  /** Record one LLM request: metrics (§59) and the raw-response log (§48). */
+  recordLlmCall(call: LlmCall): void {
+    const s = this._state;
+    s.count("llm_calls");
+    if (call.inputTokens) s.count("llm_input_tokens", call.inputTokens);
+    if (call.outputTokens) s.count("llm_output_tokens", call.outputTokens);
+    this.store.logLlmCall?.(this.roomKey, call);
+  }
+
+  /** §63: pick the extractor for the next message, respecting the per-minute budget. */
+  private chooseExtractor(): Extractor {
+    const primary = this.opts.extractor;
+    const fallback = this.opts.fallbackExtractor;
+    if (!fallback || primary.name === "heuristic") return primary;
+    const now = this.opts.clock.now().getTime();
+    this.llmWindow = this.llmWindow.filter((t) => now - t < 60_000);
+    if (this.llmWindow.length >= this.opts.config.llm.maxCallsPerMinute) {
+      this._state.count("llm_budget_fallbacks");
+      return fallback;
+    }
+    this.llmWindow.push(now);
+    return primary;
+  }
+
+  /** §65: prune message text past the retention period, at most hourly. */
+  private prune(): void {
+    const now = this.opts.clock.now();
+    if (now.getTime() - this.lastPruneAt < 3_600_000) return;
+    this.lastPruneAt = now.getTime();
+    const cutoff = new Date(now.getTime() - this.opts.config.retention.days * 86_400_000).toISOString();
+    const n = this._state.prune(cutoff);
+    this.store.prune?.(this.roomKey, cutoff);
+    if (n) this.emit({ kind: "state", detail: `retention: pruned text of ${n} messages older than ${cutoff}` });
   }
 
   get state(): RoomState {
@@ -164,11 +213,37 @@ export class ChorusRoom {
 
   tick(): Promise<void> {
     return this.enqueue(async () => {
-      const expired = applyDeadlines(this._state, this.opts.clock.now());
+      const now = this.opts.clock.now();
+      const expired = applyDeadlines(this._state, now);
       for (const id of expired) this.emit({ kind: "state", detail: `${id} → ${this._state.object(id)?.status} (deadline)` });
+      const sessionEnd = endExpiredSession(this._state, this.roomKey, now, this.signer);
+      if (sessionEnd) {
+        this.pendingReceipts.push(sessionEnd.record);
+        await this.post(this.reply(`session-end:${sessionEnd.record.sha256}`, sessionEnd.text, [this._state.session?.requestedBy ?? ""]), true);
+      }
+      this.prune();
       await this.evaluate("tick");
-      if (this.pending.length || expired.length) this.commit();
+      if (this.pending.length || expired.length || sessionEnd) this.commit();
     });
+  }
+
+  /** A solicited reply (command answers, receipts): exempt from rate limits. */
+  private reply(key: string, text: string, involved: string[], replyToMessageId?: string): InterventionCandidate {
+    return {
+      type: "command_reply",
+      severity: "low",
+      involvedAgentIds: involved.filter(Boolean),
+      relatedObjectIds: [],
+      evidenceMessageIds: replyToMessageId ? [replyToMessageId] : [],
+      confidence: 1,
+      urgency: 1,
+      expectedValue: 1,
+      blockedAgents: 0,
+      idempotencyKey: key,
+      text,
+      replyToMessageId,
+      createdIndex: this._state.roomIndex,
+    };
   }
 
   /**
@@ -214,8 +289,10 @@ export class ChorusRoom {
       state: this._state.toJSON(),
       message,
       interventions: this.pending,
+      receipts: this.pendingReceipts,
     });
     this.pending = [];
+    this.pendingReceipts = [];
     // Publish only after the state is durable.
     const t = s.transitions;
     for (; this.published < t.length; this.published++) {
@@ -292,26 +369,18 @@ export class ChorusRoom {
     this.learnAlias(msg);
 
     if (COMMAND.test(msg.text)) {
-      const r = runCommand(s, msg, this.opts.clock.now());
+      const r = runCommand(s, msg, {
+        now: this.opts.clock.now(),
+        room: this.roomKey,
+        signer: this.signer,
+        operationsEnabled: this.opts.config.operations.enabled,
+      });
       this.emit({ kind: "command", seq: msg.seq, detail: msg.text.trim() });
-      await this.post(
-        {
-          type: "command_reply",
-          severity: "low",
-          involvedAgentIds: [msg.authorId],
-          relatedObjectIds: [],
-          evidenceMessageIds: [msg.id],
-          confidence: 1,
-          urgency: 1,
-          expectedValue: 1,
-          blockedAgents: 0,
-          idempotencyKey: `command:${msg.id}`,
-          text: r.reply,
-          replyToMessageId: msg.id,
-          createdIndex: s.roomIndex,
-        },
-        true,
-      );
+      const messageId = await this.post(this.reply(`command:${msg.id}`, r.reply, [msg.authorId], msg.id), true);
+      if (r.receipt) {
+        r.receipt.messageId = messageId;
+        this.pendingReceipts.push(r.receipt);
+      }
       if (r.changed) await this.evaluate("state_change");
       return "command";
     }
@@ -322,7 +391,17 @@ export class ChorusRoom {
       return "skipped";
     }
 
-    const events = await this.opts.extractor.extract(msg.text, this.context(msg));
+    const extractor = this.chooseExtractor();
+    let events;
+    try {
+      events = await extractor.extract(msg.text, this.context(msg));
+    } catch (err) {
+      if ((err as Error).name !== "ExtractionFailedError") throw err;
+      s.count("extraction_failures");
+      this.emit({ kind: "error", seq: msg.seq, detail: (err as Error).message });
+      await this.evaluate("state_change");
+      return "extraction_failed";
+    }
     this.emit({
       kind: "events",
       seq: msg.seq,
@@ -332,7 +411,7 @@ export class ChorusRoom {
       config: this.opts.config,
       confirmer: this.opts.confirmer,
       now: this.opts.clock.now(),
-      lexicalExtractor: this.opts.extractor.name === "heuristic",
+      lexicalExtractor: extractor.name === "heuristic",
       log: (d) => this.emit({ kind: "state", seq: msg.seq, detail: d }),
     });
     for (const id of result.created) this.emit({ kind: "state", seq: msg.seq, detail: `created ${id}` });
@@ -391,7 +470,7 @@ export class ChorusRoom {
     if (decision.post) await this.post(decision.post, false);
   }
 
-  private async post(c: InterventionCandidate, solicited: boolean): Promise<void> {
+  private async post(c: InterventionCandidate, solicited: boolean): Promise<string | undefined> {
     const s = this._state;
     const now = this.opts.clock.now();
     const record = {
@@ -414,7 +493,7 @@ export class ChorusRoom {
         if (p) p.notified = true;
       }
     }
-    if (s.mode === "observe" && !solicited) return;
+    if (s.mode === "observe" && !solicited) return undefined;
 
     const key = interventionKey(this.roomKey, s.chorusAgentId ?? "", `${c.idempotencyKey}#${s.posted.length}`);
     const result = await this.opts.transport.sendMessage({ text: c.text, replyToId: c.replyToMessageId, idempotencyKey: key });
@@ -428,5 +507,6 @@ export class ChorusRoom {
       postedAt: record.postedAt,
     });
     this.emit({ kind: "posted", seq: result.seq, detail: `${solicited ? "reply" : c.type}\n${c.text}` });
+    return result.id;
   }
 }

@@ -12,6 +12,9 @@
 //   CHORUS_DB            SQLite file for room state (default .chorus/chorus.db)
 //   CHORUS_API_PORT      serve the state API + SSE (spec §31–32) on this port
 //   CHORUS_API_TOKEN     bearer token for the API (generated and printed if unset)
+//   RECEIPT_SIGNING_KEY  Ed25519 private key (PKCS#8 PEM) for receipts; default:
+//                        generated once and kept in .chorus/receipt-key.pem
+//   RECEIPT_KEY_ID       key ID shown on receipts (default derived from the key)
 //
 // Flags:
 //   --after N            start after sequence N. Default: where the saved
@@ -28,6 +31,7 @@ import { defaultConfig, type Mode } from "../config.ts";
 import { HeuristicConfirmer } from "../confirm.ts";
 import { ClaudeConfirmer, ClaudeExtractor } from "../extract/claude.ts";
 import { HeuristicExtractor } from "../extract/heuristic.ts";
+import { ReceiptSigner } from "../receipts.ts";
 import { SqliteStore } from "../store.ts";
 import { SharedNetTransport } from "../transport/sharednet.ts";
 
@@ -79,10 +83,19 @@ const after =
 
 const useClaude = env.CHORUS_EXTRACTOR === "claude";
 const transport = new SharedNetTransport({ baseUrl, roomId, token, after, log });
-const room = new ChorusRoom({
+const signer = ReceiptSigner.load({
+  pem: env.RECEIPT_SIGNING_KEY,
+  path: `${dirname(dbPath)}/receipt-key.pem`,
+  keyId: env.RECEIPT_KEY_ID,
+});
+// LLM calls are logged to SQLite and counted (§48, §59); `room` is assigned below.
+const claudeOpts = { model: env.LLM_MODEL, log, onCall: (c: Parameters<ChorusRoom["recordLlmCall"]>[0]) => room.recordLlmCall(c) };
+const room: ChorusRoom = new ChorusRoom({
   transport,
-  extractor: useClaude ? new ClaudeExtractor({ model: env.LLM_MODEL, log }) : new HeuristicExtractor(),
-  confirmer: useClaude ? new ClaudeConfirmer({ model: env.LLM_MODEL, log }) : new HeuristicConfirmer(),
+  signer,
+  extractor: useClaude ? new ClaudeExtractor(claudeOpts) : new HeuristicExtractor(),
+  fallbackExtractor: useClaude ? new HeuristicExtractor() : undefined,
+  confirmer: useClaude ? new ClaudeConfirmer(claudeOpts) : new HeuristicConfirmer(),
   clock: new SystemClock(),
   config: { ...defaultConfig, mode },
   store,
@@ -95,6 +108,7 @@ const room = new ChorusRoom({
 
 await room.start({ tick: true });
 log(`Chorus listening in ${roomId} as ${transport.selfId()} (mode ${mode}, extractor ${useClaude ? "claude" : "heuristic"}, after #${after})`);
+log(`Receipts signed with key ${signer.keyId}`);
 
 const apiPort = env.CHORUS_API_PORT ? Number(env.CHORUS_API_PORT) : undefined;
 const api =

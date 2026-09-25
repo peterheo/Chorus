@@ -34,6 +34,12 @@ export interface ChorusConfig {
   stale: { ageRefSeconds: number; roomRefMessages: number; resurfaceCooldownMessages: number };
   presence: { activeWindowMessages: number };
   extraction: { recentWindow: number };
+  /** §43: watch / facilitate / replay / receipt commands */
+  operations: { enabled: boolean };
+  /** §63: per-room LLM call budget; over budget, extraction falls back to the rule-based extractor */
+  llm: { maxCallsPerMinute: number };
+  /** §65: message text older than this is pruned */
+  retention: { days: number };
 }
 
 export const defaultConfig: ChorusConfig = {
@@ -67,6 +73,9 @@ export const defaultConfig: ChorusConfig = {
   stale: { ageRefSeconds: 600, roomRefMessages: 30, resurfaceCooldownMessages: 30 },
   presence: { activeWindowMessages: 30 },
   extraction: { recentWindow: 10 },
+  operations: { enabled: true },
+  llm: { maxCallsPerMinute: 60 },
+  retention: { days: 7 },
 };
 
 export function withMode(config: ChorusConfig, mode: Mode): ChorusConfig {

@@ -2,6 +2,19 @@
 // Deterministic; no LLM involved. Replies are solicited and exempt from limits.
 
 import type { Mode } from "./config.ts";
+import { metrics } from "./metrics.ts";
+import {
+  WATCH_DEFAULT_MINUTES,
+  WATCH_MAX_MINUTES,
+  analysisBody,
+  endSession,
+  issueReceipt,
+  openObligations,
+  snapshotBody,
+  summarizeObligations,
+} from "./operations.ts";
+import type { ReceiptSigner } from "./receipts.ts";
+import type { SignedReceiptRecord } from "./state/room.ts";
 import { completionReport, describeClaim, formatCompletion } from "./rules/rules.ts";
 import type { RoomState } from "./state/room.ts";
 import type { Message } from "./state/types.ts";
@@ -12,6 +25,17 @@ export interface CommandResult {
   reply: string;
   /** state changed; re-run rules */
   changed: boolean;
+  /** a receipt issued by this command (§54) */
+  receipt?: SignedReceiptRecord;
+}
+
+export interface CommandContext {
+  now: Date;
+  /** room ID as shown in receipts */
+  room: string;
+  signer?: ReceiptSigner;
+  /** §43 operations (watch, facilitate, replay) enabled by config */
+  operationsEnabled: boolean;
 }
 
 const HELP = [
@@ -19,6 +43,7 @@ const HELP = [
   "@chorus status | open | commitments | conflicts | decisions | what-am-i-waiting-on | close-check",
   "@chorus resolved <id> | ignore <id> | wrong [id] | correct [id] | reopen <D…>",
   "@chorus mode observe|assist|facilitate",
+  "@chorus watch [minutes] | facilitate | stop | replay | receipt | metrics",
 ].join("\n");
 
 function status(state: RoomState): string {
@@ -148,6 +173,7 @@ function feedback(state: RoomState, verb: string, arg: string | undefined, msg: 
     if (!target) return { reply: "No intervention to give feedback on.", changed: false };
     if (!target.candidate.involvedAgentIds.includes(who)) return deny("only agents involved in an intervention may rate it");
     if (verb === "wrong") state.suppressedKeys.add(target.candidate.idempotencyKey);
+    target.feedback = verb as "correct" | "wrong";
     return { reply: `Recorded: ${verb} (${target.candidate.type}). Thanks.`, changed: false };
   }
 
@@ -233,10 +259,83 @@ function feedback(state: RoomState, verb: string, arg: string | undefined, msg: 
   return { reply: HELP, changed: false };
 }
 
-export function runCommand(state: RoomState, msg: Message, now: Date): CommandResult {
+function operations(state: RoomState, verb: string, arg: string | undefined, msg: Message, ctx: CommandContext): CommandResult {
+  if (!ctx.operationsEnabled) return { reply: `@chorus ${verb} is not enabled in this room.`, changed: false };
+  if (!ctx.signer) return { reply: "Receipts are not configured for this Chorus.", changed: false };
+  const now = ctx.now;
+
+  if (verb === "receipt") {
+    const r = issueReceipt(state, ctx.signer, snapshotBody(state, ctx.room, now), summarizeObligations(openObligations(state)));
+    return { reply: r.text, changed: false, receipt: r.record };
+  }
+  if (verb === "replay") {
+    const m = metrics(state);
+    const ratio = m.useful_ratio === null ? "n/a" : `${Math.round(m.useful_ratio * 100)}%`;
+    const r = issueReceipt(
+      state,
+      ctx.signer,
+      analysisBody(state, ctx.room, now),
+      `Post-room analysis: ${m.questions_resolved}/${m.questions_detected} questions answered, ` +
+        `${m.commitments_completed}/${m.commitments_created} commitments completed, ` +
+        `${m.conflicts_resolved}/${m.conflicts_detected} conflicts resolved, ${m.interventions_posted} interventions (${ratio} useful).`,
+    );
+    return { reply: r.text, changed: false, receipt: r.record };
+  }
+  if (verb === "stop") {
+    if (!state.session) return { reply: "No watch or facilitation session is running.", changed: false };
+    const r = endSession(state, ctx.room, now, ctx.signer, `${state.session.kind === "watch" ? "Watch" : "Facilitation"} stopped`);
+    return { reply: r.text, changed: true, receipt: r.record };
+  }
+  // watch / facilitate
+  if (state.session) {
+    return { reply: `A ${state.session.kind} session is already running. "@chorus stop" ends it.`, changed: false };
+  }
+  const minutes =
+    verb === "watch" ? Math.min(Math.max(Number(arg) || WATCH_DEFAULT_MINUTES, 1), WATCH_MAX_MINUTES) : undefined;
+  state.session = {
+    kind: verb as "watch" | "facilitate",
+    requestedBy: msg.authorId,
+    startedAt: now.toISOString(),
+    startedSeq: msg.seq,
+    until: minutes ? new Date(now.getTime() + minutes * 60_000).toISOString() : undefined,
+    previousMode: state.mode,
+  };
+  state.mode = "facilitate";
+  return {
+    reply:
+      verb === "watch"
+        ? `Watching this room for ${minutes} minutes in facilitate mode. A signed receipt follows when it ends.`
+        : `Facilitating this room until "@chorus stop". A signed receipt follows when it ends.`,
+    changed: true,
+  };
+}
+
+function metricsReply(state: RoomState): string {
+  const m = metrics(state);
+  const ratio = m.useful_ratio === null ? "n/a" : `${Math.round(m.useful_ratio * 100)}%`;
+  return [
+    "CHORUS METRICS",
+    "",
+    `Useful interventions: ${ratio} (${m.interventions_followed} followed, ${m.interventions_ignored} ignored, ${m.interventions_pending} pending)`,
+    `Interventions posted: ${m.interventions_posted} · suppressed: ${m.interventions_suppressed} · marked wrong: ${m.false_positive_feedback}`,
+    `Questions: ${m.questions_resolved}/${m.questions_detected} answered · Commitments: ${m.commitments_completed}/${m.commitments_created} completed`,
+    `Conflicts: ${m.conflicts_resolved}/${m.conflicts_detected} resolved · Duplicates: ${m.duplicates_confirmed}/${m.duplicates_detected} confirmed`,
+  ].join("\n");
+}
+
+export function runCommand(state: RoomState, msg: Message, ctx: CommandContext): CommandResult {
+  const now = ctx.now;
   const m = COMMAND.exec(msg.text);
   const [verb = "", arg] = (m?.[1] ?? "").trim().split(/\s+/);
   switch (verb.toLowerCase()) {
+    case "receipt":
+    case "replay":
+    case "watch":
+    case "facilitate":
+    case "stop":
+      return operations(state, verb.toLowerCase(), arg, msg, ctx);
+    case "metrics":
+      return { reply: metricsReply(state), changed: false };
     case "status":
       return { reply: status(state), changed: false };
     case "open":
@@ -259,7 +358,9 @@ export function runCommand(state: RoomState, msg: Message, now: Date): CommandRe
         return { reply: `Mode is ${state.mode}. Usage: @chorus mode observe|assist|facilitate`, changed: false };
       }
       state.mode = mode as Mode;
-      return { reply: `Mode set to ${mode}.`, changed: true };
+      const ended = state.session ? ` The running ${state.session.kind} session was cancelled.` : "";
+      state.session = null;
+      return { reply: `Mode set to ${mode}.${ended}`, changed: true };
     }
     case "resolved":
     case "reopen":

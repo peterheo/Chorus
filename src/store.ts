@@ -18,7 +18,7 @@ export interface MessageRow {
   text: string;
   timestamp: string;
   isFromChorus: boolean;
-  processingState: "applied" | "skipped" | "command" | "own";
+  processingState: "applied" | "skipped" | "command" | "own" | "extraction_failed";
 }
 
 export interface InterventionRow {
@@ -30,9 +30,41 @@ export interface InterventionRow {
   postedAt: string;
 }
 
+export interface ReceiptRow {
+  operation: string;
+  body: Record<string, unknown>;
+  sha256: string;
+  signature: string;
+  key_id: string;
+  messageId?: string;
+}
+
+/** One LLM request, raw response included (spec §48: "store raw LLM response separately"). */
+export interface LlmCallRow {
+  purpose: string;
+  model: string;
+  rawResponse: string;
+  parsedOk: boolean;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  latencyMs: number;
+  at: string;
+}
+
+export interface CommitPayload {
+  seq: number;
+  state: unknown;
+  message?: MessageRow;
+  interventions: InterventionRow[];
+  receipts?: ReceiptRow[];
+}
+
 export interface Store {
   load(roomId: string): StoredRoom | null;
-  commit(roomId: string, commit: { seq: number; state: unknown; message?: MessageRow; interventions: InterventionRow[] }): void;
+  commit(roomId: string, commit: CommitPayload): void;
+  logLlmCall?(roomId: string, call: LlmCallRow): void;
+  /** §65: delete audit rows older than the cutoff */
+  prune?(roomId: string, cutoffIso: string): void;
   close(): void;
 }
 
@@ -43,7 +75,7 @@ export class MemoryStore implements Store {
     const r = this.rooms.get(roomId);
     return r ? structuredClone(r) : null;
   }
-  commit(roomId: string, c: { seq: number; state: unknown }): void {
+  commit(roomId: string, c: CommitPayload): void {
     this.rooms.set(roomId, { lastProcessedSeq: c.seq, state: structuredClone(c.state) });
   }
   close(): void {}
@@ -74,6 +106,29 @@ export class SqliteStore implements Store {
         processing_state TEXT NOT NULL,
         PRIMARY KEY (room_id, external_message_id)
       );
+      CREATE TABLE IF NOT EXISTS receipts (
+        room_id TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        body_json TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        message_id TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (room_id, sha256)
+      );
+      CREATE TABLE IF NOT EXISTS llm_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        room_id TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        model TEXT NOT NULL,
+        raw_response TEXT NOT NULL,
+        parsed_ok INTEGER NOT NULL,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        latency_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS interventions (
         room_id TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
@@ -94,10 +149,7 @@ export class SqliteStore implements Store {
     return row ? { lastProcessedSeq: row.last_processed_seq, state: JSON.parse(row.state_json) } : null;
   }
 
-  commit(
-    roomId: string,
-    c: { seq: number; state: unknown; message?: MessageRow; interventions: InterventionRow[] },
-  ): void {
+  commit(roomId: string, c: CommitPayload): void {
     const now = new Date().toISOString();
     this.db.exec("BEGIN");
     try {
@@ -125,11 +177,33 @@ export class SqliteStore implements Store {
           )
           .run(roomId, i.key, i.type, i.text, i.solicited ? 1 : 0, i.outputMessageId, i.postedAt);
       }
+      for (const r of c.receipts ?? []) {
+        this.db
+          .prepare(
+            `INSERT INTO receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (room_id, sha256) DO UPDATE SET message_id = excluded.message_id`,
+          )
+          .run(roomId, r.sha256, r.operation, JSON.stringify(r.body), r.signature, r.key_id, r.messageId ?? null, now);
+      }
       this.db.exec("COMMIT");
     } catch (err) {
       this.db.exec("ROLLBACK");
       throw err;
     }
+  }
+
+  logLlmCall(roomId: string, call: LlmCallRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO llm_calls (room_id, purpose, model, raw_response, parsed_ok, input_tokens, output_tokens, latency_ms, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(roomId, call.purpose, call.model, call.rawResponse, call.parsedOk ? 1 : 0, call.inputTokens, call.outputTokens, call.latencyMs, call.at);
+  }
+
+  prune(roomId: string, cutoffIso: string): void {
+    this.db.prepare("DELETE FROM messages WHERE room_id = ? AND created_at < ?").run(roomId, cutoffIso);
+    this.db.prepare("DELETE FROM llm_calls WHERE room_id = ? AND created_at < ?").run(roomId, cutoffIso);
   }
 
   close(): void {
