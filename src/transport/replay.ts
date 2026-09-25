@@ -124,7 +124,7 @@ export class ReplayTransport implements RoomTransport {
     this.sentKeys.set(out.idempotencyKey, result);
     // Self-echo like SharedNet history: Chorus sees its own message come back.
     // Deferred so the pipeline's serial queue handles it after the current step.
-    queueMicrotask(() => void this.handler?.(m));
+    queueMicrotask(() => void this.handler?.(m)?.catch(() => {}));
     return result;
   }
 

@@ -142,6 +142,8 @@ export interface Dependency extends Provenance {
   blockingKind: "question" | "commitment" | "handoff" | "decision";
   status: "waiting" | "resolved" | "cancelled";
   resolvedAt?: string;
+  /** the blocker was already finished when the dependency was declared */
+  resolvedOnCreate?: boolean;
   notified?: boolean;
 }
 

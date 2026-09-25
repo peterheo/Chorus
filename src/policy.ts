@@ -29,6 +29,15 @@ export interface Decision {
   suppressed: Array<{ candidate: InterventionCandidate; reason: string }>;
 }
 
+/**
+ * The stable part of an idempotency key. Recurring nudges add a resurface
+ * counter ("unanswered_question:Q1:14"); feedback applies to all of them.
+ */
+export function keyFamily(key: string): string {
+  const parts = key.split(":");
+  return /^(unanswered_question|missing_acknowledgement|stale_commitment)$/.test(parts[0]!) ? parts.slice(0, 2).join(":") : key;
+}
+
 export class InterventionPolicy {
   constructor(private readonly config: () => ChorusConfig) {}
 
@@ -64,7 +73,7 @@ export class InterventionPolicy {
     const eligible: Array<{ c: InterventionCandidate; s: number }> = [];
     for (const c of candidates) {
       if (postedKeys.has(c.idempotencyKey)) continue; // hard dedup
-      if (state.suppressedKeys.has(c.idempotencyKey)) {
+      if (state.suppressedKeys.has(c.idempotencyKey) || state.suppressedKeys.has(keyFamily(c.idempotencyKey))) {
         suppressed.push({ candidate: c, reason: "suppressed by feedback" });
         continue;
       }

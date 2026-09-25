@@ -3,7 +3,7 @@
 // phrase into an absolute time relative to the message.
 
 const RELATIVE = /\b(?:in|within)\s+(\d+|an?|one|two|five|ten|fifteen|thirty)\s*(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b/i;
-const CLOCK = /\b(?:by|before|until|at)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s*(utc|z))?\b/i;
+const CLOCK = /\b(?:by|before|until|at)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s*(utc|z))?\b/gi;
 const WORDS: Record<string, number> = { a: 1, an: 1, one: 1, two: 2, five: 5, ten: 10, fifteen: 15, thirty: 30 };
 
 export interface ParsedDeadline {
@@ -33,16 +33,16 @@ export function parseDeadline(text: string | null | undefined, at: Date): Parsed
     return { deadline: new Date(at.getTime() + ms).toISOString(), rest: strip(text, rel.index, rel[0].length) };
   }
 
-  const clock = CLOCK.exec(text);
-  if (clock) {
+  for (const clock of text.matchAll(CLOCK)) {
     let hour = Number(clock[1]);
     const minute = clock[2] ? Number(clock[2]) : 0;
     const ampm = clock[3]?.toLowerCase();
-    // "at 3" alone is too ambiguous (could be "at 3 endpoints"): need :mm or am/pm.
-    if (!clock[2] && !ampm) return null;
+    // "at 3" alone is too ambiguous (could be "at 3 endpoints"): need :mm or
+    // am/pm. Skip it and keep looking for a later, clearer deadline.
+    if (!clock[2] && !ampm) continue;
     if (ampm === "pm" && hour < 12) hour += 12;
     if (ampm === "am" && hour === 12) hour = 0;
-    if (hour > 23 || minute > 59) return null;
+    if (hour > 23 || minute > 59) continue;
     const d = new Date(at);
     d.setUTCHours(hour, minute, 0, 0);
     if (d.getTime() <= at.getTime()) d.setUTCDate(d.getUTCDate() + 1);

@@ -83,6 +83,17 @@ export class MemoryStore implements Store {
 
 export class SqliteStore implements Store {
   private readonly db: DatabaseSync;
+  private readonly statements = new Map<string, ReturnType<DatabaseSync["prepare"]>>();
+
+  /** Prepared statements are compiled once and reused. */
+  private stmt(sql: string): ReturnType<DatabaseSync["prepare"]> {
+    let s = this.statements.get(sql);
+    if (!s) {
+      s = this.db.prepare(sql);
+      this.statements.set(sql, s);
+    }
+    return s;
+  }
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
@@ -143,8 +154,8 @@ export class SqliteStore implements Store {
   }
 
   load(roomId: string): StoredRoom | null {
-    const row = this.db
-      .prepare("SELECT last_processed_seq, state_json FROM rooms WHERE room_id = ?")
+    const row = this
+      .stmt("SELECT last_processed_seq, state_json FROM rooms WHERE room_id = ?")
       .get(roomId) as { last_processed_seq: number; state_json: string } | undefined;
     return row ? { lastProcessedSeq: row.last_processed_seq, state: JSON.parse(row.state_json) } : null;
   }
@@ -153,8 +164,8 @@ export class SqliteStore implements Store {
     const now = new Date().toISOString();
     this.db.exec("BEGIN");
     try {
-      this.db
-        .prepare(
+      this
+        .stmt(
           `INSERT INTO rooms (room_id, last_processed_seq, state_json, updated_at) VALUES (?, ?, ?, ?)
            ON CONFLICT (room_id) DO UPDATE SET last_processed_seq = excluded.last_processed_seq,
              state_json = excluded.state_json, updated_at = excluded.updated_at`,
@@ -162,24 +173,24 @@ export class SqliteStore implements Store {
         .run(roomId, c.seq, JSON.stringify(c.state), now);
       if (c.message) {
         const m = c.message;
-        this.db
-          .prepare(
+        this
+          .stmt(
             `INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (room_id, external_message_id) DO UPDATE SET processing_state = excluded.processing_state`,
           )
           .run(roomId, m.externalId, m.seq, m.authorId, m.text, m.timestamp, m.isFromChorus ? 1 : 0, m.processingState);
       }
       for (const i of c.interventions) {
-        this.db
-          .prepare(
+        this
+          .stmt(
             `INSERT INTO interventions VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (room_id, idempotency_key) DO UPDATE SET output_message_id = excluded.output_message_id`,
           )
           .run(roomId, i.key, i.type, i.text, i.solicited ? 1 : 0, i.outputMessageId, i.postedAt);
       }
       for (const r of c.receipts ?? []) {
-        this.db
-          .prepare(
+        this
+          .stmt(
             `INSERT INTO receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (room_id, sha256) DO UPDATE SET message_id = excluded.message_id`,
           )
@@ -193,8 +204,8 @@ export class SqliteStore implements Store {
   }
 
   logLlmCall(roomId: string, call: LlmCallRow): void {
-    this.db
-      .prepare(
+    this
+      .stmt(
         `INSERT INTO llm_calls (room_id, purpose, model, raw_response, parsed_ok, input_tokens, output_tokens, latency_ms, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
@@ -202,8 +213,8 @@ export class SqliteStore implements Store {
   }
 
   prune(roomId: string, cutoffIso: string): void {
-    this.db.prepare("DELETE FROM messages WHERE room_id = ? AND created_at < ?").run(roomId, cutoffIso);
-    this.db.prepare("DELETE FROM llm_calls WHERE room_id = ? AND created_at < ?").run(roomId, cutoffIso);
+    this.stmt("DELETE FROM messages WHERE room_id = ? AND created_at < ?").run(roomId, cutoffIso);
+    this.stmt("DELETE FROM llm_calls WHERE room_id = ? AND created_at < ?").run(roomId, cutoffIso);
   }
 
   close(): void {

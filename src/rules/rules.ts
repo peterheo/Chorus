@@ -324,8 +324,14 @@ export function resolvedDependencies(state: RoomState, _ctx: RuleContext): Inter
             : "";
     const resolvedMsg = p.derivedFromMessageIds.at(-1);
     const by = resolvedMsg ? state.message(resolvedMsg) : undefined;
-    // Resolved by the very message that declared it: the blocker was already done.
-    const alreadyDone = p.derivedFromMessageIds.length === 1;
+    const alreadyDone = p.resolvedOnCreate === true;
+    const blockerStatus = blocker && "status" in blocker ? blocker.status : undefined;
+    const ended =
+      blockerStatus === "expired"
+        ? "expired without being completed (deadline passed)"
+        : blockerStatus === "cancelled" || blockerStatus === "declined" || blockerStatus === "withdrawn"
+          ? `was ${blockerStatus}`
+          : "finished";
     out.push({
       type: "dependency_resolved",
       severity: "medium",
@@ -339,7 +345,7 @@ export function resolvedDependencies(state: RoomState, _ctx: RuleContext): Inter
       idempotencyKey: `dependency_resolved:${p.id}`,
       text: alreadyDone
         ? `${state.agentName(p.blockedAgentId)} — ${p.blockingObjectId} ${what} is already done; nothing to wait for.`
-        : `${state.agentName(p.blockedAgentId)} — ${p.id} is resolved: ${p.blockingObjectId} ${what} finished${by ? ` at #${by.seq}` : ""}.`,
+        : `${state.agentName(p.blockedAgentId)} — ${p.id} is resolved: ${p.blockingObjectId} ${what} ${ended}${by && ended === "finished" ? ` at #${by.seq}` : ""}.`,
       createdIndex: state.roomIndex,
     });
   }

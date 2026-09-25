@@ -15,6 +15,7 @@ import {
   summarizeObligations,
 } from "./operations.ts";
 import type { ReceiptSigner } from "./receipts.ts";
+import { keyFamily } from "./policy.ts";
 import type { SignedReceiptRecord } from "./state/room.ts";
 import { completionReport, describeClaim, formatCompletion } from "./rules/rules.ts";
 import type { RoomState } from "./state/room.ts";
@@ -171,10 +172,19 @@ function feedback(state: RoomState, verb: string, arg: string | undefined, msg: 
       x.status = "dismissed";
       return { reply: `${id} dismissed.`, changed: true };
     }
-    const target = lastForMe ?? state.posted.at(-1);
-    if (!target) return { reply: "No intervention to give feedback on.", changed: false };
+    // With an ID, rate the latest intervention about that object; otherwise
+    // the latest one that involved the author.
+    const target = id
+      ? [...state.posted].reverse().find((p) => !p.solicited && p.candidate.relatedObjectIds.includes(id))
+      : (lastForMe ?? state.posted.at(-1));
+    if (!target) return { reply: id ? `No intervention about ${id}.` : "No intervention to give feedback on.", changed: false };
     if (!target.candidate.involvedAgentIds.includes(who)) return deny("only agents involved in an intervention may rate it");
-    if (verb === "wrong") state.suppressedKeys.add(target.candidate.idempotencyKey);
+    if (verb === "wrong") {
+      // Suppress the whole family (every resurfacing) and anything merged into it.
+      for (const k of [target.candidate.idempotencyKey, ...(target.candidate.absorbedKeys ?? [])]) {
+        state.suppressedKeys.add(keyFamily(k));
+      }
+    }
     target.feedback = verb as "correct" | "wrong";
     return { reply: `Recorded: ${verb} (${target.candidate.type}). Thanks.`, changed: false };
   }
@@ -406,10 +416,15 @@ export function runCommand(state: RoomState, msg: Message, ctx: CommandContext):
       if (mode !== "observe" && mode !== "assist" && mode !== "facilitate") {
         return { reply: `Mode is ${state.mode}. Usage: @chorus mode observe|assist|facilitate`, changed: false };
       }
-      state.mode = mode as Mode;
-      const ended = state.session ? ` The running ${state.session.kind} session was cancelled.` : "";
+      if (state.session && ctx.signer) {
+        // Ending a paid session always produces its receipt (§54).
+        const r = endSession(state, ctx.room, now, ctx.signer, `${state.session.kind === "watch" ? "Watch" : "Facilitation"} ended by a mode change`);
+        state.mode = mode as Mode;
+        return { reply: `Mode set to ${mode}.\n\n${r.text}`, changed: true, receipt: r.record };
+      }
       state.session = null;
-      return { reply: `Mode set to ${mode}.${ended}`, changed: true };
+      state.mode = mode as Mode;
+      return { reply: `Mode set to ${mode}.`, changed: true };
     }
     case "resolved":
     case "reopen":

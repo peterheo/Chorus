@@ -25,7 +25,7 @@ import {
   unansweredQuestions,
   type RuleContext,
 } from "./rules/rules.ts";
-import { applyDeadlines, applyEvents } from "./state/engine.ts";
+import { applyDeadlines, applyEvents, settle } from "./state/engine.ts";
 import { RoomState } from "./state/room.ts";
 import type { InterventionCandidate, Message } from "./state/types.ts";
 import type { LlmCall } from "./extract/claude.ts";
@@ -64,12 +64,17 @@ export interface ChorusOptions {
   election?: boolean;
 }
 
+/** Without transport presence, a silent peer counts as gone after this long. */
+const PEER_STALE_MS = 30 * 60_000;
+
 /** A Chorus instance announcing itself for §78 election. */
 const PRESENCE = /^\[chorus\] online as (\S+)/;
 
 /** "I'm the verifier." / "This is Verifier." / "Hi, I am ResearchA" — the whole message. */
+// No /i flag: the second branch must really start with a capital letter, so
+// "I'm stuck." or "This is wrong." is never taken for a name.
 const SELF_ID =
-  /^(?:(?:hi|hello|hey)[,!]?\s+)?(?:i'm|i am|this is)\s+(?:the\s+([a-z][\w-]{1,30})|([A-Z][\w-]{1,30}))(?:\s+agent)?\s*[.!]?$/i;
+  /^(?:(?:[Hh]i|[Hh]ello|[Hh]ey)[,!]?\s+)?(?:I'm|i'm|I am|i am|[Tt]his is)\s+(?:[Tt]he\s+([a-z][\w-]{1,30})|([A-Z][\w-]{1,30}))(?:\s+agent)?\s*[.!]?$/;
 const NOT_A_NAME = new Set(
   "done back here ready sure not on in out busy free online working checking looking going sorry fine ok okay available new late".split(" "),
 );
@@ -108,7 +113,7 @@ export class ChorusRoom {
   /** a welcome-back brief for the author of the message being processed (§78) */
   private pendingBrief: InterventionCandidate | null = null;
   /** messages received but not yet processed (§11.2) */
-  private inbox: Array<{ ext: ExternalRoomMessage; done: () => void }> = [];
+  private inbox: Array<{ ext: ExternalRoomMessage; done: () => void; fail: (err: unknown) => void }> = [];
   private readonly listeners = new Set<(e: RoomEvent) => void>();
   /** transitions already published to subscribers */
   private published = 0;
@@ -145,15 +150,16 @@ export class ChorusRoom {
     return primary;
   }
 
-  /** §65: prune message text past the retention period, at most hourly. */
-  private prune(): void {
+  /** §65: prune message text past the retention period, at most hourly. Returns how many were pruned. */
+  private prune(): number {
     const now = this.opts.clock.now();
-    if (now.getTime() - this.lastPruneAt < 3_600_000) return;
+    if (now.getTime() - this.lastPruneAt < 3_600_000) return 0;
     this.lastPruneAt = now.getTime();
     const cutoff = new Date(now.getTime() - this.opts.config.retention.days * 86_400_000).toISOString();
     const n = this._state.prune(cutoff);
     this.store.prune?.(this.roomKey, cutoff);
     if (n) this.emit({ kind: "state", detail: `retention: pruned text of ${n} messages older than ${cutoff}` });
+    return n;
   }
 
   get state(): RoomState {
@@ -166,11 +172,13 @@ export class ChorusRoom {
     return () => this.listeners.delete(listener);
   }
 
-  /** Events after `lastId` (exclusive), for SSE Last-Event-ID resume. */
+  /** Committed events after `lastId` (exclusive), for SSE Last-Event-ID resume. */
   eventsSince(lastId: number): RoomEvent[] {
     const out: RoomEvent[] = [];
     const t = this._state.transitions;
-    for (let i = Math.max(0, lastId + 1); i < t.length; i++) {
+    // Only up to what has been published: later transitions are not durable
+    // yet and will reach subscribers through commit().
+    for (let i = Math.max(0, lastId + 1); i < this.published; i++) {
       const e = transitionEvent(this._state, t[i]!, i);
       if (e) out.push(e);
     }
@@ -188,6 +196,23 @@ export class ChorusRoom {
     });
     this.queue = run;
     return run;
+  }
+
+  /**
+   * Run one unit of work (a message or a tick) so that an unexpected error
+   * leaves no trace: state rolls back to exactly what it was before, and
+   * nothing uncommitted is kept. The error is rethrown.
+   */
+  private async atomically<T>(fn: () => Promise<T>): Promise<T> {
+    const before = JSON.stringify(this._state.toJSON());
+    try {
+      return await fn();
+    } catch (err) {
+      this._state = RoomState.fromJSON(JSON.parse(before));
+      this.pending = [];
+      this.pendingReceipts = [];
+      throw err;
+    }
   }
 
   /** Resolves once all queued work (including self-echoes) has been handled. */
@@ -216,10 +241,11 @@ export class ChorusRoom {
     await this.refreshRoster();
     // The handler resolves only once the message is processed, so the
     // transport never advances its cursor past unprocessed messages.
+    // If processing fails, the promise rejects and the transport redelivers.
     t.onMessage(
       (m) =>
-        new Promise<void>((done) => {
-          this.inbox.push({ ext: m, done });
+        new Promise<void>((done, fail) => {
+          this.inbox.push({ ext: m, done, fail });
           void this.enqueue(() => this.drain());
         }),
     );
@@ -257,9 +283,13 @@ export class ChorusRoom {
     if (!this.opts.election) return true;
     const s = this._state;
     const self = s.chorusAgentId!;
+    const now = this.opts.clock.now().getTime();
     const online = [...s.chorusPeers.keys()].filter((id) => {
-      const p = s.agents.get(id)?.presence;
-      return p === undefined || p === "online"; // unknown presence counts as online
+      const a = s.agents.get(id);
+      if (a?.presence !== undefined) return a.presence === "online";
+      // Unknown presence (the transport does not report it): assume online
+      // only while the peer has been seen recently.
+      return a !== undefined && now - Date.parse(a.lastSeenAt) < PEER_STALE_MS;
     });
     return [self, ...online].sort()[0] === self;
   }
@@ -271,8 +301,13 @@ export class ChorusRoom {
   }
 
   tick(): Promise<void> {
-    return this.enqueue(async () => {
+    return this.enqueue(() => this.atomically(() => this.runTick()));
+  }
+
+  private async runTick(): Promise<void> {
+    {
       const now = this.opts.clock.now();
+      const before = { transitions: this._state.transitions.length, posted: this._state.posted.length };
       const expired = applyDeadlines(this._state, now);
       for (const id of expired) this.emit({ kind: "state", detail: `${id} → ${this._state.object(id)?.status} (deadline)` });
       if (this.opts.election && now.getTime() - this.lastRosterAt >= 60_000) await this.refreshRoster();
@@ -281,10 +316,17 @@ export class ChorusRoom {
         this.pendingReceipts.push(sessionEnd.record);
         await this.post(this.reply(`session-end:${sessionEnd.record.sha256}`, sessionEnd.text, [this._state.session?.requestedBy ?? ""]), true);
       }
-      this.prune();
+      const pruned = this.prune();
       await this.evaluate("tick");
-      if (this.pending.length || expired.length || sessionEnd) this.commit();
-    });
+      const s = this._state;
+      const changed =
+        s.transitions.length !== before.transitions ||
+        s.posted.length !== before.posted ||
+        this.pending.length > 0 ||
+        pruned > 0 ||
+        sessionEnd !== null;
+      if (changed) this.commit();
+    }
   }
 
   /** A solicited reply (command answers, receipts): exempt from rate limits. */
@@ -322,7 +364,7 @@ export class ChorusRoom {
         (a.displayName.toLowerCase() === alias.toLowerCase() || a.aliases.some((x) => x.toLowerCase() === alias.toLowerCase())),
     );
     const agent = s.agents.get(msg.authorId)!;
-    if (taken || agent.aliases.includes(alias)) return;
+    if (taken || agent.aliases.includes(alias) || agent.displayName.toLowerCase() === alias.toLowerCase()) return;
     agent.aliases.push(alias);
     // Guest seats have no display name; the first self-introduction becomes it.
     if (agent.displayName === agent.id) agent.displayName = alias;
@@ -401,14 +443,16 @@ export class ChorusRoom {
     if (batch.length === 0) return;
     const cfg = this.opts.config.extraction;
     const pre = new Map<string, ExtractedEvent[]>();
-    if (batch.length > cfg.batchWhenBacklogOver) {
+    if (batch.length > cfg.batchWhenBacklogOver && this.opts.extractor.extractBatch) {
       const c = this._state.counters;
       c.set("extraction_backlog_max", Math.max(c.get("extraction_backlog_max") ?? 0, batch.length));
-      const extractor = this.chooseExtractor();
-      if (extractor.extractBatch) {
-        const todo = batch.map((b) => b.ext).filter((e) => this.extractable(e));
-        for (let i = 0; i < todo.length; i += cfg.maxBatch) {
-          const chunk = todo.slice(i, i + cfg.maxBatch);
+      const todo = batch.map((b) => b.ext).filter((e) => this.extractable(e));
+      for (let i = 0; i < todo.length; i += cfg.maxBatch) {
+        const chunk = todo.slice(i, i + cfg.maxBatch);
+        // Each batch call counts against the §63 budget like a single call.
+        const extractor = this.chooseExtractor();
+        if (!extractor.extractBatch) continue; // over budget: per-message fallback below
+        {
           try {
             const results = await extractor.extractBatch(
               chunk.map((e) => ({ text: e.text, ctx: this.context(this.previewMessage(e)) })),
@@ -423,11 +467,17 @@ export class ChorusRoom {
         }
       }
     }
-    for (const b of batch) {
+    for (let i = 0; i < batch.length; i++) {
+      const b = batch[i]!;
       try {
-        await this.ingest(b.ext, pre.get(b.ext.id));
-      } finally {
+        await this.atomically(() => this.ingest(b.ext, pre.get(b.ext.id)));
         b.done();
+      } catch (err) {
+        // Nothing from this message was kept. Reject it and everything after
+        // it, in order, so the transport redelivers them all.
+        this.emit({ kind: "error", seq: b.ext.seq, detail: `processing failed, will be redelivered: ${(err as Error).message}` });
+        for (const rest of batch.slice(i)) rest.fail(err);
+        return;
       }
     }
   }
@@ -549,7 +599,13 @@ export class ChorusRoom {
         r.receipt.messageId = messageId;
         this.pendingReceipts.push(r.receipt);
       }
-      if (r.changed) await this.evaluate("state_change");
+      if (r.changed) {
+        // e.g. "@chorus resolved C3" releases agents waiting on C3.
+        for (const id of settle(s, msg, this.opts.clock.now())) {
+          this.emit({ kind: "state", seq: msg.seq, detail: `${id} → ${s.object(id)?.status}` });
+        }
+        await this.evaluate("state_change");
+      }
       return "command";
     }
 
@@ -650,6 +706,15 @@ export class ChorusRoom {
       solicited,
       messageId: undefined as string | undefined,
     };
+    const silent = (s.mode === "observe" && !solicited) || (!always && !this.isSpeaker());
+    // Deterministic key (§35), fixed before anything can change posted.length.
+    const key = interventionKey(this.roomKey, s.chorusAgentId ?? "", `${c.idempotencyKey}#${s.posted.length + 1}`);
+    let result: { id: string; seq: number } | undefined;
+    if (!silent) {
+      // Send first: a failed send throws before anything is recorded, so the
+      // intervention is retried rather than counted as delivered.
+      result = await this.opts.transport.sendMessage({ text: c.text, replyToId: c.replyToMessageId, idempotencyKey: key });
+    }
     s.posted.push(record);
     // Mark every surfaced object, including ones absorbed by merging (§51).
     for (const id of c.relatedObjectIds) {
@@ -663,16 +728,14 @@ export class ChorusRoom {
         if (p) p.notified = true;
       }
     }
-    if (s.mode === "observe" && !solicited) return undefined;
-    // A standby instance records what it would have said (so it does not
-    // repeat it after taking over) but stays silent (§78).
-    if (!always && !this.isSpeaker()) {
-      this.emit({ kind: "suppressed", detail: `${c.type}: standby (another Chorus instance is speaking)` });
+    // Observe mode and standby instances (§78) record what they would have
+    // said, so it is not repeated later, but stay silent.
+    if (!result) {
+      if (!always && !this.isSpeaker()) {
+        this.emit({ kind: "suppressed", detail: `${c.type}: standby (another Chorus instance is speaking)` });
+      }
       return undefined;
     }
-
-    const key = interventionKey(this.roomKey, s.chorusAgentId ?? "", `${c.idempotencyKey}#${s.posted.length}`);
-    const result = await this.opts.transport.sendMessage({ text: c.text, replyToId: c.replyToMessageId, idempotencyKey: key });
     record.messageId = result.id;
     this.pending.push({
       key,

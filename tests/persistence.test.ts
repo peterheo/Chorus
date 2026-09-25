@@ -100,8 +100,10 @@ describe("persistence", () => {
     const m1 = await transport.deliver("A", "I'll check the pricing.");
     await first.idle();
     crashed = true; // the message that triggers the duplicate warning never commits
-    const m2 = await transport.deliver("B", "I'll investigate the pricing.");
+    // The failed commit rejects the delivery, so a real transport would redeliver.
+    await assert.rejects(transport.deliver("B", "I'll investigate the pricing."), /simulated crash/);
     await first.idle();
+    const m2 = transport.log.find((m) => m.text === "I'll investigate the pricing.")!;
     assert.equal(transport.sent.length, 1);
 
     // Restart from the last good commit and redeliver what was not committed.

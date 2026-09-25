@@ -168,7 +168,9 @@ function handoffFor(state: RoomState, msg: Message, action?: string | null): Han
       .sort((a, b) => b.s - a.s)[0]!;
     if (best.s >= 0.5) return best.h;
   }
-  return mine.length === 1 ? mine[0] : undefined;
+  // "The only pending one" is a guess, so only when the message is not an
+  // explicit reply to something else.
+  return mine.length === 1 && !msg.replyToId ? mine[0] : undefined;
 }
 
 /** §16.3: accepting a handoff creates the recipient's commitment; that commitment is then the live object. */
@@ -211,6 +213,15 @@ export function applyDeadlines(state: RoomState, now: Date, msg?: Message): stri
   }
   if (changed.length) changed.push(...syncHandoffs(state, msg, now), ...resolveDependencies(state, msg, now));
   return changed;
+}
+
+/**
+ * Follow-on transitions after any state change, including ones made by
+ * commands (e.g. "@chorus resolved C3"): handoffs mirror their commitments
+ * and dependencies on finished objects resolve.
+ */
+export function settle(state: RoomState, msg: Message | undefined, now: Date): string[] {
+  return [...syncHandoffs(state, msg, now), ...resolveDependencies(state, msg, now)];
 }
 
 /** Accepted handoffs mirror their commitment's terminal state (§16.3). */
@@ -259,6 +270,7 @@ function resolveDependencies(state: RoomState, msg: Message | undefined, now: Da
   for (const p of state.waitingDependencies()) {
     if (!blockerDone(state, p)) continue;
     p.resolvedAt = now.toISOString();
+    if (msg && p.derivedFromMessageIds[0] === msg.id) p.resolvedOnCreate = true;
     if (msg && !p.derivedFromMessageIds.includes(msg.id)) p.derivedFromMessageIds.push(msg.id);
     transition(state, "dependency", p, "resolved", msg, now);
     changed.push(p.id);
@@ -426,12 +438,14 @@ export async function applyEvents(
 ): Promise<ApplyResult> {
   const result: ApplyResult = { created: [], changed: [], newConflicts: [] };
   const now = ctx.now;
-  const isCorrection = events.some((e) => e.type === "correction");
-  const answerMarker = events.some((e) => e.type === "answer");
+  // §40 bands first: an inadmissible correction or answer marker must not
+  // retract claims or close questions either.
+  const admitted = events.filter((e) => admissible(e, msg, events, ctx));
+  const isCorrection = admitted.some((e) => e.type === "correction");
+  const answerMarker = admitted.some((e) => e.type === "answer");
   let answeredSomething = false;
 
-  for (const e of events) {
-    if (!admissible(e, msg, events, ctx)) continue;
+  for (const e of admitted) {
     const p = e.payload;
 
     switch (e.type) {

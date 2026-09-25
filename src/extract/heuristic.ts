@@ -39,6 +39,12 @@ const CONDITION_PATTERNS = [
   /\s+(when [^,.;]+)$/i,
 ];
 
+/** Does `text` mention `name` as a whole word? Names are escaped: "C++Bot" is literal. */
+export function mentions(text: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^\\w])${escaped}(?![\\w])`, "i").test(text);
+}
+
 function sentences(text: string): string[] {
   return text
     .split(/(?<=[.!?])\s+|\n+/)
@@ -169,7 +175,7 @@ export class HeuristicExtractor implements Extractor {
           event("dependency", { text }, {
             confidence: 0.9,
             references: [...s.matchAll(SHORT_ID)].map((m) => m[1]!),
-            target_agents: roster.filter((r) => new RegExp(`\\b${r}\\b`, "i").test(text)),
+            target_agents: roster.filter((r) => mentions(text, r)),
           }),
         );
         continue;

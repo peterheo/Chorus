@@ -129,11 +129,12 @@ export class SharedNetTransport implements RoomTransport {
           "GET",
           `/rooms/${this.cfg.roomId}/wait?after=${this.cursor}&limit=100&timeout=25`,
         );
-        for (const item of page.items) {
-          // Advance the cursor only after the handler has accepted the message.
-          await this.handler?.(this.toExternal(item));
-          this.cursor = Math.max(this.cursor, item.sequence);
-        }
+        // Hand the whole page over at once, so a backlog can be batch-extracted
+        // (§11.2); the room still processes it in sequence order. Advance the
+        // cursor only once every message in the page has been processed. If
+        // one fails, the page is fetched again; processed ones are deduped.
+        await Promise.all(page.items.map((item) => this.handler?.(this.toExternal(item))));
+        for (const item of page.items) this.cursor = Math.max(this.cursor, item.sequence);
       } catch (err) {
         if (!this.running) return;
         this.cfg.log?.(`SharedNet wait failed: ${(err as Error).message}; retrying in 5s`);
