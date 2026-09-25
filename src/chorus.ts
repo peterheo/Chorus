@@ -16,6 +16,7 @@ import {
   conflicts,
   duplicateWork,
   decisionReminders,
+  dependencyDeadlocks,
   missingAcknowledgements,
   repeatedQuestions,
   resolvedDependencies,
@@ -345,6 +346,7 @@ export class ChorusRoom {
             ...repeatedQuestions(s, ctx),
             ...decisionReminders(s, ctx),
             ...resolvedDependencies(s, ctx),
+            ...dependencyDeadlocks(s, ctx),
           ]
         : completion(s, ctx)),
     ];
@@ -366,16 +368,17 @@ export class ChorusRoom {
       messageId: undefined as string | undefined,
     };
     s.posted.push(record);
-    if (c.type === "unanswered_question" || c.type === "stale_commitment" || c.type === "missing_acknowledgement") {
-      for (const id of c.relatedObjectIds) {
-        const o = s.questions.get(id) ?? s.commitments.get(id) ?? s.handoffs.get(id);
-        if (o) o.lastSurfacedIndex = s.roomIndex;
-      }
+    // Mark every surfaced object, including ones absorbed by merging (§51).
+    for (const id of c.relatedObjectIds) {
+      const o = s.questions.get(id) ?? s.commitments.get(id) ?? s.handoffs.get(id);
+      if (o && c.type !== "command_reply") o.lastSurfacedIndex = s.roomIndex;
     }
     if (c.type === "completion_check") s.completionAnnounced = true;
-    if (c.type === "dependency_resolved") {
-      const p = s.dependencies.get(c.relatedObjectIds[0]!);
-      if (p) p.notified = true;
+    for (const key of [c.idempotencyKey, ...(c.absorbedKeys ?? [])]) {
+      if (key.startsWith("dependency_resolved:")) {
+        const p = s.dependencies.get(key.split(":")[1]!);
+        if (p) p.notified = true;
+      }
     }
     if (s.mode === "observe" && !solicited) return;
 

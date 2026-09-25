@@ -158,6 +158,7 @@ export type InterventionType =
   | "repeated_question"
   | "decision_reminder"
   | "dependency_resolved"
+  | "dependency_deadlock"
   | "command_reply";
 
 export interface InterventionCandidate {
@@ -171,6 +172,8 @@ export interface InterventionCandidate {
   expectedValue: number;
   blockedAgents: number;
   idempotencyKey: string;
+  /** keys of lower-priority candidates merged into this one (§51) */
+  absorbedKeys?: string[];
   text: string;
   replyToMessageId?: string;
   createdIndex: number;

@@ -82,6 +82,28 @@ export async function duplicateWork(state: RoomState, ctx: RuleContext): Promise
   return out;
 }
 
+/** Agents waiting on an object through a dependency (§51: "…and Bob is blocked on it"). */
+export function blockedOn(state: RoomState, objectId: string): Array<{ agentId: string; depId: string }> {
+  return state
+    .waitingDependencies()
+    .filter(
+      (p) =>
+        p.blockingObjectId === objectId || state.handoffs.get(p.blockingObjectId)?.resultingCommitmentId === objectId,
+    )
+    .map((p) => ({ agentId: p.blockedAgentId, depId: p.id }));
+}
+
+function blockedLine(state: RoomState, blocked: Array<{ agentId: string; depId: string }>): string[] {
+  if (blocked.length === 0) return [];
+  const who = blocked.map((b) => `${state.agentName(b.agentId)} (${b.depId})`).join(", ");
+  return [`Blocked on it: ${who}.`];
+}
+
+/** Two or more blocked agents make a surfaced item high severity (§26 bypass). */
+function severityFor(blocked: number): "medium" | "high" {
+  return blocked >= 2 ? "high" : "medium";
+}
+
 /** §19 — (message count OR wall clock) AND a minimum age, with a resurface cooldown. */
 export function unansweredQuestions(state: RoomState, ctx: RuleContext): InterventionCandidate[] {
   const u = ctx.config.unanswered;
@@ -98,16 +120,17 @@ export function unansweredQuestions(state: RoomState, ctx: RuleContext): Interve
     if (q.lastSurfacedIndex !== undefined && state.roomIndex - q.lastSurfacedIndex < u.resurfaceCooldownMessages) {
       continue;
     }
+    const blocked = blockedOn(state, q.id);
     out.push({
       type: "unanswered_question",
-      severity: "medium",
-      involvedAgentIds: [q.askerId, ...q.targetIds],
-      relatedObjectIds: [q.id],
+      severity: severityFor(blocked.length),
+      involvedAgentIds: [q.askerId, ...q.targetIds, ...blocked.map((b) => b.agentId)],
+      relatedObjectIds: [q.id, ...blocked.map((b) => b.depId)],
       evidenceMessageIds: [q.sourceMessageId],
       confidence: q.extractorConfidence,
       urgency: Math.min(1, 0.6 + subsequent / 60),
       expectedValue: 0.8,
-      blockedAgents: 0,
+      blockedAgents: blocked.length,
       idempotencyKey: `unanswered_question:${q.id}:${q.lastSurfacedIndex ?? 0}`,
       text: [
         "Still unanswered:",
@@ -115,6 +138,7 @@ export function unansweredQuestions(state: RoomState, ctx: RuleContext): Interve
         `${q.id} — ${q.text}`,
         "",
         `Asked by ${state.agentName(q.askerId)} at ${state.cite(q.sourceMessageId)}.`,
+        ...blockedLine(state, blocked),
       ].join("\n"),
       replyToMessageId: q.sourceMessageId,
       createdIndex: state.roomIndex,
@@ -138,16 +162,18 @@ export function missingAcknowledgements(state: RoomState, ctx: RuleContext): Int
     ).length;
     if (recipientMessages < cfg.minTargetMessages) continue;
     if (h.lastSurfacedIndex !== undefined && state.roomIndex - since < cfg.resurfaceCooldownMessages) continue;
+    const blocked = blockedOn(state, h.id).filter((b) => b.agentId !== h.fromAgentId);
     out.push({
       type: "missing_acknowledgement",
-      severity: "medium",
-      involvedAgentIds: [h.toAgentId, h.fromAgentId],
-      relatedObjectIds: [h.id],
+      // The sender is waiting on it too, so count them as blocked.
+      severity: severityFor(blocked.length + 1),
+      involvedAgentIds: [h.toAgentId, h.fromAgentId, ...blocked.map((b) => b.agentId)],
+      relatedObjectIds: [h.id, ...blocked.map((b) => b.depId)],
       evidenceMessageIds: [h.sourceMessageId],
       confidence: h.extractorConfidence,
       urgency: Math.min(1, 0.6 + recipientMessages / 20),
       expectedValue: 0.8,
-      blockedAgents: 1,
+      blockedAgents: blocked.length + 1,
       idempotencyKey: `missing_acknowledgement:${h.id}:${h.lastSurfacedIndex ?? 0}`,
       text: [
         `${state.agentName(h.toAgentId)}: handoff ${h.id} from ${state.agentName(h.fromAgentId)} has not been acknowledged.`,
@@ -155,6 +181,7 @@ export function missingAcknowledgements(state: RoomState, ctx: RuleContext): Int
         `${h.id} — ${h.action} (${state.cite(h.sourceMessageId)})`,
         "",
         `Reply to accept or decline. You have posted ${recipientMessages} messages since.`,
+        ...blockedLine(state, blocked),
       ].join("\n"),
       replyToMessageId: h.sourceMessageId,
       createdIndex: state.roomIndex,
@@ -180,9 +207,8 @@ export function staleCommitments(state: RoomState, ctx: RuleContext): Interventi
     const ownerSince = state.messages.filter(
       (m) => m.authorId === c.ownerId && !m.isFromChorus && m.roomIndex > c.updatedIndex,
     ).length;
-    const dependents = state.waitingDependencies().filter(
-      (p) => p.blockingObjectId === c.id || state.handoffs.get(p.blockingObjectId)?.resultingCommitmentId === c.id,
-    ).length;
+    const blocked = blockedOn(state, c.id);
+    const dependents = blocked.length;
     const score =
       0.35 * Math.min(ageSeconds / cfg.ageRefSeconds, 1) +
       0.25 * Math.min(roomSince / cfg.roomRefMessages, 1) +
@@ -192,9 +218,9 @@ export function staleCommitments(state: RoomState, ctx: RuleContext): Interventi
     const minutes = Math.round(ageSeconds / 60);
     out.push({
       type: "stale_commitment",
-      severity: "medium",
-      involvedAgentIds: [c.ownerId],
-      relatedObjectIds: [c.id],
+      severity: severityFor(dependents),
+      involvedAgentIds: [c.ownerId, ...blocked.map((b) => b.agentId)],
+      relatedObjectIds: [c.id, ...blocked.map((b) => b.depId)],
       evidenceMessageIds: [c.sourceMessageId],
       confidence: Math.min(0.95, score + 0.1),
       urgency: score,
@@ -207,6 +233,7 @@ export function staleCommitments(state: RoomState, ctx: RuleContext): Interventi
         `${state.agentName(c.ownerId)} → ${c.action} (${state.cite(c.sourceMessageId)})`,
         "",
         `${state.agentName(c.ownerId)}, is this still in progress? "@chorus resolved ${c.id}" if it's done.`,
+        ...blockedLine(state, blocked),
       ].join("\n"),
       replyToMessageId: c.sourceMessageId,
       createdIndex: state.roomIndex,
@@ -316,6 +343,73 @@ export function resolvedDependencies(state: RoomState, _ctx: RuleContext): Inter
       createdIndex: state.roomIndex,
     });
   }
+  return out;
+}
+
+/** Who has to act for a blocking object to finish. */
+function ownerOf(state: RoomState, objectId: string): string | undefined {
+  const c = state.commitments.get(objectId);
+  if (c) return c.ownerId;
+  const h = state.handoffs.get(objectId);
+  if (h) return h.resultingCommitmentId ? state.commitments.get(h.resultingCommitmentId)?.ownerId : h.toAgentId;
+  const q = state.questions.get(objectId);
+  if (q && q.targetIds.length === 1) return q.targetIds[0];
+  return undefined;
+}
+
+/**
+ * §26 — explicit dependency deadlock: agents waiting on each other in a
+ * cycle. High severity, so it bypasses the 1-per-8-messages limit.
+ */
+export function dependencyDeadlocks(state: RoomState, _ctx: RuleContext): InterventionCandidate[] {
+  // waits-for graph: agent → [{ owner, dep }]
+  const edges = new Map<string, Array<{ to: string; depId: string; objectId: string }>>();
+  for (const p of state.waitingDependencies()) {
+    const to = ownerOf(state, p.blockingObjectId);
+    if (!to || to === p.blockedAgentId) continue;
+    const list = edges.get(p.blockedAgentId) ?? [];
+    list.push({ to, depId: p.id, objectId: p.blockingObjectId });
+    edges.set(p.blockedAgentId, list);
+  }
+  const out: InterventionCandidate[] = [];
+  const reported = new Set<string>();
+  const dfs = (start: string, node: string, path: Array<{ from: string; to: string; depId: string; objectId: string }>) => {
+    for (const e of edges.get(node) ?? []) {
+      const step = { from: node, ...e };
+      if (e.to === start) {
+        const cycle = [...path, step];
+        const key = cycle.map((s) => s.depId).sort().join(",");
+        if (reported.has(key)) continue;
+        reported.add(key);
+        out.push({
+          type: "dependency_deadlock",
+          severity: "high",
+          involvedAgentIds: cycle.map((s) => s.from),
+          relatedObjectIds: cycle.map((s) => s.depId),
+          evidenceMessageIds: cycle.flatMap((s) => state.dependencies.get(s.depId)!.derivedFromMessageIds.slice(0, 1)),
+          confidence: 0.93,
+          urgency: 1,
+          expectedValue: 1,
+          blockedAgents: cycle.length,
+          idempotencyKey: `dependency_deadlock:${key}`,
+          text: [
+            "Possible deadlock — these agents are waiting on each other:",
+            "",
+            ...cycle.map(
+              (s) =>
+                `${state.agentName(s.from)} waits on ${s.objectId} (${state.agentName(s.to)}) — ${s.depId}, ${state.cite(state.dependencies.get(s.depId)!.derivedFromMessageIds[0]!)}`,
+            ),
+            "",
+            "One of you needs to go first, or drop the dependency.",
+          ].join("\n"),
+          createdIndex: state.roomIndex,
+        });
+      } else if (!path.some((s) => s.from === e.to) && e.to !== node) {
+        dfs(start, e.to, [...path, step]);
+      }
+    }
+  };
+  for (const agent of edges.keys()) dfs(agent, agent, []);
   return out;
 }
 

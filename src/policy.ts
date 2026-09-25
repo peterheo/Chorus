@@ -37,7 +37,8 @@ export class InterventionPolicy {
       case "assist":
         // §71: only high-confidence alerts of these types.
         return (
-          ["conflict_detected", "repeated_question", "dependency_resolved"].includes(c.type) && c.confidence >= 0.9
+          ["conflict_detected", "repeated_question", "dependency_resolved", "dependency_deadlock"].includes(c.type) &&
+          c.confidence >= 0.9
         );
       case "facilitate":
         return true;
@@ -47,7 +48,9 @@ export class InterventionPolicy {
   choose(state: RoomState, candidates: InterventionCandidate[], now: Date): Decision {
     const cfg = this.config().interventions;
     const suppressed: Decision["suppressed"] = [];
-    const postedKeys = new Set(state.posted.map((p) => p.candidate.idempotencyKey));
+    const postedKeys = new Set(
+      state.posted.flatMap((p) => [p.candidate.idempotencyKey, ...(p.candidate.absorbedKeys ?? [])]),
+    );
 
     const unsolicited = state.posted.filter((p) => !p.solicited);
     const last = unsolicited[unsolicited.length - 1];
@@ -91,8 +94,33 @@ export class InterventionPolicy {
         suppressed.push({ candidate: c, reason: `rate limit: ${messagesSinceLast} messages since last` });
         continue;
       }
-      return { post: c, suppressed };
+      return { post: merge(c, eligible.map((e) => e.c)), suppressed };
     }
     return { post: null, suppressed };
   }
+}
+
+/**
+ * §51: a higher-priority candidate absorbs lower-priority ones about the same
+ * objects, so the room gets one message instead of several. Absorbed keys are
+ * recorded as posted and not raised again.
+ */
+export function merge(top: InterventionCandidate, others: InterventionCandidate[]): InterventionCandidate {
+  const related = new Set(top.relatedObjectIds);
+  const absorbed = others.filter(
+    (o) =>
+      o !== top &&
+      o.type !== "command_reply" &&
+      o.relatedObjectIds.some((id) => related.has(id)),
+  );
+  if (absorbed.length === 0) return top;
+  return {
+    ...top,
+    involvedAgentIds: [...new Set([...top.involvedAgentIds, ...absorbed.flatMap((o) => o.involvedAgentIds)])],
+    relatedObjectIds: [...new Set([...top.relatedObjectIds, ...absorbed.flatMap((o) => o.relatedObjectIds)])],
+    evidenceMessageIds: [...new Set([...top.evidenceMessageIds, ...absorbed.flatMap((o) => o.evidenceMessageIds)])],
+    blockedAgents: Math.max(top.blockedAgents, ...absorbed.map((o) => o.blockedAgents)),
+    absorbedKeys: [...(top.absorbedKeys ?? []), ...absorbed.map((o) => o.idempotencyKey)],
+    text: [top.text, ...absorbed.map((o) => o.text)].join("\n\n—\n\n"),
+  };
 }
