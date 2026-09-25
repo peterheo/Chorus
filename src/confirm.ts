@@ -12,9 +12,17 @@ export interface ClaimView {
   hedged: boolean;
 }
 
+export interface DecisionView {
+  statement: string;
+  subject?: string;
+  value?: string;
+}
+
 export interface Confirmer {
   duplicate(a: string, b: string): Promise<DuplicateVerdict>;
   conflict(a: ClaimView, b: ClaimView): Promise<ConflictVerdict>;
+  /** Does this claim propose something incompatible with the decision? (§23.1) */
+  againstDecision(d: DecisionView, claim: ClaimView): Promise<ConflictVerdict>;
 }
 
 export class HeuristicConfirmer implements Confirmer {
@@ -33,5 +41,21 @@ export class HeuristicConfirmer implements Confirmer {
       return { verdict: "not_conflict", confidence: 0.9, reason: "different conditions" };
     }
     return { verdict: "conflict", confidence: 0.95, reason: "direct contradiction" };
+  }
+
+  async againstDecision(d: DecisionView, k: ClaimView): Promise<ConflictVerdict> {
+    // Only structured "X is Y" decisions can be checked lexically.
+    if (!d.subject || !d.value) return { verdict: "unclear", confidence: 0.3, reason: "unstructured decision" };
+    if (overlap(contentTokens(d.subject), contentTokens(k.subject)) < 0.85) {
+      return { verdict: "not_conflict", confidence: 0.8, reason: "different subject" };
+    }
+    const sameValue = overlap(contentTokens(d.value), contentTokens(k.predicate)) >= 0.99;
+    if (k.polarity === "negative" && sameValue) {
+      return { verdict: "conflict", confidence: 0.9, reason: "negates the decided value" };
+    }
+    if (k.polarity === "positive" && !sameValue) {
+      return { verdict: "conflict", confidence: 0.88, reason: "different value for a decided subject" };
+    }
+    return { verdict: "not_conflict", confidence: 0.9, reason: "consistent with the decision" };
   }
 }

@@ -40,6 +40,8 @@ export interface Question extends Provenance {
   status: QuestionStatus;
   answerMessageIds: string[];
   claimedByCommitmentId?: string;
+  /** an earlier answered question this one repeats (§23) */
+  duplicateOf?: string;
   ackIndex?: number;
   lastSurfacedIndex?: number;
   ignored?: boolean;
@@ -97,6 +99,8 @@ export interface Claim extends Provenance {
   hedged: boolean;
   status: "active" | "retracted" | "superseded";
   answersQuestionId?: string;
+  /** an active decision this claim contradicts (§23.1) */
+  contradictsDecisionId?: string;
 }
 
 export interface Conflict extends Provenance {
@@ -108,7 +112,30 @@ export interface Conflict extends Provenance {
   ignored?: boolean;
 }
 
-export type ObjectKind = "question" | "commitment" | "claim" | "conflict" | "handoff";
+export type ObjectKind = "question" | "commitment" | "claim" | "conflict" | "handoff" | "decision" | "dependency";
+
+/** A decision the room made (§10.4). subject/value are set when the statement parses as "X is Y". */
+export interface Decision extends Provenance {
+  statement: string;
+  subject?: string;
+  value?: string;
+  sourceMessageIds: string[];
+  status: "active" | "superseded" | "reopened";
+  supersededBy?: string;
+  decidedBy: string;
+}
+
+/** An agent waiting on another object (§10.6). */
+export interface Dependency extends Provenance {
+  blockedAgentId: string;
+  /** the waiting agent's own commitment that is blocked, if any */
+  blockedCommitmentId?: string;
+  blockingObjectId: string;
+  blockingKind: "question" | "commitment" | "handoff" | "decision";
+  status: "waiting" | "resolved" | "cancelled";
+  resolvedAt?: string;
+  notified?: boolean;
+}
 
 export interface Transition {
   objectId: string;
@@ -127,6 +154,9 @@ export type InterventionType =
   | "completion_check"
   | "missing_acknowledgement"
   | "stale_commitment"
+  | "repeated_question"
+  | "decision_reminder"
+  | "dependency_resolved"
   | "command_reply";
 
 export interface InterventionCandidate {

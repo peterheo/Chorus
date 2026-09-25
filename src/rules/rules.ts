@@ -87,8 +87,9 @@ export function unansweredQuestions(state: RoomState, ctx: RuleContext): Interve
   const u = ctx.config.unanswered;
   const out: InterventionCandidate[] = [];
   for (const q of state.openQuestions()) {
-    // Someone is working on it; a stale-commitment rule (post-MVP) covers that case.
-    if (q.ignored || isClaimed(state, q)) continue;
+    // Someone is working on it (the stale-commitment rule covers that), or it
+    // repeats an answered question (the repeated-question rule covers that).
+    if (q.ignored || isClaimed(state, q) || q.duplicateOf) continue;
     const since = q.ackIndex ?? q.createdIndex;
     const subsequent = state.roomIndex - since;
     const ageSeconds = (ctx.now.getTime() - new Date(q.createdAt).getTime()) / 1000;
@@ -179,7 +180,9 @@ export function staleCommitments(state: RoomState, ctx: RuleContext): Interventi
     const ownerSince = state.messages.filter(
       (m) => m.authorId === c.ownerId && !m.isFromChorus && m.roomIndex > c.updatedIndex,
     ).length;
-    const dependents = 0; // dependencies are not tracked yet (§44 item 9)
+    const dependents = state.waitingDependencies().filter(
+      (p) => p.blockingObjectId === c.id || state.handoffs.get(p.blockingObjectId)?.resultingCommitmentId === c.id,
+    ).length;
     const score =
       0.35 * Math.min(ageSeconds / cfg.ageRefSeconds, 1) +
       0.25 * Math.min(roomSince / cfg.roomRefMessages, 1) +
@@ -206,6 +209,110 @@ export function staleCommitments(state: RoomState, ctx: RuleContext): Interventi
         `${state.agentName(c.ownerId)}, is this still in progress? "@chorus resolved ${c.id}" if it's done.`,
       ].join("\n"),
       replyToMessageId: c.sourceMessageId,
+      createdIndex: state.roomIndex,
+    });
+  }
+  return out;
+}
+
+/** §23 — a new question repeats one already answered; quote the answer. */
+export function repeatedQuestions(state: RoomState, _ctx: RuleContext): InterventionCandidate[] {
+  const out: InterventionCandidate[] = [];
+  for (const q of state.openQuestions()) {
+    if (!q.duplicateOf || q.ignored) continue;
+    const original = state.questions.get(q.duplicateOf);
+    if (!original) continue;
+    const answers = [...state.claims.values()].filter((k) => k.answersQuestionId === original.id && k.status === "active");
+    const answerMsgs = answers.length ? answers.map((k) => k.messageId) : original.answerMessageIds;
+    const quoted = answerMsgs
+      .map((id) => state.message(id))
+      .filter((m): m is NonNullable<typeof m> => !!m)
+      .map((m) => `${state.agentName(m.authorId)} (#${m.seq}): ${m.text}`);
+    if (quoted.length === 0) continue;
+    out.push({
+      type: "repeated_question",
+      severity: "medium",
+      involvedAgentIds: [q.askerId],
+      relatedObjectIds: [q.id, original.id],
+      evidenceMessageIds: [q.sourceMessageId, original.sourceMessageId, ...answerMsgs],
+      confidence: 0.92,
+      urgency: 0.8,
+      expectedValue: 0.9,
+      blockedAgents: 0,
+      idempotencyKey: `repeated_question:${q.id}`,
+      text: [
+        `This appears to match ${original.id}, which was previously answered.`,
+        "",
+        `${original.id} — ${original.text} (${state.cite(original.sourceMessageId)})`,
+        ...quoted.map((line) => `Answer: ${line}`),
+      ].join("\n"),
+      replyToMessageId: q.sourceMessageId,
+      createdIndex: state.roomIndex,
+    });
+  }
+  return out;
+}
+
+/** §23.1 — a claim contradicts an active decision. */
+export function decisionReminders(state: RoomState, _ctx: RuleContext): InterventionCandidate[] {
+  const out: InterventionCandidate[] = [];
+  for (const k of state.activeClaims()) {
+    const d = k.contradictsDecisionId ? state.decisions.get(k.contradictsDecisionId) : undefined;
+    if (!d || d.status !== "active") continue;
+    out.push({
+      type: "decision_reminder",
+      severity: "medium",
+      involvedAgentIds: [k.agentId],
+      relatedObjectIds: [d.id, k.id],
+      evidenceMessageIds: [k.messageId, ...d.sourceMessageIds],
+      confidence: 0.88,
+      urgency: 0.7,
+      expectedValue: 0.8,
+      blockedAgents: 0,
+      idempotencyKey: `decision_reminder:${d.id}:${k.id}`,
+      text: [
+        `Note: this differs from ${d.id} — "${d.statement}" (decided at ${state.cite(d.sourceMessageIds[0]!)}).`,
+        `Reply "@chorus reopen ${d.id}" if the room is revisiting it.`,
+      ].join("\n"),
+      replyToMessageId: k.messageId,
+      createdIndex: state.roomIndex,
+    });
+  }
+  return out;
+}
+
+/** §24 — tell a waiting agent their dependency resolved, once. */
+export function resolvedDependencies(state: RoomState, _ctx: RuleContext): InterventionCandidate[] {
+  const out: InterventionCandidate[] = [];
+  for (const p of state.dependencies.values()) {
+    if (p.status !== "resolved" || p.notified) continue;
+    const blocker = state.object(p.blockingObjectId);
+    const what =
+      blocker && "action" in blocker
+        ? `"${blocker.action}"`
+        : blocker && "text" in blocker
+          ? `"${blocker.text}"`
+          : blocker && "statement" in blocker
+            ? `"${blocker.statement}"`
+            : "";
+    const resolvedMsg = p.derivedFromMessageIds.at(-1);
+    const by = resolvedMsg ? state.message(resolvedMsg) : undefined;
+    // Resolved by the very message that declared it: the blocker was already done.
+    const alreadyDone = p.derivedFromMessageIds.length === 1;
+    out.push({
+      type: "dependency_resolved",
+      severity: "medium",
+      involvedAgentIds: [p.blockedAgentId],
+      relatedObjectIds: [p.id, p.blockingObjectId],
+      evidenceMessageIds: p.derivedFromMessageIds,
+      confidence: 0.93,
+      urgency: 0.8,
+      expectedValue: 0.9,
+      blockedAgents: 1,
+      idempotencyKey: `dependency_resolved:${p.id}`,
+      text: alreadyDone
+        ? `${state.agentName(p.blockedAgentId)} — ${p.blockingObjectId} ${what} is already done; nothing to wait for.`
+        : `${state.agentName(p.blockedAgentId)} — ${p.id} is resolved: ${p.blockingObjectId} ${what} finished${by ? ` at #${by.seq}` : ""}.`,
       createdIndex: state.roomIndex,
     });
   }

@@ -13,7 +13,10 @@ import {
   completion,
   conflicts,
   duplicateWork,
+  decisionReminders,
   missingAcknowledgements,
+  repeatedQuestions,
+  resolvedDependencies,
   staleCommitments,
   unansweredQuestions,
   type RuleContext,
@@ -293,7 +296,13 @@ export class ChorusRoom {
       ...missingAcknowledgements(s, ctx),
       ...staleCommitments(s, ctx),
       ...(trigger === "state_change"
-        ? [...(await duplicateWork(s, ctx)), ...conflicts(s, ctx)]
+        ? [
+            ...(await duplicateWork(s, ctx)),
+            ...conflicts(s, ctx),
+            ...repeatedQuestions(s, ctx),
+            ...decisionReminders(s, ctx),
+            ...resolvedDependencies(s, ctx),
+          ]
         : completion(s, ctx)),
     ];
     const decision = this.policy.choose(s, candidates, ctx.now);
@@ -321,6 +330,10 @@ export class ChorusRoom {
       }
     }
     if (c.type === "completion_check") s.completionAnnounced = true;
+    if (c.type === "dependency_resolved") {
+      const p = s.dependencies.get(c.relatedObjectIds[0]!);
+      if (p) p.notified = true;
+    }
     if (s.mode === "observe" && !solicited) return;
 
     const key = interventionKey(this.roomKey, s.chorusAgentId ?? "", `${c.idempotencyKey}#${s.posted.length}`);

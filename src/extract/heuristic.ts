@@ -19,6 +19,11 @@ const DECLINE = /\b(i can't (take|do) (it|this|that)|can't take (it|this|that)|i
 const CORRECTION = /^(correction|actually|update)\b[\s:,-]*/i;
 const UNTARGETED_REQUEST = /^(can|could|would|will)\s+(someone|anyone|somebody|anybody|one of you)\b/i;
 const YES_NO = /^(yes|yeah|yep|no|nope)\b[\s.,!:-]*/i;
+const DECISION =
+  /^(?:decision|decided|agreed|final|consensus)\s*[:,-]\s*(.+)$|^(?:let's|let us|we'll|we will|we're going to)\s+(?:go with|use|pick|choose|stick with)\s+(.+)$|^(?:we're |we are )?going with\s+(.+)$/i;
+const DEPENDENCY =
+  /\b(?:i'm |i am |we're |we are )?(?:waiting (?:on|for)|blocked (?:on|by)|depend(?:s|ing)? on|can't (?:start|continue|proceed) until)\s+(.+)$/i;
+const SHORT_ID = /\b([QCHDXKP]\d+)\b/g;
 const QUOTED = /^(\w+\s+(said|says|thinks|claimed|claims)\b|"|>)/i;
 
 const CONDITION_PATTERNS = [
@@ -148,6 +153,26 @@ export class HeuristicExtractor implements Extractor {
         out.push(event("correction", {}, { confidence: 0.92 }));
         s = s.replace(CORRECTION, "");
         if (!s) continue;
+      }
+
+      const decision = DECISION.exec(s);
+      if (decision) {
+        const text = stripEnd(decision[1] ?? decision[2] ?? decision[3] ?? s);
+        out.push(event("decision", { text }, { confidence: 0.9, references: [...text.matchAll(SHORT_ID)].map((m) => m[1]!) }));
+        continue;
+      }
+
+      const dep = DEPENDENCY.exec(s);
+      if (dep && !s.endsWith("?")) {
+        const text = stripEnd(dep[1]!);
+        out.push(
+          event("dependency", { text }, {
+            confidence: 0.9,
+            references: [...s.matchAll(SHORT_ID)].map((m) => m[1]!),
+            target_agents: roster.filter((r) => new RegExp(`\\b${r}\\b`, "i").test(text)),
+          }),
+        );
+        continue;
       }
 
       if (WITHDRAW.test(s) || DECLINE.test(s)) {

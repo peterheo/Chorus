@@ -16,8 +16,8 @@ export interface CommandResult {
 
 const HELP = [
   "Chorus commands:",
-  "@chorus status | open | commitments | conflicts | close-check",
-  "@chorus resolved <id> | ignore <id> | wrong [id] | correct [id]",
+  "@chorus status | open | commitments | conflicts | decisions | what-am-i-waiting-on | close-check",
+  "@chorus resolved <id> | ignore <id> | wrong [id] | correct [id] | reopen <D…>",
   "@chorus mode observe|assist|facilitate",
 ].join("\n");
 
@@ -36,6 +36,8 @@ function status(state: RoomState): string {
     `Open questions: ${open.length}`,
     `Commitments in progress: ${inProgress.length}`,
     `Pending handoffs: ${state.pendingHandoffs().length}`,
+    `Agents waiting on others: ${new Set(state.waitingDependencies().map((p) => p.blockedAgentId)).size}`,
+    `Active decisions: ${state.activeDecisions().length}`,
     `Unresolved conflicts: ${confirmed.length}${candidates.length ? ` (+${candidates.length} unconfirmed)` : ""}`,
   ];
   const oldest = open
@@ -67,6 +69,9 @@ function open(state: RoomState): string {
     lines.push(`${h.id} — handoff ${state.agentName(h.fromAgentId)} → ${state.agentName(h.toAgentId)}: ${h.action} [pending, ${state.cite(h.sourceMessageId)}]`);
   }
   for (const x of state.unresolvedConflicts()) lines.push(`${x.id} — conflict: ${x.subject} [${x.status}]`);
+  for (const p of state.waitingDependencies()) {
+    lines.push(`${p.id} — ${state.agentName(p.blockedAgentId)} waiting on ${p.blockingObjectId}`);
+  }
   return lines.length ? ["OPEN ITEMS", "", ...lines].join("\n") : "No open items.";
 }
 
@@ -91,6 +96,33 @@ function conflictList(state: RoomState): string {
       lines.push(`  ${state.agentName(k.agentId)} (${state.cite(k.messageId)}): ${describeClaim(k)}${k.status !== "active" ? ` [${k.status}]` : ""}`);
     }
   }
+  return lines.join("\n");
+}
+
+function decisions(state: RoomState): string {
+  const all = [...state.decisions.values()];
+  if (!all.length) return "No decisions recorded.";
+  const lines = ["DECISIONS", ""];
+  for (const d of all) {
+    const note = d.status === "superseded" ? ` [superseded by ${d.supersededBy}]` : d.status === "reopened" ? " [reopened]" : "";
+    lines.push(`${d.id} — ${d.statement} (${state.agentName(d.decidedBy)}, ${state.cite(d.sourceMessageIds[0]!)})${note}`);
+  }
+  return lines.join("\n");
+}
+
+function waitingOn(state: RoomState, who: string): string {
+  const mine = state.waitingDependencies().filter((p) => p.blockedAgentId === who);
+  const handoffs = state.pendingHandoffs().filter((h) => h.fromAgentId === who);
+  const questions = state.openQuestions().filter((q) => q.askerId === who);
+  if (!mine.length && !handoffs.length && !questions.length) return "You are not waiting on anything Chorus is tracking.";
+  const lines = ["YOU ARE WAITING ON", ""];
+  for (const p of mine) {
+    const b = state.object(p.blockingObjectId);
+    const what = b && "action" in b ? b.action : b && "text" in b ? b.text : b && "statement" in b ? b.statement : "";
+    lines.push(`${p.id} → ${p.blockingObjectId} ${what} [${b?.status ?? "unknown"}]`);
+  }
+  for (const h of handoffs) lines.push(`${h.id} → ${state.agentName(h.toAgentId)} to accept: ${h.action}`);
+  for (const q of questions) lines.push(`${q.id} → an answer: ${q.text}`);
   return lines.join("\n");
 }
 
@@ -164,6 +196,15 @@ function feedback(state: RoomState, verb: string, arg: string | undefined, msg: 
     return { reply: `No object ${id}.`, changed: false };
   }
 
+  if (verb === "reopen") {
+    const d = state.decisions.get(id);
+    if (!d) return { reply: `No decision ${id}.`, changed: false };
+    // §60: any agent may reopen a decision.
+    state.record({ objectId: d.id, kind: "decision", from: d.status, to: "reopened", cause: "feedback", messageId: msg.id, at: now.toISOString() });
+    d.status = "reopened";
+    return { reply: `${id} reopened: "${d.statement}". Chorus will stop reminding the room about it.`, changed: true };
+  }
+
   if (verb === "ignore") {
     const q = state.questions.get(id);
     const c = state.commitments.get(id);
@@ -203,6 +244,11 @@ export function runCommand(state: RoomState, msg: Message, now: Date): CommandRe
       return { reply: commitments(state), changed: false };
     case "conflicts":
       return { reply: conflictList(state), changed: false };
+    case "decisions":
+      return { reply: decisions(state), changed: false };
+    case "what-am-i-waiting-on":
+    case "waiting":
+      return { reply: waitingOn(state, msg.authorId), changed: false };
     case "close-check":
     case "close_check":
       return { reply: formatCompletion(state, completionReport(state)), changed: false };
@@ -215,6 +261,7 @@ export function runCommand(state: RoomState, msg: Message, now: Date): CommandRe
       return { reply: `Mode set to ${mode}.`, changed: true };
     }
     case "resolved":
+    case "reopen":
     case "ignore":
     case "wrong":
     case "correct":

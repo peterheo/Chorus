@@ -7,6 +7,8 @@ import type {
   Claim,
   Commitment,
   Conflict,
+  Decision,
+  Dependency,
   Handoff,
   Message,
   ObjectKind,
@@ -22,6 +24,8 @@ const PREFIX: Record<ObjectKind, string> = {
   claim: "K",
   conflict: "X",
   handoff: "H",
+  decision: "D",
+  dependency: "P",
 };
 
 export class RoomState {
@@ -36,6 +40,8 @@ export class RoomState {
   readonly claims = new Map<string, Claim>();
   readonly conflicts = new Map<string, Conflict>();
   readonly handoffs = new Map<string, Handoff>();
+  readonly decisions = new Map<string, Decision>();
+  readonly dependencies = new Map<string, Dependency>();
   readonly transitions: Transition[] = [];
   readonly posted: PostedIntervention[] = [];
   /** idempotency keys suppressed by `@chorus wrong` */
@@ -49,7 +55,7 @@ export class RoomState {
   roomIndex = 0;
   /** highest transport sequence fully processed; the resume cursor (§70) */
   lastProcessedSeq = 0;
-  private counters: Record<string, number> = { Q: 0, C: 0, K: 0, X: 0, H: 0 };
+  private counters: Record<string, number> = { Q: 0, C: 0, K: 0, X: 0, H: 0, D: 0, P: 0 };
 
   constructor(mode: Mode) {
     this.mode = mode;
@@ -75,14 +81,24 @@ export class RoomState {
     return m ? `#${m.seq}` : "#?";
   }
 
-  object(id: string): Question | Commitment | Claim | Conflict | Handoff | undefined {
+  object(id: string): Question | Commitment | Claim | Conflict | Handoff | Decision | Dependency | undefined {
     return (
       this.questions.get(id) ??
       this.commitments.get(id) ??
       this.claims.get(id) ??
       this.conflicts.get(id) ??
-      this.handoffs.get(id)
+      this.handoffs.get(id) ??
+      this.decisions.get(id) ??
+      this.dependencies.get(id)
     );
+  }
+
+  activeDecisions(): Decision[] {
+    return [...this.decisions.values()].filter((d) => d.status === "active");
+  }
+
+  waitingDependencies(): Dependency[] {
+    return [...this.dependencies.values()].filter((p) => p.status === "waiting");
   }
 
   pendingHandoffs(): Handoff[] {
@@ -128,6 +144,8 @@ export class RoomState {
       claims: [...this.claims.values()],
       conflicts: [...this.conflicts.values()],
       handoffs: [...this.handoffs.values()],
+      decisions: [...this.decisions.values()],
+      dependencies: [...this.dependencies.values()],
       transitions: this.transitions,
       posted: this.posted,
       suppressedKeys: [...this.suppressedKeys],
@@ -154,6 +172,8 @@ export class RoomState {
     for (const k of j.claims) s.claims.set(k.id, k);
     for (const x of j.conflicts) s.conflicts.set(x.id, x);
     for (const h of j.handoffs) s.handoffs.set(h.id, h);
+    for (const d of j.decisions ?? []) s.decisions.set(d.id, d);
+    for (const p of j.dependencies ?? []) s.dependencies.set(p.id, p);
     s.transitions.push(...j.transitions);
     s.posted.push(...j.posted);
     for (const k of j.suppressedKeys) s.suppressedKeys.add(k);
@@ -177,6 +197,9 @@ export interface RoomSnapshot {
   claims: Claim[];
   conflicts: Conflict[];
   handoffs: Handoff[];
+  /** absent in snapshots written before decisions existed */
+  decisions?: Decision[];
+  dependencies?: Dependency[];
   transitions: Transition[];
   posted: PostedIntervention[];
   suppressedKeys: string[];

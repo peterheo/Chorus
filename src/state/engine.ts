@@ -6,7 +6,18 @@ import type { Confirmer } from "../confirm.ts";
 import type { ExtractedEvent } from "../schemas/llm.ts";
 import { conditionsOverlap, contentTokens, overlap, textSimilarity } from "../similarity.ts";
 import type { RoomState } from "./room.ts";
-import type { Claim, Commitment, Conflict, Handoff, Message, ObjectKind, Question } from "./types.ts";
+import { parseClaim } from "../extract/heuristic.ts";
+import type {
+  Claim,
+  Commitment,
+  Conflict,
+  Decision,
+  Dependency,
+  Handoff,
+  Message,
+  ObjectKind,
+  Question,
+} from "./types.ts";
 
 export interface ApplyContext {
   config: ChorusConfig;
@@ -175,6 +186,82 @@ function syncHandoffs(state: RoomState, msg: Message, now: Date): string[] {
     changed.push(h.id);
   }
   return changed;
+}
+
+/** Is the object a dependency waits on finished? (§24) */
+function blockerDone(state: RoomState, p: Dependency): boolean {
+  switch (p.blockingKind) {
+    case "question": {
+      const q = state.questions.get(p.blockingObjectId);
+      return !q || ["answered", "withdrawn", "superseded"].includes(q.status);
+    }
+    case "commitment": {
+      const c = state.commitments.get(p.blockingObjectId);
+      return !c || ["completed", "cancelled", "expired"].includes(c.status);
+    }
+    case "handoff": {
+      const h = state.handoffs.get(p.blockingObjectId);
+      if (!h) return true;
+      if (h.status === "accepted" && h.resultingCommitmentId) {
+        const c = state.commitments.get(h.resultingCommitmentId);
+        return !c || ["completed", "cancelled", "expired"].includes(c.status);
+      }
+      return ["completed", "declined", "cancelled", "expired"].includes(h.status);
+    }
+    case "decision":
+      return state.decisions.get(p.blockingObjectId)?.status === "active";
+  }
+}
+
+/** Resolve waiting dependencies whose blocker finished; unblock the waiter's commitment. */
+function resolveDependencies(state: RoomState, msg: Message, now: Date): string[] {
+  const changed: string[] = [];
+  for (const p of state.waitingDependencies()) {
+    if (!blockerDone(state, p)) continue;
+    p.resolvedAt = now.toISOString();
+    if (!p.derivedFromMessageIds.includes(msg.id)) p.derivedFromMessageIds.push(msg.id);
+    transition(state, "dependency", p, "resolved", msg, now);
+    changed.push(p.id);
+    const blocked = p.blockedCommitmentId ? state.commitments.get(p.blockedCommitmentId) : undefined;
+    const stillWaiting = state
+      .waitingDependencies()
+      .some((o) => o.blockedCommitmentId && o.blockedCommitmentId === p.blockedCommitmentId);
+    if (blocked?.status === "blocked" && !stillWaiting) {
+      transition(state, "commitment", blocked, "in_progress", msg, now);
+      changed.push(blocked.id);
+    }
+  }
+  return changed;
+}
+
+type Blocker = { id: string; kind: Dependency["blockingKind"] };
+
+/** What a dependency message waits on (§14 order: short ID, agent mention, then text). */
+function findBlocker(state: RoomState, msg: Message, e: ExtractedEvent): Blocker | undefined {
+  for (const ref of e.references) {
+    const id = ref.toUpperCase();
+    if (state.questions.has(id)) return { id, kind: "question" };
+    if (state.commitments.has(id)) return { id, kind: "commitment" };
+    if (state.handoffs.has(id)) return { id, kind: "handoff" };
+    if (state.decisions.has(id)) return { id, kind: "decision" };
+  }
+  const text = e.payload.text ?? msg.text;
+  const agents = e.target_agents.map((n) => resolveAgent(state, n)).filter((a): a is string => !!a && a !== msg.authorId);
+  const scored: Array<Blocker & { s: number }> = [];
+  for (const c of state.activeCommitments()) {
+    if (c.ownerId === msg.authorId) continue;
+    const s = textSimilarity(c.action, text) + (agents.includes(c.ownerId) ? 0.5 : 0);
+    scored.push({ id: c.id, kind: "commitment", s });
+  }
+  for (const h of state.pendingHandoffs()) {
+    const s = textSimilarity(h.action, text) + (agents.includes(h.toAgentId) ? 0.5 : 0);
+    scored.push({ id: h.id, kind: "handoff", s });
+  }
+  for (const q of state.openQuestions()) {
+    scored.push({ id: q.id, kind: "question", s: textSimilarity(q.text, text) });
+  }
+  const best = scored.sort((a, b) => b.s - a.s)[0];
+  return best && best.s >= 0.5 ? best : undefined;
 }
 
 /** Which open question (if any) does this claim or answer resolve? (§15) */
@@ -348,9 +435,88 @@ export async function applyEvents(
           derivedFromMessageIds: [msg.id],
           extractorConfidence: e.confidence,
         };
+        // §23: the same question was already answered, and not contested.
+        const qTokens = contentTokens(q.text);
+        const earlier = [...state.questions.values()]
+          .filter((o) => o.status === "answered" && overlap(qTokens, contentTokens(o.text)) >= 0.9)
+          .filter(
+            (o) =>
+              !state
+                .unresolvedConflicts()
+                .some((x) => x.claimIds.some((k) => state.claims.get(k)?.answersQuestionId === o.id)),
+          )
+          .pop();
+        if (earlier) q.duplicateOf = earlier.id;
         state.questions.set(q.id, q);
         created(state, "question", q.id, "open", msg, now);
         result.created.push(q.id);
+        break;
+      }
+
+      case "decision": {
+        const statement = p.text ?? msg.text;
+        const parsed = parseClaim(statement);
+        const subject = parsed?.payload.subject ?? undefined;
+        const value = parsed?.payload.predicate ?? undefined;
+        const d: Decision = {
+          id: state.nextId("decision"),
+          statement,
+          subject,
+          value,
+          sourceMessageIds: [msg.id],
+          status: "active",
+          decidedBy: msg.authorId,
+          createdAt: now.toISOString(),
+          createdIndex: state.roomIndex,
+          derivedFromMessageIds: [msg.id],
+          extractorConfidence: e.confidence,
+        };
+        // A new decision on the same subject supersedes the old one (§10.4).
+        for (const old of state.activeDecisions()) {
+          const same = subject && old.subject
+            ? overlap(contentTokens(subject), contentTokens(old.subject)) >= 0.85
+            : textSimilarity(old.statement, statement) >= 0.8;
+          if (same) {
+            old.supersededBy = d.id;
+            transition(state, "decision", old, "superseded", msg, now);
+            result.changed.push(old.id);
+          }
+        }
+        state.decisions.set(d.id, d);
+        created(state, "decision", d.id, "active", msg, now);
+        result.created.push(d.id);
+        break;
+      }
+
+      case "dependency": {
+        const blocker = findBlocker(state, msg, e);
+        if (!blocker) {
+          ctx.log?.(`#${msg.seq}: dependency on "${p.text}" did not resolve to a known object`);
+          break;
+        }
+        const mine = state.activeCommitments().filter((c) => c.ownerId === msg.authorId && c.status !== "proposed");
+        const blockedCommitment = mine[mine.length - 1];
+        const dep: Dependency = {
+          id: state.nextId("dependency"),
+          blockedAgentId: msg.authorId,
+          blockedCommitmentId: blockedCommitment?.id,
+          blockingObjectId: blocker.id,
+          blockingKind: blocker.kind,
+          status: "waiting",
+          createdAt: now.toISOString(),
+          createdIndex: state.roomIndex,
+          derivedFromMessageIds: [msg.id],
+          extractorConfidence: e.confidence,
+        };
+        state.dependencies.set(dep.id, dep);
+        created(state, "dependency", dep.id, "waiting", msg, now);
+        result.created.push(dep.id);
+        if (blockedCommitment && !blockerDone(state, dep)) {
+          transition(state, "commitment", blockedCommitment, "blocked", msg, now);
+          result.changed.push(blockedCommitment.id);
+        }
+        // Waiting on something already finished resolves at once below, and
+        // §24 tells the agent so (goal 3: "waiting on already-resolved dependencies").
         break;
       }
 
@@ -487,6 +653,14 @@ export async function applyEvents(
           result.changed.push(q.id);
         }
         if (isCorrection) result.changed.push(...reviewConflicts(state, msg, now));
+        for (const d of state.activeDecisions()) {
+          if (d.decidedBy === msg.authorId && d.sourceMessageIds.includes(msg.id)) continue;
+          const v = await ctx.confirmer.againstDecision(d, k);
+          if (v.verdict === "conflict" && v.confidence >= 0.85) {
+            k.contradictsDecisionId = d.id;
+            break;
+          }
+        }
         result.newConflicts.push(...(await linkConflicts(state, k, msg, ctx)));
         break;
       }
@@ -509,5 +683,6 @@ export async function applyEvents(
     }
   }
   result.changed.push(...syncHandoffs(state, msg, now));
+  result.changed.push(...resolveDependencies(state, msg, now));
   return result;
 }

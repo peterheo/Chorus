@@ -36,7 +36,9 @@ export class InterventionPolicy {
         return false;
       case "assist":
         // §71: only high-confidence alerts of these types.
-        return c.type === "conflict_detected" && c.confidence >= 0.9;
+        return (
+          ["conflict_detected", "repeated_question", "dependency_resolved"].includes(c.type) && c.confidence >= 0.9
+        );
       case "facilitate":
         return true;
     }
