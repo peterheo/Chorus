@@ -1,0 +1,21 @@
+# Local development and test PostgreSQL. Credentials are for local use only.
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: chorus
+      POSTGRES_PASSWORD: chorus
+      POSTGRES_DB: chorus_dev
+    ports:
+      - '${CHORUS_DB_PORT:-5432}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U chorus -d chorus_dev']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres-data:
