@@ -33,13 +33,20 @@ interface AppliedRow {
 export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
   const migrations = await loadMigrations(options.migrationsDir);
   const client = new pg.Client({ connectionString: options.databaseUrl });
+  // A server-side disconnect is emitted as an 'error' event; without a listener it crashes the process.
+  // The in-flight query rejects with the same error, so nothing is lost by absorbing the event here.
+  client.on('error', () => undefined);
   await client.connect();
   try {
     await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY.toString()]);
     try {
       return await applyPending(client, migrations);
     } finally {
-      await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY.toString()]);
+      // Session locks are released when the connection closes, so a failed unlock (for example on a
+      // dropped connection) must not mask the migration error or fail an already committed run.
+      await client
+        .query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY.toString()])
+        .catch(() => undefined);
     }
   } finally {
     await client.end();
@@ -101,7 +108,8 @@ async function applyOne(client: pg.Client, migration: Migration): Promise<void> 
     );
     await client.query('COMMIT');
   } catch (error) {
-    await client.query('ROLLBACK');
+    // If the connection died mid-migration, ROLLBACK throws too; keep the original error as the cause.
+    await client.query('ROLLBACK').catch(() => undefined);
     throw new MigrationFailedError(migration.version, migration.name, error);
   }
 }

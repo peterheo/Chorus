@@ -30,3 +30,23 @@ checksums in `schema_migrations` and refuses to run if an applied file was edite
 ```sh
 DATABASE_URL=postgres://chorus:chorus@localhost:5432/chorus_dev pnpm migrate
 ```
+
+## Database roles and isolation
+
+- **Owner role** (`DATABASE_URL`): runs migrations and operator tooling. It must be a superuser or hold
+  `BYPASSRLS`, because tenant tables use `FORCE ROW LEVEL SECURITY` and the `SECURITY DEFINER` functions
+  (`chorus_resolve_token`, `chorus_redeem_invite`, `chorus_visible_rooms`) run as it. Locally and in CI
+  this is the compose `chorus` superuser.
+- **Runtime role** `chorus_app` (`DATABASE_URL_APP`): created by migration `0003`, not a superuser, no
+  `BYPASSRLS`, owns nothing, least-privilege grants. All application traffic and all domain integration
+  tests use it, so row-level security applies to them.
+- The migration creates `chorus_app` **without a password**. Set one out of band; never commit it:
+
+  ```sh
+  CHORUS_APP_PASSWORD='<secret>' DATABASE_URL=<owner url> pnpm migrate   # migrates, then sets the password
+  ```
+
+  Tests set their own throwaway password on the local test cluster.
+
+- Transactions set `chorus.workspace_id` and `chorus.actor_id` (transaction-local) through `runCommand`
+  and `withReadTx`; with neither set the runtime role sees nothing.

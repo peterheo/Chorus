@@ -3,7 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MigrationError } from '../../src/errors.ts';
-import { checksumOf, loadMigrations, parseMigrationFilename } from '../../src/migrations.ts';
+import {
+  checksumOf,
+  findTransactionControl,
+  loadMigrations,
+  parseMigrationFilename,
+} from '../../src/migrations.ts';
 
 describe('parseMigrationFilename', () => {
   it('accepts NNNN_snake_case.sql', () => {
@@ -62,5 +67,34 @@ describe('loadMigrations', () => {
     await writeFile(join(dir, '0001_a.sql'), 'select 1;');
     await writeFile(join(dir, '0001_b.sql'), 'select 2;');
     await expect(loadMigrations(dir)).rejects.toThrow(/Duplicate migration version 0001/);
+  });
+});
+
+describe('findTransactionControl', () => {
+  it.each([
+    ['BEGIN;\nCREATE TABLE t (id int);\nCOMMIT;', 'begin'],
+    ['CREATE TABLE t (id int);\ncommit;', 'commit'],
+    ['create table t (id int);\n  ROLLBACK;', 'rollback'],
+    ['START TRANSACTION;', 'start transaction'],
+  ])('flags %j', (sql, expected) => {
+    expect(findTransactionControl(sql)).toBe(expected);
+  });
+
+  it('ignores BEGIN inside dollar-quoted function bodies, strings and comments', () => {
+    const sql = `
+      -- BEGIN; COMMIT;
+      /* ROLLBACK; */
+      CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $body$
+      BEGIN
+        RAISE EXCEPTION 'no; COMMIT; here';
+      END;
+      $body$;
+      CREATE FUNCTION g() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END; $$;
+      INSERT INTO t VALUES ('begin;');`;
+    expect(findTransactionControl(sql)).toBeUndefined();
+  });
+
+  it('does not flag identifiers that merely start with the keyword', () => {
+    expect(findTransactionControl('CREATE TABLE beginnings (id int);')).toBeUndefined();
   });
 });
