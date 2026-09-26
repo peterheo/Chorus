@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import pg from 'pg';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { RoomWatcher } from '../../src/watcher.ts';
 import { SharedNetClient } from '../../src/sharednet/client.ts';
@@ -60,11 +61,16 @@ describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
     expect(await cursor()).toBe(head());
 
     // The database refuses a regression outright.
+    const [epochRow] = await s.owner<{ consumer_epoch: string }>(
+      'SELECT consumer_epoch FROM sharednet_cursors WHERE room_id = $1',
+      [s.roomId],
+    );
     await expect(
-      s.pool.query('SELECT chorus_watcher_advance($1, $2, $3, true, NULL)', [
+      s.pool.query('SELECT chorus_watcher_advance($1, $2, $3, $4, true, NULL)', [
         s.workspaceId,
         s.roomId,
         persisted - 1,
+        Number(epochRow?.consumer_epoch),
       ]),
     ).rejects.toMatchObject({ code: 'CH002' });
     expect(await cursor()).toBe(head());
@@ -164,7 +170,7 @@ describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
       return row?.last_error === null;
     });
     const agent = s.agent('afterbackoff');
-    await expect(s.enroll(agent)).resolves.toMatchObject({ roles: ['executor'] });
+    await expect(s.enroll(agent)).resolves.toMatchObject({ workspaceId: s.workspaceId });
   });
 
   it('watcher.recovery: enrollment is refused while the watcher is unhealthy (stale last_ok_at)', async () => {
@@ -224,5 +230,95 @@ describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
       expect(Number(hits[0]?.n), tablename).toBe(0);
     }
     expect(s.logs.join('')).not.toContain(needle);
+  });
+
+  it('watcher.consumer_lease: two processes, one consumer; failover when the lease connection dies; stale epochs are fenced out', async () => {
+    const poolB = new pg.Pool({ connectionString: s.db.appUrl, max: 5 });
+    poolB.on('error', () => undefined);
+    const mk = (pool: pg.Pool) =>
+      new RoomWatcher({
+        pool,
+        secretsKey: s.secretsKey,
+        client: new SharedNetClient({ baseUrl: s.fake.url, timeoutMs: 5000 }),
+        rescanMs: 100,
+        expireMs: 30_000,
+        minPollIntervalMs: 10,
+      });
+    const a = mk(s.pool);
+    const b = mk(poolB);
+    const epoch = async () =>
+      Number(
+        (
+          await s.owner<{ e: string }>(
+            'SELECT consumer_epoch AS e FROM sharednet_cursors WHERE room_id = $1',
+            [s.roomId],
+          )
+        )[0]?.e,
+      );
+    const lockHolders = async () =>
+      s.owner<{ pid: number }>(
+        `SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+      );
+    try {
+      await a.start();
+      await b.start();
+      await s.waitFor('one consumer', () =>
+        Promise.resolve(a.consuming.length + b.consuming.length >= 1),
+      );
+      // Give the losing process several scans to (not) take over: still exactly one consumer and one lock.
+      await new Promise((r) => setTimeout(r, 500));
+      expect(a.consuming.length + b.consuming.length).toBe(1);
+      expect(await lockHolders()).toHaveLength(1);
+      const firstEpoch = await epoch();
+      expect(firstEpoch).toBe(1);
+
+      // Only the consumer processes: a proof posted now is verified exactly once, by whoever holds the lease.
+      const agent = s.agent('leased');
+      const started = await s.startEnrollment(agent);
+      s.post(agent, started.message);
+      await s.waitFor(
+        'verified',
+        async () => (await enrollmentState(started.enrollmentId)) === 'verified',
+      );
+
+      // Kill the lease-holding connection: the other process (or the same one, after a rescan) takes over
+      // with a NEW epoch, and the old epoch can no longer move the cursor.
+      const [holder] = await lockHolders();
+      await s.owner('SELECT pg_terminate_backend($1)', [holder?.pid]);
+      await s.waitFor('failover to a new epoch', async () => (await epoch()) > firstEpoch);
+      await s.waitFor('one consumer again', () =>
+        Promise.resolve(a.consuming.length + b.consuming.length === 1),
+      );
+      await expect(
+        s.pool.query('SELECT chorus_watcher_advance($1, $2, $3, $4, true, NULL)', [
+          s.workspaceId,
+          s.roomId,
+          head() + 100,
+          firstEpoch,
+        ]),
+      ).rejects.toMatchObject({ code: 'CH003' });
+
+      // Still working after failover, and never two consumers.
+      const again = s.agent('after-failover');
+      const restarted = await s.startEnrollment(again);
+      s.post(again, restarted.message);
+      await s.waitFor(
+        'verified after failover',
+        async () => (await enrollmentState(restarted.enrollmentId)) === 'verified',
+      );
+      expect(a.consuming.length + b.consuming.length).toBe(1);
+
+      // Releasing the lease (stopping the holder) lets the other process consume.
+      const holderIsA = a.consuming.length === 1;
+      await (holderIsA ? a : b).stop();
+      const survivor = holderIsA ? b : a;
+      await s.waitFor('the other process takes over', () =>
+        Promise.resolve(survivor.consuming.length === 1),
+      );
+    } finally {
+      await a.stop();
+      await b.stop();
+      await poolB.end();
+    }
   });
 });

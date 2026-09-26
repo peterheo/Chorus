@@ -6,6 +6,7 @@ export interface FakeMessage {
   sequence: number;
   senderPrincipalId: string;
   senderMemberId: string;
+  senderAgentId?: string | null;
   content: string;
 }
 
@@ -38,7 +39,13 @@ export class FakeSharedNet {
   /** Posts a message as the SharedNet server would: it assigns id and sequence, never the sender. */
   post(
     roomId: string,
-    message: { memberId: string; principalId: string; content: string; sequence?: number },
+    message: {
+      memberId: string;
+      principalId: string;
+      content: string;
+      sequence?: number;
+      agentId?: string;
+    },
   ): FakeMessage {
     const room = this.rooms.get(roomId);
     if (room === undefined) throw new Error(`unknown fake room ${roomId}`);
@@ -48,6 +55,7 @@ export class FakeSharedNet {
       sequence,
       senderPrincipalId: message.principalId,
       senderMemberId: message.memberId,
+      senderAgentId: message.agentId ?? null,
       content: message.content,
     };
     room.messages.push(posted);
@@ -90,6 +98,7 @@ export class FakeSharedNet {
                   room_id: 'x',
                   sequence: m.sequence,
                   sender_principal_id: m.senderPrincipalId,
+                  sender_agent_id: m.senderAgentId ?? null,
                   sender_instance_id: m.senderMemberId,
                   sender: { member_id: m.senderMemberId, kind: 'guest', name: 'n' },
                   content: m.content,

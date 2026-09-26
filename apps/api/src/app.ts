@@ -1,25 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import type { Writable } from 'node:stream';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import type pg from 'pg';
-import { extractBearer, resolveToken, type AuthContext } from './auth.ts';
 import type { Config } from './config.ts';
 import { registerEnrollRoutes } from './enroll.ts';
 import { sendError } from './http.ts';
-import { buildMcpServer } from './mcp.ts';
 import { RateLimiter } from './rate-limit.ts';
 
 export interface AppLimits {
-  readonly mcpPerTokenPerMinute: number;
   readonly enrollStartPerRoomPerMinute: number;
   readonly enrollStartGlobalPerMinute: number;
   readonly enrollCompleteGlobalPerMinute: number;
 }
 
 const DEFAULT_LIMITS: AppLimits = {
-  mcpPerTokenPerMinute: 120,
   enrollStartPerRoomPerMinute: 20,
   enrollStartGlobalPerMinute: 60,
   enrollCompleteGlobalPerMinute: 120,
@@ -56,7 +50,6 @@ interface RequestNotes {
 export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const { pool, config } = options;
   const limits = { ...DEFAULT_LIMITS, ...options.limits };
-  const mcpLimiter = new RateLimiter({ limit: limits.mcpPerTokenPerMinute, windowMs: 60_000 });
   const notes = new WeakMap<FastifyRequest, RequestNotes>();
 
   const app = Fastify({
@@ -121,64 +114,6 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       `Unexpected error. Quote request_id ${request.id} when reporting it.`,
     );
   });
-
-  // ---------------------------------------------------------------------------------------------
-  // MCP: stateless Streamable HTTP, JSON responses only, a new server + transport per request.
-  // ---------------------------------------------------------------------------------------------
-  const unauthenticated = (request: FastifyRequest, reply: Parameters<typeof sendError>[1]) =>
-    sendError(request, reply, 401, 'unauthenticated', 'A valid bearer token is required.', {
-      'www-authenticate': 'Bearer realm="chorus"',
-    });
-
-  app.post('/mcp', async (request, reply) => {
-    const token = extractBearer(request.headers.authorization);
-    let auth: AuthContext | undefined;
-    if (token !== undefined) auth = await resolveToken(pool, token);
-    if (auth === undefined) return unauthenticated(request, reply);
-
-    const note: RequestNotes = { actorId: auth.actorId };
-    const body = request.body as { method?: unknown; params?: { name?: unknown } } | undefined;
-    if (body?.method === 'tools/call' && typeof body.params?.name === 'string')
-      note.tool = body.params.name;
-    notes.set(request, note);
-
-    const decision = mcpLimiter.hit(auth.tokenKey);
-    if (!decision.ok) {
-      return sendError(request, reply, 429, 'rate_limited', 'Too many requests for this token.', {
-        'retry-after': String(decision.retryAfterSeconds),
-      });
-    }
-
-    const server = buildMcpServer({
-      pool,
-      auth,
-      leaseDurationSeconds: config.leaseDurationSeconds,
-      gitCommit: config.gitCommit,
-      version: options.version ?? '0.1.0',
-      requestId: request.id,
-      logError: (obj, msg) => {
-        request.log.error(obj, msg);
-      },
-    });
-    // No sessionIdGenerator means stateless mode; JSON responses mean no SSE stream is ever opened.
-    const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
-    reply.raw.on('close', () => {
-      void transport.close();
-      void server.close();
-    });
-    await server.connect(transport as unknown as Transport);
-    void reply.hijack();
-    await transport.handleRequest(request.raw, reply.raw, request.body);
-  });
-
-  for (const method of ['GET', 'DELETE'] as const) {
-    app.route({
-      method,
-      url: '/mcp',
-      handler: (request, reply) =>
-        sendError(request, reply, 405, 'invalid_request', 'Use POST.', { allow: 'POST' }),
-    });
-  }
 
   // ---------------------------------------------------------------------------------------------
   // Enrollment (public, no auth) and health.

@@ -1,8 +1,5 @@
 import { randomBytes } from 'node:crypto';
 import { Writable } from 'node:stream';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { FastifyInstance } from 'fastify';
 import pg from 'pg';
 import { createMigratedEphemeralDatabase, type EphemeralDatabase } from '@chorus/database/testing';
@@ -28,7 +25,6 @@ export interface Enrolled {
   instanceId: string;
   workspaceId: string;
   roomId: string;
-  roles: string[];
   expiresAt: string;
   raw: Record<string, unknown>;
 }
@@ -60,8 +56,6 @@ export interface Stack {
   waitForCursor: (sequence: number) => Promise<void>;
   waitFor: (what: string, condition: () => Promise<boolean>) => Promise<void>;
   owner: <T extends pg.QueryResultRow>(sql: string, params?: unknown[]) => Promise<T[]>;
-  grantRole: (actorId: string, role: string) => Promise<void>;
-  mcp: (token: string) => Promise<Client>;
   stop: () => Promise<void>;
 }
 
@@ -229,7 +223,6 @@ export async function startStack(
             instanceId: body['instance_id'] as string,
             workspaceId: body['workspace_id'] as string,
             roomId: (body['room'] as { id: string }).id,
-            roles: body['roles'] as string[],
             expiresAt: body['token_expires_at'] as string,
             raw: body,
           };
@@ -250,21 +243,6 @@ export async function startStack(
       }),
     waitFor,
     owner,
-    grantRole: async (actorId, role) => {
-      await owner(
-        `INSERT INTO room_grants (workspace_id, actor_id, room_id, role) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (workspace_id, actor_id, room_id, role) WHERE revoked_at IS NULL DO NOTHING`,
-        [workspaceId, actorId, roomId, role],
-      );
-    },
-    mcp: async (token) => {
-      const client = new Client({ name: 'chorus-test', version: '0.0.0' });
-      const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
-        requestInit: { headers: { authorization: `Bearer ${token}` } },
-      });
-      await client.connect(transport as unknown as Transport);
-      return client;
-    },
     stop: async () => {
       await watcher.stop();
       await app.close();

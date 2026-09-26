@@ -8,14 +8,20 @@ import {
 } from './sharednet/client.ts';
 
 /**
- * The SharedNet room watcher (spec section 5). For every ACTIVE bound room it long-polls the room
- * with Chorus's own service seat, and turns exactly one kind of message into an effect: a challenge
- * `chorus-verify cvn_<22>` posted by the claimed member. Everything else is ignored and never stored.
+ * The SharedNet room watcher (WP3 rev 3 section 6.3, rev 4 section 6). For every ACTIVE bound room it
+ * long-polls the room with Chorus's own service seat and turns exactly one kind of message into an
+ * effect: a challenge `chorus-verify cvn_<22>` posted by the claimed member. Everything else is ignored
+ * and never stored.
  *
- * Identity comes only from the server-assigned sender fields. The cursor is persisted and monotonic,
- * so a restart resumes where it stopped and duplicate delivery is harmless (verification is a
- * no-op for non-pending enrollments). Auth failures and contract violations take the room out of
- * service (fail closed); transient errors back off and retry.
+ * Identity comes only from the server-assigned sender fields. The cursor is persisted and monotonic, so a
+ * restart resumes where it stopped and duplicate delivery is harmless (verification is a no-op for
+ * non-pending enrollments). Auth failures and contract violations take the room out of service (fail
+ * closed); transient errors back off and retry.
+ *
+ * ONE consumer per room: a loop runs only while its process holds `pg_try_advisory_lock` for the room on
+ * a dedicated connection, and every cursor advance carries the epoch claimed on acquiring it, so an
+ * ex-holder that lost the lock can never move the cursor. A second process simply does not consume that
+ * room until the lock frees (failover).
  */
 export const PROOF_MESSAGE = /^chorus-verify (cvn_[A-Za-z0-9_-]{22})$/;
 
@@ -29,7 +35,7 @@ export interface WatcherOptions {
   readonly secretsKey: Buffer;
   readonly client: SharedNetClient;
   readonly logger?: WatcherLogger;
-  /** How often to look for newly activated rooms. Default 60 s. */
+  /** How often to look for newly activated rooms (and to retry rooms another process holds). Default 60 s. */
   readonly rescanMs?: number;
   /** How often to expire old enrollments. Default 60 s. */
   readonly expireMs?: number;
@@ -51,6 +57,8 @@ interface WatchedRoom {
 }
 
 const noopLogger: WatcherLogger = { info: () => undefined, warn: () => undefined };
+const LOCK_SQL = `SELECT pg_try_advisory_lock(hashtextextended('chorus:room-consumer:' || $1::text, 0)) AS got`;
+const UNLOCK_SQL = `SELECT pg_advisory_unlock(hashtextextended('chorus:room-consumer:' || $1::text, 0))`;
 
 export class RoomWatcher {
   private readonly options: Required<Omit<WatcherOptions, 'logger'>> & { logger: WatcherLogger };
@@ -68,6 +76,11 @@ export class RoomWatcher {
       logger: noopLogger,
       ...options,
     };
+  }
+
+  /** Rooms this instance currently consumes (holds the consumer lease for). */
+  get consuming(): readonly string[] {
+    return [...this.running.keys()];
   }
 
   /** Starts the loops. Safe to call once; returns after the first scan has spawned its loops. */
@@ -104,12 +117,56 @@ export class RoomWatcher {
     for (const room of rows) {
       const key = `${room.workspace_id}/${room.room_id}`;
       if (this.running.has(key)) continue;
-      const loop = this.watchRoom(room).finally(() => this.running.delete(key));
+      const loop = this.consumeRoom(room).finally(() => this.running.delete(key));
       this.running.set(key, loop);
     }
   }
 
-  private async watchRoom(room: WatchedRoom): Promise<void> {
+  /** Takes the consumer lease for the room (or returns quietly if another process holds it) and runs the loop. */
+  private async consumeRoom(room: WatchedRoom): Promise<void> {
+    const { pool, logger } = this.options;
+    const lock = await pool.connect();
+    const lockState = { broken: false };
+    lock.on('error', () => {
+      lockState.broken = true;
+    });
+    let held = false;
+    try {
+      const got = await lock.query<{ got: boolean }>(LOCK_SQL, [room.room_id]);
+      held = got.rows[0]?.got === true;
+      if (!held) return; // another process consumes this room; retried on the next scan
+      const epoch = Number(
+        (
+          await pool.query<{ e: string }>('SELECT chorus_watcher_claim_epoch($1, $2) AS e', [
+            room.workspace_id,
+            room.room_id,
+          ])
+        ).rows[0]?.e,
+      );
+      logger.info({ room_id: room.room_id, epoch }, 'consuming room');
+      await this.watchRoom(room, epoch, async () => {
+        // The lease is only as good as its connection: if it died, another process may hold the lock now.
+        if (lockState.broken) return false;
+        try {
+          await lock.query('SELECT 1');
+          return true;
+        } catch {
+          return false;
+        }
+      });
+    } finally {
+      if (held && !lockState.broken) {
+        await lock.query(UNLOCK_SQL, [room.room_id]).catch(() => undefined);
+      }
+      lock.release(lockState.broken ? true : undefined);
+    }
+  }
+
+  private async watchRoom(
+    room: WatchedRoom,
+    epoch: number,
+    leaseHeld: () => Promise<boolean>,
+  ): Promise<void> {
     const { pool, client, secretsKey, logger, minPollIntervalMs, maxBackoffMs } = this.options;
     const signal = this.abort.signal;
     const log = { room_id: room.room_id, sharednet_room_id: room.external_room_id };
@@ -129,18 +186,28 @@ export class RoomWatcher {
       return;
     }
 
-    let after = Number(room.last_sequence);
+    // Resume from the persisted cursor as it is NOW (a previous holder may have advanced it).
+    const current = await pool.query<{ last_sequence: string }>(
+      'SELECT last_sequence FROM chorus_watcher_rooms() WHERE room_id = $1',
+      [room.room_id],
+    );
+    let after = Number(current.rows[0]?.last_sequence ?? room.last_sequence);
     let failures = 0;
     while (!signal.aborted) {
+      if (!(await leaseHeld())) {
+        logger.warn(log, 'consumer lease lost; stopping this loop');
+        return;
+      }
       const started = Date.now();
       try {
         const page = await client.wait(room.external_room_id, token, after, signal);
         for (const message of page.messages) await this.handleMessage(room, message);
         const highest = page.messages.at(-1)?.sequence ?? after;
-        await pool.query('SELECT chorus_watcher_advance($1, $2, $3, true, NULL)', [
+        await pool.query('SELECT chorus_watcher_advance($1, $2, $3, $4, true, NULL)', [
           room.workspace_id,
           room.room_id,
           highest,
+          epoch,
         ]);
         after = highest;
         failures = 0;
@@ -150,6 +217,10 @@ export class RoomWatcher {
         }
       } catch (error) {
         if (this.abort.signal.aborted) return;
+        if ((error as { code?: string }).code === 'CH003') {
+          logger.warn(log, 'stale consumer epoch; another process took over this room');
+          return;
+        }
         if (error instanceof SharedNetAuthError || error instanceof SharedNetContractError) {
           logger.warn({ ...log, error: error.name }, 'taking room out of service (fail closed)');
           await this.degrade(room, `${error.name}: ${error.message}`);
@@ -163,10 +234,11 @@ export class RoomWatcher {
           'watcher error',
         );
         await pool
-          .query('SELECT chorus_watcher_advance($1, $2, $3, false, $4)', [
+          .query('SELECT chorus_watcher_advance($1, $2, $3, $4, false, $5)', [
             room.workspace_id,
             room.room_id,
             after,
+            epoch,
             (error as Error).name,
           ])
           .catch(() => undefined);
@@ -181,7 +253,7 @@ export class RoomWatcher {
     const match = PROOF_MESSAGE.exec(message.content.trim());
     const nonce = match?.[1];
     if (nonce === undefined) return;
-    await this.options.pool.query('SELECT chorus_enroll_verify($1, $2, $3, $4, $5, $6, $7)', [
+    await this.options.pool.query('SELECT chorus_enroll_verify($1, $2, $3, $4, $5, $6, $7, $8)', [
       room.workspace_id,
       room.room_id,
       nonce,
@@ -189,12 +261,18 @@ export class RoomWatcher {
       message.sequence,
       message.senderPrincipalId,
       message.senderMemberId,
+      message.senderAgentId,
     ]);
   }
 
   private async degrade(room: WatchedRoom, reason: string): Promise<void> {
     await this.options.pool
-      .query('SELECT chorus_watcher_degrade($1, $2, $3)', [room.workspace_id, room.room_id, reason])
+      .query('SELECT chorus_set_room_state($1, $2, $3, $4)', [
+        room.workspace_id,
+        room.room_id,
+        'degraded',
+        reason,
+      ])
       .catch(() => undefined);
   }
 }

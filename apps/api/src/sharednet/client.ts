@@ -9,6 +9,8 @@ export interface SharedNetMessage {
   readonly sequence: number;
   readonly senderPrincipalId: string;
   readonly senderMemberId: string;
+  /** The SharedNet agent tag of the sender, when it has one (used only for `policy_matched` joins). */
+  readonly senderAgentId: string | null;
   readonly content: string;
 }
 
@@ -97,6 +99,7 @@ export function parsePage(body: unknown, after: number): WaitPage {
     const id = item['id'];
     const sequence = item['sequence'];
     const principal = item['sender_principal_id'];
+    const agentRaw = item['sender_agent_id'];
     const content = item['content'];
     if (typeof id !== 'string' || id === '') fail('an item lacks id');
     if (typeof sequence !== 'number' || !Number.isSafeInteger(sequence))
@@ -113,6 +116,7 @@ export function parsePage(body: unknown, after: number): WaitPage {
       sequence,
       senderPrincipalId: principal,
       senderMemberId: memberId,
+      senderAgentId: typeof agentRaw === 'string' && agentRaw !== '' ? agentRaw : null,
       content,
     });
   }

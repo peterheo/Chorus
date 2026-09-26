@@ -3,7 +3,6 @@ import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createMigratedEphemeralDatabase } from '@chorus/database/testing';
 import { buildApp } from '../../src/app.ts';
-import { newChorusToken } from '../../src/auth.ts';
 import { ConfigError } from '../../src/config.ts';
 import { assertRuntimeRole } from '../../src/runtime-role.ts';
 import { openSecret } from '../../src/secrets.ts';
@@ -14,7 +13,6 @@ describe('rate limits, startup guards, health and logging', () => {
   beforeAll(async () => {
     s = await startStack({
       limits: {
-        mcpPerTokenPerMinute: 4,
         enrollStartPerRoomPerMinute: 3,
         enrollStartGlobalPerMinute: 50,
         enrollCompleteGlobalPerMinute: 6,
@@ -25,33 +23,7 @@ describe('rate limits, startup guards, health and logging', () => {
     await s.stop();
   });
 
-  it('http.rate_limit: MCP is limited per token, enrollment per room and globally, each with Retry-After', async () => {
-    const agent = await s.enroll(s.agent('limited'));
-    const other = await s.enroll(s.agent('limited2'));
-    const call = (token: string) =>
-      fetch(`${s.baseUrl}/mcp`, {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${token}`,
-          'content-type': 'application/json',
-          accept: 'application/json, text/event-stream',
-        },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
-      });
-    const statuses: number[] = [];
-    let limited: Response | undefined;
-    for (let i = 0; i < 6; i++) {
-      const r = await call(agent.token);
-      statuses.push(r.status);
-      if (r.status === 429) limited ??= r;
-    }
-    expect(statuses.slice(0, 4)).toEqual([200, 200, 200, 200]);
-    expect(statuses.slice(4)).toEqual([429, 429]);
-    expect(Number(limited?.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
-    expect(await limited?.json()).toMatchObject({ error: 'rate_limited', status: 429 });
-    // Another token is unaffected.
-    expect((await call(other.token)).status).toBe(200);
-
+  it('http.rate_limit: enrollment is limited per room and globally, each with Retry-After', async () => {
     const start = () =>
       fetch(`${s.baseUrl}/v1/enroll/start`, {
         method: 'POST',
@@ -169,15 +141,6 @@ describe('rate limits, startup guards, health and logging', () => {
     await expect(
       s.pool.query(`UPDATE rooms SET activation_state = 'active' WHERE id = $1`, [s.roomId]),
     ).rejects.toMatchObject({ code: '42501' });
-    // Nor can it call the definers with an escalated role set.
-    await expect(
-      s.pool.query('SELECT * FROM chorus_enroll_complete($1, $2, $3, $4)', [
-        '00000000-0000-4000-8000-000000000000',
-        'a'.repeat(64),
-        'b'.repeat(64),
-        ['manager'],
-      ]),
-    ).rejects.toMatchObject({ code: '22023' });
     const throwaway = await createMigratedEphemeralDatabase();
     try {
       // Re-running every migration on a fresh database still yields exactly the intended definer set.
@@ -185,6 +148,7 @@ describe('rate limits, startup guards, health and logging', () => {
         `SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND prosecdef ORDER BY 1`,
       );
       expect(fns.map((f) => f.proname)).toContain('chorus_enroll_complete');
+      expect(fns.map((f) => f.proname)).toContain('chorus_join_session');
       expect(fns.map((f) => f.proname)).not.toContain('chorus_redeem_invite');
     } finally {
       await throwaway.drop();
@@ -205,21 +169,11 @@ describe('logging (default limits)', () => {
     const started = await s.startEnrollment(s.agent('logger'));
     const secretsSeen = [started.secret, started.nonce];
     const enrolled = await s.enroll(s.agent('logger2'));
-    const bad = newChorusToken();
-    await fetch(`${s.baseUrl}/mcp`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${bad}`, 'content-type': 'application/json' },
-      body: '{}',
-    });
-    const client = await s.mcp(enrolled.token);
-    await client.callTool({
-      name: 'chorus_get_task',
-      arguments: { task_id: '00000000-0000-4000-8000-000000000000' },
-    });
-    await client.close();
+    await fetch(`${s.baseUrl}/healthz`);
+    await fetch(`${s.baseUrl}/nope`);
 
     const text = s.logs.join('');
-    for (const secret of [...secretsSeen, enrolled.token, bad, s.seatToken, 'Bearer ']) {
+    for (const secret of [...secretsSeen, enrolled.token, s.seatToken, 'Bearer ']) {
       expect(text, secret.slice(0, 12)).not.toContain(secret);
     }
     const lines = text
@@ -227,7 +181,7 @@ describe('logging (default limits)', () => {
       .filter((l) => l.trim() !== '')
       .map((l) => JSON.parse(l) as Record<string, unknown>);
     const access = lines.filter((l) => l['msg'] === 'request');
-    expect(access.length).toBeGreaterThan(5);
+    expect(access.length).toBeGreaterThan(3);
     for (const line of access) {
       expect(
         Object.keys(line)
@@ -254,8 +208,5 @@ describe('logging (default limits)', () => {
       );
       expect(extra).toEqual([]);
     }
-    expect(
-      access.some((l) => l['tool'] === 'chorus_get_task' && l['actor_id'] === enrolled.actorId),
-    ).toBe(true);
   });
 });

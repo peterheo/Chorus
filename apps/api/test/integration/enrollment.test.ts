@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { resolveToken } from '../../src/auth.ts';
 import { startStack, type Stack, SEAT_MEMBER } from '../helpers/stack.ts';
 
 describe('automated in-room enrollment (real PostgreSQL, fake SharedNet)', () => {
@@ -38,7 +39,6 @@ describe('automated in-room enrollment (real PostgreSQL, fake SharedNet)', () =>
     expect(enrolled).toMatchObject({
       status: 'issued',
       token_type: 'Bearer',
-      roles: ['executor'],
       workspace_id: s.workspaceId,
       room: { id: s.roomId, sharednet_room_id: 'rom_TestRoom01' },
       mcp_url: 'http://127.0.0.1:0/mcp',
@@ -60,15 +60,24 @@ describe('automated in-room enrollment (real PostgreSQL, fake SharedNet)', () =>
     expect(row?.token_sha256).not.toContain(enrolled['token'] as string);
     expect(row).toMatchObject({ kind: 'agent', label: `sharednet:${agent.memberId}` });
 
-    const client = await s.mcp(enrolled['token'] as string);
-    const who = await client.callTool({ name: 'chorus_whoami', arguments: {} });
-    expect(who.structuredContent).toMatchObject({
-      actor_id: enrolled['actor_id'],
+    // The token resolves to the new actor, its instance and the room; enrollment gave NO session access.
+    const auth = await resolveToken(s.pool, enrolled['token'] as string);
+    expect(auth).toMatchObject({
+      actorId: enrolled['actor_id'],
+      instanceId: enrolled['instance_id'],
+      roomId: s.roomId,
+      workspaceId: s.workspaceId,
       kind: 'agent',
-      instance_id: enrolled['instance_id'],
-      rooms: [{ room_id: s.roomId, sharednet_room_id: 'rom_TestRoom01', roles: ['executor'] }],
     });
-    await client.close();
+    expect(enrolled['sessions_hint']).toContain('chorus.list_sessions');
+    expect(
+      await s.owner('SELECT 1 FROM room_members WHERE actor_id = $1 AND removed_at IS NULL', [
+        enrolled['actor_id'],
+      ]),
+    ).toHaveLength(1);
+    expect(
+      await s.owner('SELECT 1 FROM session_members WHERE actor_id = $1', [enrolled['actor_id']]),
+    ).toHaveLength(0);
   });
 
   it('enroll.bystander_replay: a bystander re-posting the nonce verifies nothing; the claimed seat does', async () => {
@@ -168,7 +177,7 @@ describe('automated in-room enrollment (real PostgreSQL, fake SharedNet)', () =>
     const fresh = s.agent('fresh');
     const startedFresh = await s.startEnrollment(fresh);
     const verified = await s.pool.query<{ ok: boolean }>(
-      'SELECT chorus_enroll_verify($1, $2, $3, $4, $5, $6, $7) AS ok',
+      'SELECT chorus_enroll_verify($1, $2, $3, $4, $5, $6, $7, NULL) AS ok',
       [
         s.workspaceId,
         other[0]?.id,
@@ -231,28 +240,61 @@ describe('automated in-room enrollment (real PostgreSQL, fake SharedNet)', () =>
     expect((await s.complete(started.enrollmentId, 'nope')).status).toBe(400);
   });
 
-  it('enroll.roles: everyone verified is an executor; the same principal reuses its actor with a new instance and token', async () => {
-    const agent = s.agent('roles');
+  it('enroll.membership: one actor and one room membership per principal; a new instance and token each time', async () => {
+    const agent = s.agent('member');
     const first = await s.enroll(agent);
-    expect(first.roles).toEqual(['executor']);
     const second = await s.enroll(agent);
     expect(second.actorId).toBe(first.actorId);
-    expect(second.roles).toEqual(['executor']);
     expect(second.instanceId).not.toBe(first.instanceId);
     expect(second.token).not.toBe(first.token);
-    const other = await s.enroll(s.agent('roles-other'));
+    const other = await s.enroll(s.agent('member-other'));
     expect(other.actorId).not.toBe(first.actorId);
     expect(
-      await s.owner(`SELECT 1 FROM room_grants WHERE actor_id = $1 AND revoked_at IS NULL`, [
-        first.actorId,
-      ]),
+      await s.owner('SELECT 1 FROM room_members WHERE actor_id = $1', [first.actorId]),
+    ).toHaveLength(1);
+    expect(
+      await s.owner('SELECT 1 FROM external_identities WHERE actor_id = $1', [first.actorId]),
     ).toHaveLength(1);
     // Old tokens stay valid until they expire or are revoked.
-    for (const t of [first.token, second.token]) {
-      const client = await s.mcp(t);
-      expect((await client.callTool({ name: 'chorus_whoami', arguments: {} })).isError).toBeFalsy();
-      await client.close();
+    for (const t of [first.token, second.token])
+      expect(await resolveToken(s.pool, t)).toMatchObject({ actorId: first.actorId });
+    // A member removed from the room is not re-admitted by enrolling again.
+    await s.owner('UPDATE room_members SET removed_at = now() WHERE actor_id = $1', [
+      first.actorId,
+    ]);
+    expect(await resolveToken(s.pool, first.token)).toBeUndefined();
+    const started = await s.startEnrollment(agent);
+    s.post(agent, started.message);
+    await s.waitFor('verified', async () => {
+      const rows = await s.owner<{ state: string }>('SELECT state FROM enrollments WHERE id = $1', [
+        started.enrollmentId,
+      ]);
+      return rows[0]?.state === 'verified';
+    });
+    expect((await s.complete(started.enrollmentId, started.secret)).status).toBe(404);
+  });
+
+  it('enroll.agent_tag: the SharedNet agent tag of the proof is recorded on the room membership', async () => {
+    const agent = s.agent('tagged');
+    const started = await s.startEnrollment(agent);
+    s.fake.post('rom_TestRoom01', {
+      memberId: agent.memberId,
+      principalId: agent.principalId,
+      content: started.message,
+      agentId: 'a_TaggedAgent1',
+    });
+    let actorId = '';
+    for (let i = 0; i < 200 && actorId === ''; i++) {
+      const response = await s.complete(started.enrollmentId, started.secret);
+      if (response.status === 200)
+        actorId = ((await response.json()) as { actor_id: string }).actor_id;
+      else await new Promise((r) => setTimeout(r, 20));
     }
+    const [row] = await s.owner<{ agent_tag: string | null }>(
+      'SELECT agent_tag FROM room_members WHERE actor_id = $1',
+      [actorId],
+    );
+    expect(row?.agent_tag).toBe('a_TaggedAgent1');
   });
 
   it('enroll.expiry_sweep: old pending and verified enrollments become expired and stop working', async () => {

@@ -8,6 +8,8 @@ export interface AuthContext {
   readonly kind: string;
   readonly instanceId: Uuid | null;
   readonly tokenExpiresAt: Date | null;
+  /** The room this token is scoped to. */
+  readonly roomId: Uuid;
   /** Stable, non-secret handle for rate limiting and logging (a prefix of the token's sha256). */
   readonly tokenKey: string;
 }
@@ -36,6 +38,7 @@ export async function resolveToken(pool: pg.Pool, token: string): Promise<AuthCo
     actor_kind: string;
     instance_id: Uuid | null;
     token_expires_at: Date | null;
+    room_id: Uuid;
   }>('SELECT * FROM chorus_resolve_token($1)', [hash]);
   const row = rows[0];
   if (row === undefined) return undefined;
@@ -45,6 +48,7 @@ export async function resolveToken(pool: pg.Pool, token: string): Promise<AuthCo
     kind: row.actor_kind,
     instanceId: row.instance_id,
     tokenExpiresAt: row.token_expires_at,
+    roomId: row.room_id,
     tokenKey: hash.slice(0, 16),
   };
 }

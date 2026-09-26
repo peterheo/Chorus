@@ -5,7 +5,6 @@ import { withReadTx, type Uuid } from '@chorus/domain';
 import { newChorusToken, sha256Hex } from './auth.ts';
 import { sendError } from './http.ts';
 import type { RateLimiter } from './rate-limit.ts';
-import { rolesForEnrollment } from './roles.ts';
 
 /**
  * Automated enrollment (spec section 4). A SharedNet participant proves control of its OWN seat by
@@ -158,11 +157,6 @@ export function registerEnrollRoutes(app: FastifyInstance, deps: EnrollDeps): vo
       return invalid();
     }
 
-    const roles = rolesForEnrollment({
-      principalId: current.proof_principal_id,
-      workspaceId: current.workspace_id,
-      roomId: current.room_id,
-    });
     const token = newChorusToken();
     const completed = await deps.pool.query<{
       status: string;
@@ -172,12 +166,7 @@ export function registerEnrollRoutes(app: FastifyInstance, deps: EnrollDeps): vo
       instance_id: Uuid | null;
       roles: string[] | null;
       token_expires_at: Date | null;
-    }>('SELECT * FROM chorus_enroll_complete($1, $2, $3, $4)', [
-      id,
-      secretHash,
-      sha256Hex(token),
-      roles,
-    ]);
+    }>('SELECT * FROM chorus_enroll_complete($1, $2, $3)', [id, secretHash, sha256Hex(token)]);
     const issued = completed.rows[0];
     if (issued === undefined || issued.status === 'invalid') return invalid();
     if (issued.status === 'pending') return pending();
@@ -186,7 +175,6 @@ export function registerEnrollRoutes(app: FastifyInstance, deps: EnrollDeps): vo
       issued.workspace_id === null ||
       issued.room_id === null ||
       issued.instance_id === null ||
-      issued.roles === null ||
       issued.token_expires_at === null
     ) {
       return invalid();
@@ -217,8 +205,8 @@ export function registerEnrollRoutes(app: FastifyInstance, deps: EnrollDeps): vo
         instance_id: issued.instance_id,
         workspace_id: issued.workspace_id,
         room: { id: issued.room_id, sharednet_room_id: sharednetRoomId },
-        roles: issued.roles,
         mcp_url: `${deps.publicBaseUrl}/mcp`,
+        sessions_hint: 'Call chorus.list_sessions, then chorus.join_session, to work in a session.',
         note: 'Shown once. Re-enroll before token_expires_at to continue.',
       });
   });

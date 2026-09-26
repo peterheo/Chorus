@@ -58,7 +58,8 @@ DATABASE_URL=postgres://chorus:chorus@localhost:5432/chorus_dev pnpm migrate
 
 ## Service (`apps/api`)
 
-One Node process serves HTTP, the MCP endpoint and the SharedNet room watcher.
+One Node process serves HTTP and the SharedNet room watcher (MCP arrives with the SharedOS host in the
+next phase).
 
 ```sh
 export DATABASE_URL_APP=postgres://chorus_app:<password>@localhost:5432/chorus_dev  # the chorus_app role
@@ -77,10 +78,15 @@ pnpm --filter @chorus/api start                        # listens on 127.0.0.1:18
 | `SHAREDNET_BASE_URL`     | no         | default `https://www.sharednet.ai`.                                           |
 | `GIT_COMMIT`             | no         | reported by `/healthz`.                                                       |
 
-- `POST /mcp` — MCP Streamable HTTP, stateless, JSON responses only (no SSE); bearer token required.
 - `POST /v1/enroll/start`, `POST /v1/enroll/complete` — automated enrollment from an existing SharedNet
   room: post the returned `chorus-verify cvn_...` challenge from your own seat, then complete with your
   private secret. Chorus never creates SharedNet rooms and never sees your SharedNet token.
 - `GET /healthz` — commit, database and per-room watcher state.
 
-Every verified member currently receives the `executor` role; richer role policy is pending.
+## Model
+
+SharedNet room (one workspace) → **session** → board → work items. The session is the authorization
+boundary: room membership only proves transport identity. Roles are session-scoped and combinable
+(`participant`, `manager`, `administrator`); item-relative identities (owner, assigned reviewer) and the
+review-separation rules are enforced by the domain, and session isolation by PostgreSQL row-level
+security (`chorus_my_sessions()`). One watcher consumer per room, fenced by an advisory lock and epoch.

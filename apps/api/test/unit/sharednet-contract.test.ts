@@ -7,6 +7,7 @@ const item = (over: Record<string, unknown> = {}) => ({
   sequence: 5,
   sender_principal_id: 'p_abcdef1234',
   sender_instance_id: 'i_abcdef1234',
+  sender_agent_id: null,
   sender: { member_id: 'i_abcdef1234', kind: 'guest', name: 'n' },
   content: 'hi',
   ...over,
