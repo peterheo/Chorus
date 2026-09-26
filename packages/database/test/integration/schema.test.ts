@@ -51,9 +51,17 @@ describe('core schema constraints (real PostgreSQL)', () => {
   const newRevision = async (t: Tenant, taskId: string, content: string, revision = 1) => {
     await db.query(
       `INSERT INTO task_result_revisions
-         (workspace_id, task_id, revision, content, content_sha256, submitted_by, fence)
-       VALUES ($1, $2, $3, $4, $5, $6, 1)`,
-      [t.workspaceId, taskId, revision, content, sha256(content), t.actorId],
+         (workspace_id, task_id, revision, content, content_sha256, byte_length, submitted_by, fence)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 1)`,
+      [
+        t.workspaceId,
+        taskId,
+        revision,
+        content,
+        sha256(content),
+        Buffer.byteLength(content),
+        t.actorId,
+      ],
     );
   };
 
@@ -165,8 +173,8 @@ describe('core schema constraints (real PostgreSQL)', () => {
       await expect(
         db.query(
           `INSERT INTO task_result_revisions
-             (workspace_id, task_id, revision, content, content_sha256, submitted_by, fence)
-           VALUES ($1, $2, 2, 'real bytes', $3, $4, 1)`,
+             (workspace_id, task_id, revision, content, content_sha256, byte_length, submitted_by, fence)
+           VALUES ($1, $2, 2, 'real bytes', $3, 10, $4, 1)`,
           [a.workspaceId, id, sha256('other bytes'), a.actorId],
         ),
       ).rejects.toMatchObject({ code: '23514' });
@@ -278,12 +286,12 @@ describe('core schema constraints (real PostgreSQL)', () => {
       await expect(
         db.query(
           `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256) VALUES ($1, $2, 'plaintext-token')`,
-          [a.workspaceId, a.actorId],
+          [a.workspaceId, a.otherActorId],
         ),
       ).rejects.toMatchObject({ code: '23514' });
       await db.query(
         `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256) VALUES ($1, $2, $3)`,
-        [a.workspaceId, a.actorId, sha256('secret')],
+        [a.workspaceId, a.otherActorId, sha256('secret')],
       );
     });
 

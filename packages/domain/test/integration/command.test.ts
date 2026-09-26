@@ -40,7 +40,7 @@ async function waitFor(condition: () => Promise<boolean>, what: string): Promise
 describe('runCommand (real PostgreSQL)', () => {
   let f: Fixture;
   beforeAll(async () => {
-    f = await createFixture();
+    f = await createFixture({ poolMax: 24 });
   });
   afterAll(async () => {
     await f.close();
