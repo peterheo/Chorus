@@ -30,6 +30,8 @@ export interface CommandContext {
   readonly pool: pg.Pool;
   readonly workspaceId: Uuid;
   readonly actorId: Uuid;
+  /** The agent instance bound to the caller's API token; null for human/service actors. Set by the caller layer. */
+  readonly instanceId: Uuid | null;
   /** Lease length for claim/renew, in seconds. Default {@link DEFAULT_LEASE_DURATION_SECONDS}. */
   readonly leaseDurationSeconds?: number;
   /** `Idempotency-Key` (REST) or the explicit MCP argument. Required on every mutation. */
@@ -51,7 +53,12 @@ export interface LockedWorkItem {
 /** An existing work item the command mutates, with the version the caller last saw. */
 export interface CommandTarget {
   readonly id: Uuid;
+  /** Required unless `lockOnly`. */
   readonly expectedVersion?: number | undefined;
+  /** Locked in the same sorted pass but exempt from the version check; `bumpVersion` rejects it. */
+  readonly lockOnly?: boolean;
+  /** When set, a target of another kind is indistinguishable from a missing one: `not_found`. */
+  readonly kind?: WorkItemKind;
 }
 
 export interface DomainEventDraft {
@@ -69,6 +76,8 @@ export interface CommandTx {
   readonly workspaceId: Uuid;
   readonly actorId: Uuid;
   readonly commandId: Uuid;
+  /** The caller's agent instance (from the API token), or null. */
+  readonly instanceId: Uuid | null;
   /** Resolved lease length in seconds; the single source for claim and renew. */
   readonly leaseDurationSeconds: number;
   /** Rows locked FOR UPDATE for `targets`, keyed by id. */
@@ -230,6 +239,7 @@ async function executeInTransaction<TResult extends CommandResult>(
         workspaceId,
         actorId,
         commandId: row.id,
+        instanceId: ctx.instanceId,
         leaseDurationSeconds: resolveLeaseDurationSeconds(ctx.leaseDurationSeconds),
         items: replayItems,
         bumpVersion: () => {
@@ -251,19 +261,23 @@ async function executeInTransaction<TResult extends CommandResult>(
 
   const items = await loadTargets(client, workspaceId, spec.targets ?? [], true);
   const bumped = new Map<Uuid, number>();
+  const lockOnlyIds = new Set(
+    (spec.targets ?? []).filter((t) => t.lockOnly === true).map((t) => t.id),
+  );
   const tx: CommandTx = {
     db: client,
     workspaceId,
     actorId,
     commandId,
+    instanceId: ctx.instanceId,
     leaseDurationSeconds: resolveLeaseDurationSeconds(ctx.leaseDurationSeconds),
     items,
     bumpVersion: async (itemId) => {
       const locked = items.get(itemId);
-      if (locked === undefined) {
+      if (locked === undefined || lockOnlyIds.has(itemId)) {
         throw new ChorusError(
           'internal_error',
-          'bumpVersion called on an item that is not a locked target.',
+          'bumpVersion called on an item that is not a versioned locked target.',
         );
       }
       const updated = await client.query<{ version: number }>(
@@ -339,6 +353,12 @@ async function loadTargets(
   }
   // Missing ids are indistinguishable from other workspaces' ids (and RLS-hidden rows): not found.
   if (items.size !== ids.length) throw new ChorusError('not_found', 'Not found.');
+  // So is an item of the wrong kind (a review id passed where a task is expected, and vice versa).
+  for (const target of targets) {
+    if (target.kind !== undefined && items.get(target.id)?.kind !== target.kind) {
+      throw new ChorusError('not_found', 'Not found.');
+    }
+  }
   return items;
 }
 
@@ -347,6 +367,7 @@ function checkExpectedVersions(
   items: ReadonlyMap<Uuid, LockedWorkItem>,
 ): void {
   for (const target of targets) {
+    if (target.lockOnly === true) continue;
     const current = items.get(target.id)?.version;
     if (current === undefined) continue; // lockTargets already guaranteed presence
     if (target.expectedVersion === undefined) {
@@ -523,7 +544,11 @@ export function hashRequest(spec: {
   readonly targets?: readonly CommandTarget[] | undefined;
 }): string {
   const targets = [...(spec.targets ?? [])]
-    .map((t) => ({ id: t.id, expected_version: t.expectedVersion ?? null }))
+    .map((t) => ({
+      id: t.id,
+      expected_version: t.expectedVersion ?? null,
+      lock_only: t.lockOnly === true,
+    }))
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   return createHash('sha256')
     .update(canonicalJson({ type: spec.type, targets, input: spec.input }), 'utf8')

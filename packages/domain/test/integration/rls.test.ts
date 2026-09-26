@@ -46,11 +46,10 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
   };
 
   async function seedEverything(ws: Workspace, label: string): Promise<Uuid> {
-    await owner(`INSERT INTO agent_instances (workspace_id, actor_id, label) VALUES ($1, $2, $3)`, [
-      ws.id,
-      ws.executorId,
-      `${label}-instance`,
-    ]);
+    const seedInstance = await first(
+      `INSERT INTO agent_instances (workspace_id, actor_id, label) VALUES ($1, $2, $3) RETURNING id`,
+      [ws.id, ws.executorId, `${label}-instance`],
+    );
     await owner(`INSERT INTO projects (workspace_id, room_id, name) VALUES ($1, $2, $3)`, [
       ws.id,
       ws.roomId,
@@ -71,9 +70,9 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
     ]);
     const content = `${label} result`;
     await owner(
-      `INSERT INTO task_result_revisions (workspace_id, task_id, revision, content, content_sha256, submitted_by, fence)
-       VALUES ($1, $2, 1, $3, $4, $5, 1)`,
-      [ws.id, task, content, sha256(content), ws.executorId],
+      `INSERT INTO task_result_revisions (workspace_id, task_id, revision, content, content_sha256, byte_length, submitted_by, fence)
+       VALUES ($1, $2, 1, $3, $4, $5, $6, 1)`,
+      [ws.id, task, content, sha256(content), Buffer.byteLength(content), ws.executorId],
     );
     const review = await first(
       `INSERT INTO work_items (workspace_id, kind, home_room_id, title, state, creator_actor_id)
@@ -86,8 +85,8 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
       [ws.id, review, task, sha256(content)],
     );
     await owner(
-      `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256) VALUES ($1, $2, $3)`,
-      [ws.id, ws.executorId, sha256(`${label}-token`)],
+      `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, instance_id) VALUES ($1, $2, $3, $4)`,
+      [ws.id, ws.executorId, sha256(`${label}-token`), seedInstance],
     );
     await owner(
       `INSERT INTO invites (workspace_id, room_id, role, code_sha256, expires_at)
@@ -348,6 +347,8 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
         created_at timestamptz DEFAULT now())`,
       room_grants: `CREATE TEMP TABLE room_grants (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, actor_id uuid, room_id uuid,
         role text, granted_at timestamptz DEFAULT now(), revoked_at timestamptz)`,
+      agent_instances: `CREATE TEMP TABLE agent_instances (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, actor_id uuid,
+        label text, created_at timestamptz DEFAULT now())`,
       api_tokens: `CREATE TEMP TABLE api_tokens (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, actor_id uuid,
         token_sha256 text, created_at timestamptz DEFAULT now(), expires_at timestamptz, revoked_at timestamptz)`,
     };
@@ -402,7 +403,7 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
         );
         const client = await f.pool.connect();
         try {
-          for (const table of ['actors', 'room_grants', 'api_tokens']) {
+          for (const table of ['actors', 'agent_instances', 'room_grants', 'api_tokens']) {
             await client.query(LOOKALIKE[table] ?? '');
           }
           const { rows } = await client.query<{ actor_id: string }>(
@@ -453,6 +454,122 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
     });
   });
 
+  describe('rls.definer.hardening_v2 (migration 0004)', () => {
+    it("cannot create an agent token without an instance, or with another actor's instance", async () => {
+      await expect(
+        owner(`INSERT INTO api_tokens (workspace_id, actor_id, token_sha256) VALUES ($1, $2, $3)`, [
+          f.a.id,
+          f.a.executor2Id,
+          sha256('no-instance-token'),
+        ]),
+      ).rejects.toMatchObject({ code: '23000' });
+      const foreign = await first(
+        `INSERT INTO agent_instances (workspace_id, actor_id, label) VALUES ($1, $2, 'foreign') RETURNING id`,
+        [f.a.id, f.a.executorId],
+      );
+      await expect(
+        owner(
+          `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, instance_id) VALUES ($1, $2, $3, $4)`,
+          [f.a.id, f.a.executor2Id, sha256('wrong-owner-token'), foreign],
+        ),
+      ).rejects.toMatchObject({ code: '23000' });
+      // One instance serves one token.
+      await expect(
+        owner(
+          `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, instance_id) VALUES ($1, $2, $3, $4)`,
+          [f.a.id, f.a.executorId, sha256('second-token-same-instance'), foreign],
+        ),
+      ).resolves.toBeDefined();
+      await expect(
+        owner(
+          `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, instance_id) VALUES ($1, $2, $3, $4)`,
+          [f.a.id, f.a.executorId, sha256('third-token-same-instance'), foreign],
+        ),
+      ).rejects.toMatchObject({ code: '23505' });
+      // Human and service actors may have instance-less tokens.
+      await owner(
+        `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256) VALUES ($1, $2, $3)`,
+        [
+          f.a.id,
+          f.a.reviewerId === f.a.executorId ? f.a.executorId : await humanActor(),
+          sha256('human-token'),
+        ],
+      );
+    });
+
+    async function humanActor(): Promise<Uuid> {
+      return (await first(
+        `INSERT INTO actors (workspace_id, kind, display_name) VALUES ($1, 'human', 'h') RETURNING id`,
+        [f.a.id],
+      )) as Uuid;
+    }
+
+    it('redeeming an invite creates exactly one instance bound to the new token', async () => {
+      await owner(
+        `INSERT INTO invites (workspace_id, room_id, role, code_sha256, expires_at)
+         VALUES ($1, $2, 'executor', $3, now() + interval '1 hour')`,
+        [f.a.id, f.a.roomId, sha256('v2-code')],
+      );
+      const { rows } = await f.pool.query<{ actor_id: string }>(
+        'SELECT * FROM chorus_redeem_invite($1, $2, $3)',
+        [sha256('v2-code'), sha256('v2-token'), 'v2 agent'],
+      );
+      const actorId = rows[0]?.actor_id;
+      expect(actorId).toBeDefined();
+      expect(
+        await f.count(`SELECT count(*) AS n FROM agent_instances WHERE actor_id = $1`, [actorId]),
+      ).toBe(1);
+      const [token] = await owner<{ instance_id: string; label: string }>(
+        `SELECT t.instance_id, i.label FROM api_tokens t JOIN agent_instances i ON i.id = t.instance_id
+          WHERE t.token_sha256 = $1`,
+        [sha256('v2-token')],
+      );
+      expect(token?.label).toBe('v2 agent');
+    });
+
+    it('lets an actor see only its own agent_instances', async () => {
+      const other = await f.addActor(f.a, { roomId: f.a.roomId, role: 'executor' });
+      const mine = await f.addInstance(f.a, other);
+      expect(await countAs(f.a, other, 'agent_instances', `id = '${mine}'`)).toBe(1);
+      // executor2 shares the room but cannot see it.
+      expect(await countAs(f.a, f.a.executor2Id, 'agent_instances', `id = '${mine}'`)).toBe(0);
+    });
+  });
+
+  describe('immutability.after_0004', () => {
+    it('still rejects UPDATE and DELETE of a result revision after the ALTERs, as owner and as chorus_app', async () => {
+      const { createTask, claim, submitResult } = await import('../../src/index.ts');
+      const manager = await f.addActor(f.a, { roomId: f.a.roomId, role: 'manager' });
+      const executor = await f.addActor(f.a, { roomId: f.a.roomId, role: 'executor' });
+      const instance = await f.addInstance(f.a, executor);
+      const { task } = await createTask(f.ctx(f.a, manager, 'imm-create'), {
+        room_id: f.a.roomId,
+        title: 'immutable',
+        acceptance_criteria: ['c'],
+      });
+      const c = await claim(f.ctx(f.a, executor, 'imm-claim', instance), {
+        task_id: task.id,
+        expected_version: 1,
+      });
+      await submitResult(f.ctx(f.a, executor, 'imm-submit', instance), {
+        task_id: task.id,
+        expected_version: c.version,
+        fence: c.fence,
+        content: 'bytes',
+        content_type: 'text/plain',
+        criteria_mapping: [{ criterion: 0, note: 'done' }],
+      });
+      for (const sql of [
+        `UPDATE task_result_revisions SET criteria_mapping = '[]' WHERE task_id = $1`,
+        `UPDATE task_result_revisions SET byte_length = 0 WHERE task_id = $1`,
+        `DELETE FROM task_result_revisions WHERE task_id = $1`,
+      ]) {
+        await expect(owner(sql, [task.id])).rejects.toMatchObject({ code: '23000' });
+        await expect(f.pool.query(sql, [task.id])).rejects.toMatchObject({ code: '42501' });
+      }
+    });
+  });
+
   describe('append-only guarantees at the privilege level', () => {
     it.each([
       'UPDATE task_result_revisions SET content_type = $1',
@@ -480,21 +597,39 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
       (await f.pool.query('SELECT * FROM chorus_resolve_token($1)', [sha256(token)])).rows as {
         actor_id: string;
         workspace_id: string;
+        actor_kind: string;
+        instance_id: string | null;
       }[];
 
-    it('resolves a live token to its actor and workspace only', async () => {
+    it('resolves a live token to its actor, workspace, actor kind and bound instance only', async () => {
       const rows = await resolve('a-token');
-      expect(rows).toEqual([{ actor_id: f.a.executorId, workspace_id: f.a.id }]);
+      const [instance] = await owner<{ id: string }>(
+        `SELECT instance_id AS id FROM api_tokens WHERE token_sha256 = $1`,
+        [sha256('a-token')],
+      );
+      expect(rows).toEqual([
+        {
+          actor_id: f.a.executorId,
+          workspace_id: f.a.id,
+          actor_kind: 'agent',
+          instance_id: instance?.id,
+        },
+      ]);
     });
 
     it('returns nothing for revoked, expired and unknown tokens', async () => {
+      const instanceFor = (label: string) =>
+        first(
+          `INSERT INTO agent_instances (workspace_id, actor_id, label) VALUES ($1, $2, $3) RETURNING id`,
+          [f.a.id, f.a.executorId, label],
+        );
       await owner(
-        `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, revoked_at) VALUES ($1, $2, $3, now())`,
-        [f.a.id, f.a.executorId, sha256('revoked-token')],
+        `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, instance_id, revoked_at) VALUES ($1, $2, $3, $4, now())`,
+        [f.a.id, f.a.executorId, sha256('revoked-token'), await instanceFor('revoked')],
       );
       await owner(
-        `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, expires_at) VALUES ($1, $2, $3, now() - interval '1 second')`,
-        [f.a.id, f.a.executorId, sha256('expired-token')],
+        `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, instance_id, expires_at) VALUES ($1, $2, $3, $4, now() - interval '1 second')`,
+        [f.a.id, f.a.executorId, sha256('expired-token'), await instanceFor('expired')],
       );
       expect(await resolve('revoked-token')).toEqual([]);
       expect(await resolve('expired-token')).toEqual([]);
@@ -587,9 +722,14 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
       const resolved = (
         await f.pool.query('SELECT * FROM chorus_resolve_token($1)', [sha256('e2e-token')])
       ).rows;
-      expect(resolved).toEqual([
-        { actor_id: redeemed.actor_id, workspace_id: redeemed.workspace_id },
+      expect(resolved).toMatchObject([
+        {
+          actor_id: redeemed.actor_id,
+          workspace_id: redeemed.workspace_id,
+          actor_kind: 'agent',
+        },
       ]);
+      expect((resolved[0] as { instance_id: string | null }).instance_id).not.toBeNull();
 
       const ctx = f.ctx(f.a, redeemed.actor_id, 'e2e-create');
       const created = await runCommand(

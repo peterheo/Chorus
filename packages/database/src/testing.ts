@@ -52,19 +52,18 @@ export async function createEphemeralDatabase(): Promise<EphemeralDatabase> {
   appUrl.username = APP_ROLE;
   appUrl.password = TEST_APP_PASSWORD;
 
+  // One small pool per ephemeral database: parallel test files must not exhaust max_connections.
+  const pool = new pg.Pool({ connectionString: url.toString(), max: 3 });
+  pool.on('error', () => undefined);
+
   return {
     url: url.toString(),
     appUrl: appUrl.toString(),
     async query<T extends pg.QueryResultRow>(sql: string, params: unknown[] = []) {
-      const client = new pg.Client({ connectionString: url.toString() });
-      await client.connect();
-      try {
-        return (await client.query<T>(sql, params)).rows;
-      } finally {
-        await client.end();
-      }
+      return (await pool.query<T>(sql, params)).rows;
     },
     async drop() {
+      await pool.end();
       const dropper = new pg.Client({ connectionString: adminUrl });
       await dropper.connect();
       try {

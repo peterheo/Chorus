@@ -25,18 +25,25 @@ export interface Fixture {
   pool: pg.Pool;
   a: Workspace;
   b: Workspace;
-  ctx: (workspace: Workspace, actorId: Uuid, key: string | undefined) => CommandContext;
+  ctx: (
+    workspace: Workspace,
+    actorId: Uuid,
+    key: string | undefined,
+    instanceId?: Uuid | null,
+  ) => CommandContext;
   count: (sql: string, params?: unknown[]) => Promise<number>;
   /** Owner-side seeding: a new agent in the workspace, optionally granted a role in a room. */
   addActor: (workspace: Workspace, grant?: { roomId: Uuid; role: string }) => Promise<Uuid>;
   addRoom: (workspace: Workspace, name: string) => Promise<Uuid>;
+  /** Owner-side seeding: an agent instance for an actor (the per-token identity a claim uses). */
+  addInstance: (workspace: Workspace, actorId: Uuid) => Promise<Uuid>;
   close: () => Promise<void>;
 }
 
 export async function createFixture(): Promise<Fixture> {
   const db = await createMigratedEphemeralDatabase();
   // The pool connects as the non-owner runtime role, so RLS applies to every command under test.
-  const pool = new pg.Pool({ connectionString: db.appUrl, max: 40 });
+  const pool = new pg.Pool({ connectionString: db.appUrl, max: 8 });
 
   const one = async <T extends string>(sql: string, params: unknown[]): Promise<T> => {
     const [row] = await db.query<{ id: T }>(sql, params);
@@ -80,10 +87,11 @@ export async function createFixture(): Promise<Fixture> {
     pool,
     a,
     b,
-    ctx: (workspace, actorId, key) => ({
+    ctx: (workspace, actorId, key, instanceId = null) => ({
       pool,
       workspaceId: workspace.id,
       actorId,
+      instanceId,
       idempotencyKey: key,
     }),
     addActor: async (workspace, grant) => {
@@ -99,6 +107,11 @@ export async function createFixture(): Promise<Fixture> {
       }
       return actorId;
     },
+    addInstance: (workspace, actorId) =>
+      one<Uuid>(
+        `INSERT INTO agent_instances (workspace_id, actor_id, label) VALUES ($1, $2, 'test-instance') RETURNING id`,
+        [workspace.id, actorId],
+      ),
     addRoom: (workspace, name) =>
       one<Uuid>('INSERT INTO rooms (workspace_id, name) VALUES ($1, $2) RETURNING id', [
         workspace.id,
