@@ -28,7 +28,13 @@ const READABLE = [
   'domain_events',
 ] as const;
 /** Tables with no privileges for the runtime role at all. */
-const NO_ACCESS = ['api_tokens', 'invites'] as const;
+const NO_ACCESS = [
+  'api_tokens',
+  'sharednet_seats',
+  'sharednet_cursors',
+  'external_identities',
+  'enrollments',
+] as const;
 
 describe('row-level security, as the runtime role chorus_app (real PostgreSQL)', () => {
   let f: Fixture;
@@ -44,6 +50,30 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
     if (row === undefined) throw new Error('expected a row');
     return row.id;
   };
+
+  const randomId = (prefix: string, n: number) =>
+    `${prefix}${sha256(String(Math.random()) + prefix).slice(0, n)}`;
+
+  /** Owner-side: a VERIFIED enrollment (as the watcher would leave it) for the given principal. */
+  async function seedVerifiedEnrollment(
+    ws: Workspace,
+    opts: { principal?: string; member?: string; secret?: string; roomId?: Uuid } = {},
+  ) {
+    const secret = opts.secret ?? randomId('cvs_', 30);
+    const principal = opts.principal ?? randomId('p_', 12);
+    const member = opts.member ?? randomId('i_', 12);
+    const nonce = `cvn_${sha256(secret).slice(0, 22)}`;
+    const id = await first(
+      `INSERT INTO enrollments
+         (workspace_id, room_id, claimed_member_id, display_name, nonce, secret_sha256, state,
+          created_at, expires_at, start_sequence, verified_at, proof_message_id, proof_sequence,
+          proof_principal_id, proof_member_id)
+       VALUES ($1, $2, $3, 'enrolled agent', $4, $5, 'verified', now(), now() + interval '10 minutes', 0,
+               now(), 'msg_test', 5, $6, $3) RETURNING id`,
+      [ws.id, opts.roomId ?? ws.roomId, member, nonce, sha256(secret), principal],
+    );
+    return { id, secret, principal, member, nonce };
+  }
 
   async function seedEverything(ws: Workspace, label: string): Promise<Uuid> {
     const seedInstance = await first(
@@ -87,11 +117,6 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
     await owner(
       `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, instance_id) VALUES ($1, $2, $3, $4)`,
       [ws.id, ws.executorId, sha256(`${label}-token`), seedInstance],
-    );
-    await owner(
-      `INSERT INTO invites (workspace_id, room_id, role, code_sha256, expires_at)
-       VALUES ($1, $2, 'executor', $3, now() + interval '1 hour')`,
-      [ws.id, ws.roomId, sha256(`${label}-invite`)],
     );
     // A real command gives us commands + domain_events rows.
     await runCommand(
@@ -150,7 +175,8 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
       }>(
         `SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity
            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND c.relname <> 'schema_migrations'`,
+          WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+            AND c.relname NOT IN ('schema_migrations', 'admin_audit_log')`,
       );
       expect(tables.map((t) => t.relname).sort()).toEqual([...READABLE, ...NO_ACCESS].sort());
       for (const t of tables) {
@@ -161,7 +187,27 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
       }
     });
 
-    it('lets only the three intended SECURITY DEFINER functions bypass RLS, with a pinned search_path', async () => {
+    it('exempts exactly schema_migrations and admin_audit_log, and chorus_app has no privilege on the latter', async () => {
+      const all = await owner<{ relname: string }>(
+        `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relrowsecurity ORDER BY 1`,
+      );
+      expect(all.map((t) => t.relname)).toEqual(['admin_audit_log', 'schema_migrations']);
+      await expect(f.pool.query('SELECT 1 FROM admin_audit_log')).rejects.toMatchObject({
+        code: '42501',
+      });
+      await expect(
+        f.pool.query(`INSERT INTO admin_audit_log (operator, command) VALUES ('x', 'y')`),
+      ).rejects.toMatchObject({ code: '42501' });
+      // The audit log is append-only even for the owner.
+      await owner(`INSERT INTO admin_audit_log (operator, command) VALUES ('op', 'test')`);
+      await expect(owner(`UPDATE admin_audit_log SET command = 'x'`)).rejects.toMatchObject({
+        code: '23000',
+      });
+      await expect(owner('DELETE FROM admin_audit_log')).rejects.toMatchObject({ code: '23000' });
+    });
+
+    it('lets only the intended SECURITY DEFINER functions bypass RLS, with a pinned search_path', async () => {
       const fns = await owner<{
         proname: string;
         proconfig: string[] | null;
@@ -172,9 +218,17 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
           WHERE n.nspname = 'public' AND p.prosecdef ORDER BY p.proname`,
       );
       expect(fns.map((x) => x.proname)).toEqual([
-        'chorus_redeem_invite',
+        'chorus_enroll_complete',
+        'chorus_enroll_start',
+        'chorus_enroll_status',
+        'chorus_enroll_verify',
+        'chorus_expire_enrollments',
         'chorus_resolve_token',
+        'chorus_room_health',
         'chorus_visible_rooms',
+        'chorus_watcher_advance',
+        'chorus_watcher_degrade',
+        'chorus_watcher_rooms',
       ]);
       for (const fn of fns) {
         // pg_temp must come LAST; when omitted Postgres searches it first and temp tables can shadow.
@@ -341,8 +395,17 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
 
     /** Attacker-style lookalikes: explicit columns, because LIKE would need SELECT the role lacks. */
     const LOOKALIKE: Record<string, string> = {
-      invites: `CREATE TEMP TABLE invites (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, room_id uuid, role text,
-        code_sha256 text, created_at timestamptz DEFAULT now(), expires_at timestamptz, used_at timestamptz, used_by_actor_id uuid)`,
+      rooms: `CREATE TEMP TABLE rooms (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, name text,
+        created_at timestamptz DEFAULT now(), provider text, external_room_id text, activation_state text)`,
+      sharednet_cursors: `CREATE TEMP TABLE sharednet_cursors (workspace_id uuid, room_id uuid, last_sequence bigint,
+        updated_at timestamptz DEFAULT now(), last_error text, last_ok_at timestamptz)`,
+      enrollments: `CREATE TEMP TABLE enrollments (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, room_id uuid,
+        claimed_member_id text, display_name text, nonce text, secret_sha256 text, state text,
+        created_at timestamptz DEFAULT now(), expires_at timestamptz, start_sequence bigint, verified_at timestamptz,
+        proof_message_id text, proof_sequence bigint, proof_principal_id text, proof_member_id text,
+        consumed_at timestamptz, issued_actor_id uuid, issued_token_id uuid)`,
+      external_identities: `CREATE TEMP TABLE external_identities (workspace_id uuid, actor_id uuid, provider text,
+        principal_id text, first_seen_at timestamptz DEFAULT now())`,
       actors: `CREATE TEMP TABLE actors (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, kind text, display_name text,
         created_at timestamptz DEFAULT now())`,
       room_grants: `CREATE TEMP TABLE room_grants (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, actor_id uuid, room_id uuid,
@@ -367,74 +430,113 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
         await owner(`REVOKE TEMPORARY ON DATABASE ${db()} FROM chorus_app`);
       });
 
-      it('chorus_redeem_invite ignores a forged temp invites table', async () => {
+      it('chorus_enroll_start ignores a forged temp rooms/cursor pair', async () => {
         const client = await f.pool.connect();
         try {
-          await client.query(LOOKALIKE['invites'] ?? '');
-          await client.query(
-            `INSERT INTO pg_temp.invites (workspace_id, room_id, role, code_sha256, expires_at)
-             VALUES ($1, $2, 'manager', $3, now() + interval '1 hour')`,
-            [f.a.id, f.a.roomId, sha256('forged-code')],
+          await client.query(LOOKALIKE['rooms'] ?? '');
+          await client.query(LOOKALIKE['sharednet_cursors'] ?? '');
+          const forgedRoom = await client.query<{ id: string }>(
+            `INSERT INTO pg_temp.rooms (workspace_id, name, provider, external_room_id, activation_state)
+             VALUES ($1, 'forged', 'sharednet', 'rom_forgedroom1', 'active') RETURNING id`,
+            [f.a.id],
           );
-          const { rows } = await client.query('SELECT * FROM chorus_redeem_invite($1, $2, $3)', [
-            sha256('forged-code'),
-            sha256('forged-token'),
-            'attacker',
-          ]);
-          expect(rows).toEqual([]);
+          await client.query(
+            `INSERT INTO pg_temp.sharednet_cursors (workspace_id, room_id, last_sequence, last_ok_at)
+             VALUES ($1, $2, 0, now())`,
+            [f.a.id, forgedRoom.rows[0]?.id],
+          );
+          await expect(
+            client.query('SELECT * FROM chorus_enroll_start($1, $2, $3, $4, $5)', [
+              'rom_forgedroom1',
+              'i_forgedmember1',
+              'attacker',
+              `cvn_${'a'.repeat(22)}`,
+              sha256('forged-secret'),
+            ]),
+          ).rejects.toMatchObject({ code: 'CH001' });
         } finally {
           client.release(true);
         }
         expect(
-          await f.count(`SELECT count(*) AS n FROM actors WHERE display_name = 'attacker'`),
-        ).toBe(0);
-        expect(
-          await f.count(`SELECT count(*) AS n FROM api_tokens WHERE token_sha256 = $1`, [
-            sha256('forged-token'),
-          ]),
+          await f.count(`SELECT count(*) AS n FROM enrollments WHERE display_name = 'attacker'`),
         ).toBe(0);
       });
 
-      it('a real redemption writes to the real tables even when temp lookalikes exist', async () => {
-        await owner(
-          `INSERT INTO invites (workspace_id, room_id, role, code_sha256, expires_at)
-           VALUES ($1, $2, 'executor', $3, now() + interval '1 hour')`,
-          [f.a.id, f.a.roomId, sha256('real-code')],
-        );
+      it('chorus_enroll_complete ignores a forged temp enrollments table', async () => {
         const client = await f.pool.connect();
-        let redeemedActor: string | undefined;
+        const tokenHash = sha256('forged-enrollment-token');
         try {
-          for (const table of ['actors', 'agent_instances', 'room_grants', 'api_tokens']) {
+          await client.query(LOOKALIKE['enrollments'] ?? '');
+          await client.query(
+            `INSERT INTO pg_temp.enrollments
+               (workspace_id, room_id, claimed_member_id, display_name, nonce, secret_sha256, state, expires_at,
+                start_sequence, verified_at, proof_principal_id, proof_member_id)
+             VALUES ($1, $2, 'i_forgedmember1', 'forged', $3, $4, 'verified', now() + interval '10 minutes', 0,
+                     now(), 'p_forgedprincipal1', 'i_forgedmember1')`,
+            [f.a.id, f.a.roomId, `cvn_${'b'.repeat(22)}`, sha256('forged-secret2')],
+          );
+          const forged = await client.query<{ id: string }>('SELECT id FROM pg_temp.enrollments');
+          const { rows } = await client.query<{ status: string }>(
+            'SELECT * FROM chorus_enroll_complete($1, $2, $3, $4)',
+            [forged.rows[0]?.id, sha256('forged-secret2'), tokenHash, ['executor']],
+          );
+          expect(rows).toEqual([expect.objectContaining({ status: 'invalid' })]);
+        } finally {
+          client.release(true);
+        }
+        expect(
+          await f.count(`SELECT count(*) AS n FROM api_tokens WHERE token_sha256 = $1`, [
+            tokenHash,
+          ]),
+        ).toBe(0);
+        expect(
+          await f.count(`SELECT count(*) AS n FROM actors WHERE display_name = 'forged'`),
+        ).toBe(0);
+      });
+
+      it('a real enrollment completes into the real tables even when temp lookalikes exist', async () => {
+        const enrollment = await seedVerifiedEnrollment(f.a);
+        const tokenHash = sha256('shadow-real-token');
+        const client = await f.pool.connect();
+        let actorId: string | undefined;
+        try {
+          for (const table of [
+            'actors',
+            'agent_instances',
+            'room_grants',
+            'api_tokens',
+            'external_identities',
+          ]) {
             await client.query(LOOKALIKE[table] ?? '');
           }
-          const { rows } = await client.query<{ actor_id: string }>(
-            'SELECT * FROM chorus_redeem_invite($1, $2, $3)',
-            [sha256('real-code'), sha256('real-token'), 'legit'],
+          const { rows } = await client.query<{ status: string; actor_id: string }>(
+            'SELECT * FROM chorus_enroll_complete($1, $2, $3, $4)',
+            [enrollment.id, sha256(enrollment.secret), tokenHash, ['executor']],
           );
-          expect(rows).toHaveLength(1);
-          redeemedActor = rows[0]?.actor_id;
-          // Nothing was written to ANY of the forged temp tables, including agent_instances.
-          for (const table of ['actors', 'agent_instances', 'room_grants', 'api_tokens']) {
+          expect(rows).toEqual([expect.objectContaining({ status: 'issued' })]);
+          actorId = rows[0]?.actor_id;
+          for (const table of [
+            'actors',
+            'agent_instances',
+            'room_grants',
+            'api_tokens',
+            'external_identities',
+          ]) {
             const temp = await client.query(`SELECT (SELECT count(*) FROM pg_temp.${table}) AS n`);
             expect(Number((temp.rows[0] as { n: string }).n), `pg_temp.${table}`).toBe(0);
           }
         } finally {
           client.release(true);
         }
-        expect(await f.count(`SELECT count(*) AS n FROM actors WHERE display_name = 'legit'`)).toBe(
-          1,
-        );
-        // The real instance exists and is the one bound to the new token.
+        expect(await f.count(`SELECT count(*) AS n FROM actors WHERE id = $1`, [actorId])).toBe(1);
         expect(
-          await f.count(`SELECT count(*) AS n FROM agent_instances WHERE actor_id = $1`, [
-            redeemedActor,
-          ]),
+          await f.count(`SELECT count(*) AS n FROM agent_instances WHERE actor_id = $1`, [actorId]),
         ).toBe(1);
         expect(
           await f.count(
             `SELECT count(*) AS n FROM api_tokens t JOIN agent_instances i ON i.id = t.instance_id
               WHERE t.token_sha256 = $1 AND i.actor_id = $2`,
-            [sha256('real-token'), redeemedActor],
+            [tokenHash, actorId],
           ),
         ).toBe(1);
       });
@@ -466,6 +568,7 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
               workspace_id: f.a.id,
               actor_kind: 'agent',
               instance_id: real?.instance_id,
+              token_expires_at: null,
             },
           ]);
         } finally {
@@ -556,15 +659,11 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
       )) as Uuid;
     }
 
-    it('redeeming an invite creates exactly one instance bound to the new token', async () => {
-      await owner(
-        `INSERT INTO invites (workspace_id, room_id, role, code_sha256, expires_at)
-         VALUES ($1, $2, 'executor', $3, now() + interval '1 hour')`,
-        [f.a.id, f.a.roomId, sha256('v2-code')],
-      );
+    it('completing an enrollment creates exactly one instance bound to the new token', async () => {
+      const enrollment = await seedVerifiedEnrollment(f.a);
       const { rows } = await f.pool.query<{ actor_id: string }>(
-        'SELECT * FROM chorus_redeem_invite($1, $2, $3)',
-        [sha256('v2-code'), sha256('v2-token'), 'v2 agent'],
+        'SELECT * FROM chorus_enroll_complete($1, $2, $3, $4)',
+        [enrollment.id, sha256(enrollment.secret), sha256('v2-token'), ['executor']],
       );
       const actorId = rows[0]?.actor_id;
       expect(actorId).toBeDefined();
@@ -576,7 +675,7 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
           WHERE t.token_sha256 = $1`,
         [sha256('v2-token')],
       );
-      expect(token?.label).toBe('v2 agent');
+      expect(token?.label).toBe(`sharednet:${enrollment.member}`);
     });
 
     it('lets an actor see only its own agent_instances', async () => {
@@ -651,6 +750,7 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
         workspace_id: string;
         actor_kind: string;
         instance_id: string | null;
+        token_expires_at: Date | null;
       }[];
 
     it('resolves a live token to its actor, workspace, actor kind and bound instance only', async () => {
@@ -665,6 +765,7 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
           workspace_id: f.a.id,
           actor_kind: 'agent',
           instance_id: instance?.id,
+          token_expires_at: null,
         },
       ]);
     });
@@ -694,106 +795,232 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
     });
   });
 
-  describe('invite redemption (SECURITY DEFINER)', () => {
-    const redeem = async (code: string, token: string, name = 'new agent') =>
+  describe('enrollment completion (SECURITY DEFINER)', () => {
+    const complete = async (
+      id: string,
+      secret: string,
+      token: string,
+      roles: string[] = ['executor'],
+    ) =>
       (
-        await f.pool.query<{ workspace_id: Uuid; actor_id: Uuid; room_id: Uuid; role: string }>(
-          'SELECT * FROM chorus_redeem_invite($1, $2, $3)',
-          [sha256(code), sha256(token), name],
-        )
+        await f.pool.query<{
+          status: string;
+          actor_id: Uuid | null;
+          workspace_id: Uuid | null;
+          room_id: Uuid | null;
+          instance_id: Uuid | null;
+          roles: string[] | null;
+        }>('SELECT * FROM chorus_enroll_complete($1, $2, $3, $4)', [
+          id,
+          sha256(secret),
+          sha256(token),
+          roles,
+        ])
       ).rows;
 
-    it('lets exactly one of 10 concurrent redemptions of a single-use invite succeed', async () => {
-      await owner(
-        `INSERT INTO invites (workspace_id, room_id, role, code_sha256, expires_at)
-         VALUES ($1, $2, 'executor', $3, now() + interval '1 hour')`,
-        [f.a.id, f.a.roomId, sha256('race-code')],
-      );
+    it('lets exactly one of 10 concurrent completions of a verified enrollment issue a token', async () => {
+      const e = await seedVerifiedEnrollment(f.a);
       const before = await f.count(`SELECT count(*) AS n FROM actors WHERE workspace_id = $1`, [
         f.a.id,
       ]);
       const results = await Promise.all(
-        Array.from({ length: 10 }, (_, i) =>
-          redeem('race-code', `race-token-${String(i)}`, `racer-${String(i)}`),
-        ),
+        Array.from({ length: 10 }, (_, i) => complete(e.id, e.secret, `race-token-${String(i)}`)),
       );
-      const winners = results.filter((rows) => rows.length === 1);
-      expect(winners).toHaveLength(1);
-      expect(results.filter((rows) => rows.length === 0)).toHaveLength(9);
-
-      const [won] = winners.flat();
-      expect(won).toMatchObject({ workspace_id: f.a.id, room_id: f.a.roomId, role: 'executor' });
-      // Exactly one new actor, one grant and one token came out of it; the invite records who used it.
+      const issued = results.flat().filter((r) => r.status === 'issued');
+      expect(issued).toHaveLength(1);
+      expect(results.flat().filter((r) => r.status === 'invalid')).toHaveLength(9);
+      const [won] = issued;
+      expect(won).toMatchObject({ workspace_id: f.a.id, room_id: f.a.roomId, roles: ['executor'] });
       expect(
         await f.count(`SELECT count(*) AS n FROM actors WHERE workspace_id = $1`, [f.a.id]),
       ).toBe(before + 1);
       expect(
+        await f.count(`SELECT count(*) AS n FROM agent_instances WHERE actor_id = $1`, [
+          won?.actor_id,
+        ]),
+      ).toBe(1);
+      expect(
         await f.count(
-          `SELECT count(*) AS n FROM room_grants WHERE actor_id = $1 AND role = 'executor'`,
+          `SELECT count(*) AS n FROM room_grants WHERE actor_id = $1 AND revoked_at IS NULL`,
           [won?.actor_id],
         ),
       ).toBe(1);
-      expect(
-        await f.count(
-          `SELECT count(*) AS n FROM invites WHERE code_sha256 = $1 AND used_by_actor_id = $2`,
-          [sha256('race-code'), won?.actor_id],
-        ),
-      ).toBe(1);
-      const [actor] = await owner<{ kind: string }>('SELECT kind FROM actors WHERE id = $1', [
-        won?.actor_id,
-      ]);
-      expect(actor?.kind).toBe('agent');
+      const [row] = await owner<{ state: string; issued_actor_id: string }>(
+        'SELECT state, issued_actor_id FROM enrollments WHERE id = $1',
+        [e.id],
+      );
+      expect(row).toEqual({ state: 'consumed', issued_actor_id: won?.actor_id });
     });
 
-    it('cannot redeem twice, or redeem an expired or unknown code', async () => {
-      await owner(
-        `INSERT INTO invites (workspace_id, room_id, role, code_sha256, expires_at)
-         VALUES ($1, $2, 'reviewer', $3, now() + interval '1 hour'), ($1, $2, 'executor', $4, now() - interval '1 second')`,
-        [f.a.id, f.a.roomId, sha256('once-code'), sha256('expired-code')],
+    it('answers unknown, wrong-secret, consumed and expired enrollments identically', async () => {
+      const e = await seedVerifiedEnrollment(f.a);
+      expect(await complete(e.id, e.secret, 'once-token-1')).toHaveLength(1);
+      const consumed = await complete(e.id, e.secret, 'enr-once-token-2');
+      const wrongSecret = await complete(
+        (await seedVerifiedEnrollment(f.a)).id,
+        'not-the-secret',
+        'enr-wrong-token',
       );
-      expect(await redeem('once-code', 'once-token-1')).toHaveLength(1);
-      expect(await redeem('once-code', 'once-token-2')).toEqual([]);
-      expect(await redeem('expired-code', 'expired-token')).toEqual([]);
-      expect(await redeem('unknown-code', 'unknown-token')).toEqual([]);
+      const unknown = await complete(
+        '00000000-0000-4000-8000-000000000000',
+        e.secret,
+        'enr-unknown-token',
+      );
+      const expired = await seedVerifiedEnrollment(f.a);
+      await owner(`UPDATE enrollments SET state = 'expired' WHERE id = $1`, [expired.id]);
+      const stale = await complete(expired.id, expired.secret, 'enr-expired-token');
+      for (const result of [consumed, wrongSecret, unknown, stale]) {
+        expect(result).toEqual([
+          {
+            status: 'invalid',
+            actor_id: null,
+            workspace_id: null,
+            room_id: null,
+            instance_id: null,
+            roles: null,
+            token_expires_at: null,
+          },
+        ]);
+      }
       expect(
-        await f.count(`SELECT count(*) AS n FROM api_tokens WHERE token_sha256 = $1`, [
-          sha256('once-token-2'),
+        await f.count(`SELECT count(*) AS n FROM api_tokens WHERE token_sha256 = ANY($1::text[])`, [
+          ['enr-once-token-2', 'enr-wrong-token', 'enr-unknown-token', 'enr-expired-token'].map(
+            sha256,
+          ),
         ]),
       ).toBe(0);
     });
 
-    it('produces an identity that resolves, is scoped to the invited room, and can do real work there', async () => {
-      await owner(
-        `INSERT INTO invites (workspace_id, room_id, role, code_sha256, expires_at)
-         VALUES ($1, $2, 'executor', $3, now() + interval '1 hour')`,
-        [f.a.id, f.a.roomId, sha256('e2e-code')],
-      );
-      const [redeemed] = await redeem('e2e-code', 'e2e-token', 'external agent');
-      if (redeemed === undefined) throw new Error('redemption failed');
+    it('reports pending until verified, and refuses roles beyond executor', async () => {
+      const e = await seedVerifiedEnrollment(f.a);
+      await owner(`UPDATE enrollments SET state = 'pending', verified_at = NULL WHERE id = $1`, [
+        e.id,
+      ]);
+      expect(await complete(e.id, e.secret, 'pending-token')).toEqual([
+        expect.objectContaining({ status: 'pending' }),
+      ]);
+      const status = await f.pool.query('SELECT * FROM chorus_enroll_status($1, $2)', [
+        e.id,
+        sha256(e.secret),
+      ]);
+      expect(status.rows).toEqual([expect.objectContaining({ status: 'pending' })]);
+      await owner(`UPDATE enrollments SET state = 'verified', verified_at = now() WHERE id = $1`, [
+        e.id,
+      ]);
+      for (const roles of [['manager'], ['reviewer'], ['executor', 'manager'], []]) {
+        await expect(complete(e.id, e.secret, 'bad-roles-token', roles)).rejects.toMatchObject({
+          code: '22023',
+        });
+      }
+      expect(await complete(e.id, e.secret, 'good-roles-token')).toEqual([
+        expect.objectContaining({ status: 'issued' }),
+      ]);
+    });
 
+    it('reuses the actor for a principal, never duplicates grants, and never revokes', async () => {
+      const principal = randomId('p_', 12);
+      const e1 = await seedVerifiedEnrollment(f.a, { principal });
+      const [first] = await complete(e1.id, e1.secret, 'reuse-token-1');
+      const e2 = await seedVerifiedEnrollment(f.a, { principal });
+      const [second] = await complete(e2.id, e2.secret, 'reuse-token-2');
+      expect(second?.actor_id).toBe(first?.actor_id);
+      // A new instance and token per enrollment; old ones stay valid; grants are not duplicated.
+      expect(second?.instance_id).not.toBe(first?.instance_id);
+      expect(
+        await f.count(
+          `SELECT count(*) AS n FROM room_grants WHERE actor_id = $1 AND revoked_at IS NULL`,
+          [first?.actor_id],
+        ),
+      ).toBe(1);
+      expect(
+        await f.count(`SELECT count(*) AS n FROM external_identities WHERE principal_id = $1`, [
+          principal,
+        ]),
+      ).toBe(1);
+      for (const token of ['reuse-token-1', 'reuse-token-2']) {
+        const rows = (await f.pool.query('SELECT 1 FROM chorus_resolve_token($1)', [sha256(token)]))
+          .rows;
+        expect(rows, token).toHaveLength(1);
+      }
+      // Two DIFFERENT principals get two different actors, even when racing.
+      const [ea, eb] = await Promise.all([
+        seedVerifiedEnrollment(f.a),
+        seedVerifiedEnrollment(f.a),
+      ]);
+      const [ra, rb] = await Promise.all([
+        complete(ea.id, ea.secret, 'pa-token'),
+        complete(eb.id, eb.secret, 'pb-token'),
+      ]);
+      expect(ra[0]?.actor_id).not.toBe(rb[0]?.actor_id);
+      // Same principal enrolling concurrently still yields a single actor.
+      const same = randomId('p_', 12);
+      const [s1, s2] = await Promise.all([
+        seedVerifiedEnrollment(f.a, { principal: same }),
+        seedVerifiedEnrollment(f.a, { principal: same }),
+      ]);
+      const [c1, c2] = await Promise.all([
+        complete(s1.id, s1.secret, 'same-1'),
+        complete(s2.id, s2.secret, 'same-2'),
+      ]);
+      expect(c1[0]?.actor_id).toBe(c2[0]?.actor_id);
+      expect(
+        await f.count(
+          `SELECT count(*) AS n FROM actors a JOIN external_identities i ON i.actor_id = a.id WHERE i.principal_id = $1`,
+          [same],
+        ),
+      ).toBe(1);
+      expect(
+        await f.count(
+          `SELECT count(*) AS n FROM room_grants WHERE actor_id = $1 AND revoked_at IS NULL`,
+          [c1[0]?.actor_id],
+        ),
+      ).toBe(1);
+    });
+
+    it('issues nothing for a suspended room, and locks out its existing tokens', async () => {
+      const room = await f.addRoom(f.a, 'suspendable');
+      const e = await seedVerifiedEnrollment(f.a, { roomId: room });
+      await owner(`UPDATE rooms SET activation_state = 'suspended' WHERE id = $1`, [room]);
+      expect(await complete(e.id, e.secret, 'suspended-token')).toEqual([
+        expect.objectContaining({ status: 'invalid' }),
+      ]);
+      await owner(`UPDATE rooms SET activation_state = 'active' WHERE id = $1`, [room]);
+      const [issued] = await complete(e.id, e.secret, 'resuming-token');
+      expect(issued?.status).toBe('issued');
+      const resolve = async () =>
+        (
+          await f.pool.query<Record<string, unknown>>('SELECT * FROM chorus_resolve_token($1)', [
+            sha256('resuming-token'),
+          ])
+        ).rows;
+      expect(await resolve()).toHaveLength(1);
+      await owner(`UPDATE rooms SET activation_state = 'suspended' WHERE id = $1`, [room]);
+      expect(await resolve()).toEqual([]);
+      await owner(`UPDATE rooms SET activation_state = 'degraded' WHERE id = $1`, [room]);
+      expect(await resolve()).toEqual([]);
+    });
+
+    it('produces an identity that resolves and can do real work in its room, and only there', async () => {
+      const e = await seedVerifiedEnrollment(f.a);
+      const [issued] = await complete(e.id, e.secret, 'e2e-token', ['executor']);
+      if (issued?.actor_id == null) throw new Error('enrollment did not issue');
       const resolved = (
         await f.pool.query('SELECT * FROM chorus_resolve_token($1)', [sha256('e2e-token')])
       ).rows;
       expect(resolved).toMatchObject([
-        {
-          actor_id: redeemed.actor_id,
-          workspace_id: redeemed.workspace_id,
-          actor_kind: 'agent',
-        },
+        { actor_id: issued.actor_id, workspace_id: f.a.id, actor_kind: 'agent' },
       ]);
-      expect((resolved[0] as { instance_id: string | null }).instance_id).not.toBeNull();
+      expect((resolved[0] as { instance_id: string | null }).instance_id).toBe(issued.instance_id);
 
-      const ctx = f.ctx(f.a, redeemed.actor_id, 'e2e-create');
       const created = await runCommand(
-        ctx,
-        createItemCommand({ roomId: f.a.roomId, title: 'by invited agent' }),
+        f.ctx(f.a, issued.actor_id, 'e2e-create'),
+        createItemCommand({ roomId: f.a.roomId, title: 'by enrolled agent' }),
       );
       expect(created.version).toBe(1);
-      // Its scope is the invited room only.
       const { retitleCommand } = await import('../helpers/fixture.ts');
       await expect(
         runCommand(
-          f.ctx(f.a, redeemed.actor_id, 'e2e-other-room'),
+          f.ctx(f.a, issued.actor_id, 'e2e-other-room'),
           retitleCommand({ itemId: taskInSecondRoom, expectedVersion: 1, title: 'x' }),
         ),
       ).rejects.toMatchObject({ code: 'not_found' });

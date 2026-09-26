@@ -281,8 +281,8 @@ describe('core schema constraints (real PostgreSQL)', () => {
     });
   });
 
-  describe('credentials and invites', () => {
-    it('stores only a well-formed sha256 for tokens and invite codes', async () => {
+  describe('credentials', () => {
+    it('stores only a well-formed sha256 for tokens', async () => {
       await expect(
         db.query(
           `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256) VALUES ($1, $2, 'plaintext-token')`,
@@ -293,16 +293,6 @@ describe('core schema constraints (real PostgreSQL)', () => {
         `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256) VALUES ($1, $2, $3)`,
         [a.workspaceId, a.otherActorId, sha256('secret')],
       );
-    });
-
-    it('marks an invite used only together with the actor it created', async () => {
-      await expect(
-        db.query(
-          `INSERT INTO invites (workspace_id, room_id, role, code_sha256, expires_at, used_at)
-           VALUES ($1, $2, 'executor', $3, now() + interval '1 hour', now())`,
-          [a.workspaceId, a.roomId, sha256('code')],
-        ),
-      ).rejects.toMatchObject({ code: '23514' });
     });
   });
 });

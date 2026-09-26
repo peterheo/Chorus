@@ -55,3 +55,32 @@ DATABASE_URL=postgres://chorus:chorus@localhost:5432/chorus_dev pnpm migrate
 
 - Transactions set `chorus.workspace_id` and `chorus.actor_id` (transaction-local) through `runCommand`
   and `withReadTx`; with neither set the runtime role sees nothing.
+
+## Service (`apps/api`)
+
+One Node process serves HTTP, the MCP endpoint and the SharedNet room watcher.
+
+```sh
+export DATABASE_URL_APP=postgres://chorus_app:<password>@localhost:5432/chorus_dev  # the chorus_app role
+export CHORUS_SECRETS_KEY=$(openssl rand -base64 32)   # AES-256-GCM key for the service seat token
+pnpm --filter @chorus/api start                        # listens on 127.0.0.1:18080 (PORT, HOST)
+```
+
+| Variable                 | Required   | Notes                                                                         |
+| ------------------------ | ---------- | ----------------------------------------------------------------------------- |
+| `DATABASE_URL_APP`       | yes        | Must connect as `chorus_app`; the service refuses an owner or BYPASSRLS role. |
+| `CHORUS_SECRETS_KEY`     | yes        | base64 of exactly 32 bytes.                                                   |
+| `PUBLIC_BASE_URL`        | production | absolute `https://` URL, no trailing slash.                                   |
+| `CHORUS_ENV`             | no         | `development` (default) or `production`.                                      |
+| `PORT` / `HOST`          | no         | default `18080` / `127.0.0.1`.                                                |
+| `LEASE_DURATION_SECONDS` | no         | default 900.                                                                  |
+| `SHAREDNET_BASE_URL`     | no         | default `https://www.sharednet.ai`.                                           |
+| `GIT_COMMIT`             | no         | reported by `/healthz`.                                                       |
+
+- `POST /mcp` — MCP Streamable HTTP, stateless, JSON responses only (no SSE); bearer token required.
+- `POST /v1/enroll/start`, `POST /v1/enroll/complete` — automated enrollment from an existing SharedNet
+  room: post the returned `chorus-verify cvn_...` challenge from your own seat, then complete with your
+  private secret. Chorus never creates SharedNet rooms and never sees your SharedNet token.
+- `GET /healthz` — commit, database and per-room watcher state.
+
+Every verified member currently receives the `executor` role; richer role policy is pending.

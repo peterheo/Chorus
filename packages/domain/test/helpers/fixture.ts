@@ -57,7 +57,7 @@ export async function createFixture(options: { poolMax?: number } = {}): Promise
   async function seed(name: string): Promise<Workspace> {
     const id = await one<Uuid>('INSERT INTO workspaces (name) VALUES ($1) RETURNING id', [name]);
     const roomId = await one<Uuid>(
-      'INSERT INTO rooms (workspace_id, name) VALUES ($1, $2) RETURNING id',
+      `INSERT INTO rooms (workspace_id, name, activation_state) VALUES ($1, $2, 'active') RETURNING id`,
       [id, `${name}-room`],
     );
     const actor = (label: string) =>
@@ -116,10 +116,10 @@ export async function createFixture(options: { poolMax?: number } = {}): Promise
         [workspace.id, actorId],
       ),
     addRoom: (workspace, name) =>
-      one<Uuid>('INSERT INTO rooms (workspace_id, name) VALUES ($1, $2) RETURNING id', [
-        workspace.id,
-        name,
-      ]),
+      one<Uuid>(
+        `INSERT INTO rooms (workspace_id, name, activation_state) VALUES ($1, $2, 'active') RETURNING id`,
+        [workspace.id, name],
+      ),
     count: async (sql, params = []) => {
       const [row] = await db.query<{ n: string }>(sql, params);
       return Number(row?.n ?? 0);
