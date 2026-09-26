@@ -44,6 +44,9 @@ export async function createFixture(options: { poolMax?: number } = {}): Promise
   const db = await createMigratedEphemeralDatabase();
   // The pool connects as the non-owner runtime role, so RLS applies to every command under test.
   const pool = new pg.Pool({ connectionString: db.appUrl, max: options.poolMax ?? 8 });
+  // Dropping the database (WITH FORCE) can terminate idle pooled connections that are still closing;
+  // that is expected at teardown and must not surface as an unhandled 'error' event.
+  pool.on('error', () => undefined);
 
   const one = async <T extends string>(sql: string, params: unknown[]): Promise<T> => {
     const [row] = await db.query<{ id: T }>(sql, params);
