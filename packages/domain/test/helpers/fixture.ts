@@ -40,10 +40,10 @@ export interface Fixture {
   close: () => Promise<void>;
 }
 
-export async function createFixture(): Promise<Fixture> {
+export async function createFixture(options: { poolMax?: number } = {}): Promise<Fixture> {
   const db = await createMigratedEphemeralDatabase();
   // The pool connects as the non-owner runtime role, so RLS applies to every command under test.
-  const pool = new pg.Pool({ connectionString: db.appUrl, max: 8 });
+  const pool = new pg.Pool({ connectionString: db.appUrl, max: options.poolMax ?? 8 });
 
   const one = async <T extends string>(sql: string, params: unknown[]): Promise<T> => {
     const [row] = await db.query<{ id: T }>(sql, params);

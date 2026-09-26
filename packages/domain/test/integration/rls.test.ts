@@ -350,7 +350,7 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
       agent_instances: `CREATE TEMP TABLE agent_instances (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, actor_id uuid,
         label text, created_at timestamptz DEFAULT now())`,
       api_tokens: `CREATE TEMP TABLE api_tokens (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, actor_id uuid,
-        token_sha256 text, created_at timestamptz DEFAULT now(), expires_at timestamptz, revoked_at timestamptz)`,
+        token_sha256 text, instance_id uuid, created_at timestamptz DEFAULT now(), expires_at timestamptz, revoked_at timestamptz)`,
     };
 
     it('gives the runtime role no TEMP privilege by default', async () => {
@@ -402,6 +402,7 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
           [f.a.id, f.a.roomId, sha256('real-code')],
         );
         const client = await f.pool.connect();
+        let redeemedActor: string | undefined;
         try {
           for (const table of ['actors', 'agent_instances', 'room_grants', 'api_tokens']) {
             await client.query(LOOKALIKE[table] ?? '');
@@ -411,14 +412,65 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
             [sha256('real-code'), sha256('real-token'), 'legit'],
           );
           expect(rows).toHaveLength(1);
-          const temp = await client.query('SELECT (SELECT count(*) FROM pg_temp.actors) AS n');
-          expect(Number((temp.rows[0] as { n: string }).n)).toBe(0);
+          redeemedActor = rows[0]?.actor_id;
+          // Nothing was written to ANY of the forged temp tables, including agent_instances.
+          for (const table of ['actors', 'agent_instances', 'room_grants', 'api_tokens']) {
+            const temp = await client.query(`SELECT (SELECT count(*) FROM pg_temp.${table}) AS n`);
+            expect(Number((temp.rows[0] as { n: string }).n), `pg_temp.${table}`).toBe(0);
+          }
         } finally {
           client.release(true);
         }
         expect(await f.count(`SELECT count(*) AS n FROM actors WHERE display_name = 'legit'`)).toBe(
           1,
         );
+        // The real instance exists and is the one bound to the new token.
+        expect(
+          await f.count(`SELECT count(*) AS n FROM agent_instances WHERE actor_id = $1`, [
+            redeemedActor,
+          ]),
+        ).toBe(1);
+        expect(
+          await f.count(
+            `SELECT count(*) AS n FROM api_tokens t JOIN agent_instances i ON i.id = t.instance_id
+              WHERE t.token_sha256 = $1 AND i.actor_id = $2`,
+            [sha256('real-token'), redeemedActor],
+          ),
+        ).toBe(1);
+      });
+
+      it('chorus_resolve_token ignores forged temp actors and api_tokens (real kind and instance win)', async () => {
+        const [real] = await owner<{ instance_id: string }>(
+          `SELECT instance_id FROM api_tokens WHERE token_sha256 = $1`,
+          [sha256('a-token')],
+        );
+        const client = await f.pool.connect();
+        try {
+          await client.query(LOOKALIKE['actors'] ?? '');
+          await client.query(LOOKALIKE['api_tokens'] ?? '');
+          // A forged 'human' actor row for the real actor, and a forged token pointing elsewhere.
+          await client.query(
+            `INSERT INTO pg_temp.actors (id, workspace_id, kind, display_name) VALUES ($1, $2, 'human', 'forged')`,
+            [f.a.executorId, f.a.id],
+          );
+          await client.query(
+            `INSERT INTO pg_temp.api_tokens (workspace_id, actor_id, token_sha256, instance_id) VALUES ($1, $2, $3, gen_random_uuid())`,
+            [f.a.id, f.a.outsiderId, sha256('a-token')],
+          );
+          const { rows } = await client.query('SELECT * FROM chorus_resolve_token($1)', [
+            sha256('a-token'),
+          ]);
+          expect(rows).toEqual([
+            {
+              actor_id: f.a.executorId,
+              workspace_id: f.a.id,
+              actor_kind: 'agent',
+              instance_id: real?.instance_id,
+            },
+          ]);
+        } finally {
+          client.release(true);
+        }
       });
 
       it('chorus_visible_rooms and chorus_resolve_token ignore forged temp tables', async () => {

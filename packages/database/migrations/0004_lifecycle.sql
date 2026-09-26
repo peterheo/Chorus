@@ -41,7 +41,9 @@ CREATE TRIGGER api_tokens_guard
 ALTER TABLE task_details ADD COLUMN shareable boolean NOT NULL DEFAULT false;
 
 -- 3. Result revisions gain the criteria mapping and the UTF-8 byte length. Adding columns does not fire
---    the row-level immutability triggers (tested); existing rows would default to length 0.
+--    the row-level immutability triggers (tested). The byte_length CHECK below fails for any existing
+--    revision with non-empty content (the column defaults to 0), so this migration REQUIRES an empty
+--    task_result_revisions table or a backfill of byte_length first; none exists before first deploy.
 ALTER TABLE task_result_revisions
   ADD COLUMN criteria_mapping jsonb NOT NULL DEFAULT '[]'::jsonb
     CHECK (jsonb_typeof(criteria_mapping) = 'array'),

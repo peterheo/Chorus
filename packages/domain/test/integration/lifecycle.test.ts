@@ -54,7 +54,8 @@ describe('RC-WP2 lifecycle (real PostgreSQL, as chorus_app)', () => {
   let w: World;
 
   beforeAll(async () => {
-    f = await createFixture();
+    // 100 concurrent claims must really contend: give the app pool room for 40 connections.
+    f = await createFixture({ poolMax: 40 });
     w = await makeWorld(f, f.a);
   });
   afterAll(async () => {
@@ -355,6 +356,94 @@ describe('RC-WP2 lifecycle (real PostgreSQL, as chorus_app)', () => {
   });
 
   // ------------------------------------------------------------------------------------------------
+  it('review.request.check_order (A2.1-9)', async () => {
+    // A: a stale version wins over an ineligible reviewer.
+    const a = await taskInReview(w);
+    await expectCode(
+      requestReview(w.executor.ctx(), {
+        task_id: a.taskId,
+        expected_version: a.version + 5,
+        revision: 1,
+        reviewer_actor_id: w.executor2.actorId, // not a reviewer
+      }),
+      'version_conflict',
+    );
+
+    // B: lifecycle wins over reviewer checks (task still in progress, reviewer ineligible).
+    const task = await newTask(w);
+    const claimed = await claimAs(w, task.id as Uuid, task.version);
+    await expectCode(
+      requestReview(w.executor.ctx(), {
+        task_id: task.id,
+        expected_version: claimed.version,
+        revision: 1,
+        reviewer_actor_id: w.executor2.actorId,
+      }),
+      'invalid_transition',
+      'invalid_state',
+    );
+
+    // Order after lifecycle: submitter (403) before eligibility (400) before stale (409) before exists (409).
+    const t = await taskInReview(w);
+    const call = (over: { reviewer_actor_id?: Uuid; revision?: number }) =>
+      requestReview(w.executor.ctx(), {
+        task_id: t.taskId,
+        expected_version: t.version,
+        revision: over.revision ?? 1,
+        reviewer_actor_id: over.reviewer_actor_id ?? w.reviewer.actorId,
+      });
+    await expectCode(
+      call({ reviewer_actor_id: w.executor.actorId, revision: 9 }),
+      'action_forbidden',
+      'reviewer_is_submitter',
+    );
+    await expectCode(
+      call({ reviewer_actor_id: w.executor2.actorId, revision: 9 }),
+      'invalid_request',
+      'reviewer_not_eligible',
+    );
+    await expectCode(call({ revision: 9 }), 'review_stale');
+    const first = await call({});
+    await expectCode(
+      requestReview(w.executor.ctx(), {
+        task_id: t.taskId,
+        expected_version: first.task_version,
+        revision: 1,
+        reviewer_actor_id: w.reviewer2.actorId,
+      }),
+      'review_exists',
+    );
+  });
+
+  it('review.request.replay_ignores_reviewer_changes (A2.1-9, scenario C)', async () => {
+    const t = await taskInReview(w);
+    const reviewer = await w.agent('reviewer');
+    const key = uniqueKey('rr');
+    const ctx = f.ctx(w.ws, w.executor.actorId, key, w.executor.instanceId);
+    const input = {
+      task_id: t.taskId,
+      expected_version: t.version,
+      revision: 1,
+      reviewer_actor_id: reviewer.actorId,
+    };
+    const first = await requestReview(ctx, input);
+    // The REVIEWER's grant is revoked afterwards: the caller is unchanged, so the replay must still
+    // return the stored response (replay re-authorizes the caller only).
+    await owner('UPDATE room_grants SET revoked_at = now() WHERE actor_id = $1', [
+      reviewer.actorId,
+    ]);
+    expect(await requestReview(ctx, input)).toEqual(first);
+    // Revoking the CALLER's grant does block the replay.
+    await owner('UPDATE room_grants SET revoked_at = now() WHERE actor_id = $1', [
+      w.executor.actorId,
+    ]);
+    await expectCode(requestReview(ctx, input), 'not_found');
+    await owner(
+      `INSERT INTO room_grants (workspace_id, actor_id, room_id, role) VALUES ($1, $2, $3, 'executor')`,
+      [w.ws.id, w.executor.actorId, w.roomId],
+    );
+  });
+
   it('complete.truth_table', async () => {
     const complete = (t: { taskId: Uuid }, version: number) =>
       completeTask(w.executor.ctx(), { task_id: t.taskId, expected_version: version });
@@ -609,10 +698,19 @@ describe('RC-WP2 lifecycle (real PostgreSQL, as chorus_app)', () => {
 
   // ------------------------------------------------------------------------------------------------
   it('events.one_per_version', async () => {
-    const t = await taskInReview(w);
-    const r = await requestReviewAs(w, t.taskId, t.version, 1);
-    await verdictAs(r.review, t.digest, 'approved', w.reviewer);
-    await completeTask(w.executor.ctx(), { task_id: t.taskId, expected_version: r.task_version });
+    const task = await newTask(w);
+    const claimed = await claimAs(w, task.id as Uuid, task.version);
+    const renewed = await renewLease(w.executor.ctx(), {
+      task_id: task.id,
+      expected_version: claimed.version,
+      fence: claimed.fence,
+    });
+    await expireLease(task.id);
+    const reacquired = await claimAs(w, task.id as Uuid, renewed.version);
+    const submitted = await submitAs(w, task.id as Uuid, reacquired.version, reacquired.fence);
+    const r = await requestReviewAs(w, task.id as Uuid, submitted.version, 1);
+    await verdictAs(r.review, submitted.content_sha256, 'approved', w.reviewer);
+    await completeTask(w.executor.ctx(), { task_id: task.id, expected_version: r.task_version });
 
     const events = await owner<{
       aggregate_id: string;
@@ -622,28 +720,57 @@ describe('RC-WP2 lifecycle (real PostgreSQL, as chorus_app)', () => {
     }>(
       `SELECT aggregate_id, aggregate_version, event_type, payload FROM domain_events
         WHERE aggregate_id = ANY($1::uuid[]) ORDER BY aggregate_id, aggregate_version`,
-      [[t.taskId, r.review.id]],
+      [[task.id, r.review.id]],
     );
     const byAggregate = new Map<string, typeof events>();
-    for (const e of events)
+    for (const e of events) {
       byAggregate.set(e.aggregate_id, [...(byAggregate.get(e.aggregate_id) ?? []), e]);
+    }
 
-    expect(byAggregate.get(t.taskId)?.map((e) => [e.aggregate_version, e.event_type])).toEqual([
+    // Exactly one event per version, contiguous from 1, strictly increasing.
+    expect(byAggregate.get(task.id)?.map((e) => [e.aggregate_version, e.event_type])).toEqual([
       [1, 'task.created'],
       [2, 'task.claimed'],
-      [3, 'task.result_submitted'],
-      [4, 'task.review_requested'],
-      [5, 'task.completed'],
+      [3, 'task.lease_renewed'],
+      [4, 'task.claimed'],
+      [5, 'task.result_submitted'],
+      [6, 'task.review_requested'],
+      [7, 'task.completed'],
     ]);
     expect(byAggregate.get(r.review.id)?.map((e) => [e.aggregate_version, e.event_type])).toEqual([
       [1, 'review.requested'],
       [2, 'review.verdict_recorded'],
     ]);
-    // Payloads carry no content.
-    for (const e of events) expect(JSON.stringify(e.payload)).not.toContain('the result');
+
+    // Payload keys are exactly the spec section 8 set, and contain no content.
+    const KEYS: Record<string, string[]> = {
+      'task.created': ['criteria_count', 'review_required', 'shareable', 'title'],
+      'task.claimed': ['expires_at', 'fence', 'owner_actor_id', 'reacquired'],
+      'task.lease_renewed': ['expires_at', 'fence'],
+      'task.result_submitted': [
+        'byte_length',
+        'content_sha256',
+        'content_type',
+        'fence',
+        'revision',
+        'supporting_ref_count',
+      ],
+      'task.review_requested': ['review_id', 'reviewer_actor_id', 'revision'],
+      'review.requested': ['content_sha256', 'reviewer_actor_id', 'revision', 'task_id'],
+      'review.verdict_recorded': ['revision', 'task_id', 'verdict'],
+      'task.completed': ['review_id', 'revision'],
+    };
+    for (const e of events) {
+      expect(Object.keys(e.payload).sort(), e.event_type).toEqual(KEYS[e.event_type]);
+      expect(JSON.stringify(e.payload)).not.toContain('the result');
+    }
+    const claims = byAggregate.get(task.id)?.filter((e) => e.event_type === 'task.claimed');
+    expect(claims?.map((e) => e.payload['reacquired'])).toEqual([false, true]);
+    expect(claims?.map((e) => e.payload['fence'])).toEqual([1, 2]);
+
     // The task row version equals its last event version.
-    const view = await getTask(w.executor.ctx(), { task_id: t.taskId });
-    expect(view.version).toBe(5);
+    const view = await getTask(w.executor.ctx(), { task_id: task.id });
+    expect(view.version).toBe(7);
   });
 
   // ------------------------------------------------------------------------------------------------

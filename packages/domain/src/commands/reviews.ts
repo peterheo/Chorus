@@ -62,9 +62,19 @@ export async function requestReview(
           },
         );
       }
-      // Q3 default: the submitter check precedes reviewer eligibility.
+      // A2.1-9: reviewer_is_submitter / reviewer_not_eligible run in `handle`, after the version and
+      // lifecycle checks, so replay re-authorizes only the caller (spec section 5).
+    },
+    handle: async (tx) => {
+      const task = lockedItem(tx, taskId);
+      assertTaskTransition('request_review', task.state);
       const latest = await loadLatestRevision(tx.db, tx.workspaceId, taskId);
-      if (latest !== null && latest.submittedBy === reviewerId) {
+      if (latest === null) {
+        throw new ChorusError('internal_error', 'A task in review has no result revision.');
+      }
+      // A2.1-9 order after lifecycle: reviewer_is_submitter (403), reviewer_not_eligible (400),
+      // then the review gates (precedence 11): stale, duplicate.
+      if (latest.submittedBy === reviewerId) {
         throw new ChorusError(
           'action_forbidden',
           'A reviewer cannot review their own submission.',
@@ -83,20 +93,9 @@ export async function requestReview(
         throw new ChorusError(
           'invalid_request',
           'The reviewer does not hold the reviewer role in this room.',
-          {
-            details: { field: 'reviewer_actor_id', reason: 'reviewer_not_eligible' },
-          },
+          { details: { field: 'reviewer_actor_id', reason: 'reviewer_not_eligible' } },
         );
       }
-    },
-    handle: async (tx) => {
-      const task = lockedItem(tx, taskId);
-      assertTaskTransition('request_review', task.state);
-      const latest = await loadLatestRevision(tx.db, tx.workspaceId, taskId);
-      if (latest === null) {
-        throw new ChorusError('internal_error', 'A task in review has no result revision.');
-      }
-      // Review gates (precedence 11): stale, then duplicate.
       if (revision !== latest.revision) {
         throw new ChorusError('review_stale', 'Only the latest result revision can be reviewed.', {
           details: { latest_revision: latest.revision },
