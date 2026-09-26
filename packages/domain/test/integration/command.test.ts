@@ -54,7 +54,7 @@ describe('runCommand (real PostgreSQL, as chorus_app)', () => {
 
   beforeAll(async () => {
     // 24 connections so the 20-way same-key test really contends.
-    f = await createFixture({ poolMax: 24 });
+    f = await createFixture({ poolMax: 22 });
     ws = await f.workspace('cmd');
     manager = await f.actor(ws, 'manager');
     session = await f.session(manager);

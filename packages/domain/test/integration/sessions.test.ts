@@ -51,7 +51,7 @@ describe('sessions (real PostgreSQL, as chorus_app)', () => {
   let ws: Workspace;
 
   beforeAll(async () => {
-    f = await createFixture({ poolMax: 24 });
+    f = await createFixture({ poolMax: 14 });
     ws = await f.workspace('sess');
   });
   afterAll(async () => {

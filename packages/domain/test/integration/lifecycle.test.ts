@@ -56,7 +56,7 @@ describe('task and review lifecycle in a session (real PostgreSQL, as chorus_app
 
   beforeAll(async () => {
     // 100 concurrent claims must really contend: give the app pool room for 40 connections.
-    f = await createFixture({ poolMax: 40 });
+    f = await createFixture({ poolMax: 36 });
     w = await makeWorld(f, await f.workspace('life'));
     sid = w.session.id;
   });
