@@ -44,9 +44,23 @@ $$;
 -- Rooms in which the current actor holds a live grant. SECURITY DEFINER so that policies on
 -- room_grants itself can use it without recursing into their own policy.
 CREATE FUNCTION chorus_visible_rooms() RETURNS SETOF uuid
-  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-  SELECT room_id FROM room_grants
-   WHERE workspace_id = chorus_ws() AND actor_id = chorus_actor() AND revoked_at IS NULL
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+  SELECT g.room_id FROM public.room_grants g
+   WHERE g.workspace_id = public.chorus_ws() AND g.actor_id = public.chorus_actor()
+     AND g.revoked_at IS NULL
+$$;
+
+-- ---------------------------------------------------------------------------------------------------
+-- pg_temp hardening. A SECURITY DEFINER function whose search_path does not list pg_temp last searches
+-- the caller's temporary schema FIRST, so a role with TEMP privilege could shadow invites, room_grants,
+-- api_tokens or actors with forged temp tables and have the owner-run function trust them. Three layers:
+-- pg_temp last in every definer search_path, every relation schema-qualified in the bodies, and no
+-- TEMP privilege for PUBLIC (chorus_app never needs temporary tables).
+-- ---------------------------------------------------------------------------------------------------
+DO $$
+BEGIN
+  EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
+END;
 $$;
 
 -- ---------------------------------------------------------------------------------------------------
@@ -183,9 +197,9 @@ CREATE POLICY tenant ON review_details
 -- Token -> identity. Zero rows unless the token is live: unknown, revoked and expired all look alike.
 CREATE FUNCTION chorus_resolve_token(p_token_sha256 text)
   RETURNS TABLE (actor_id uuid, workspace_id uuid)
-  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
   SELECT t.actor_id, t.workspace_id
-    FROM api_tokens t
+    FROM public.api_tokens t
    WHERE t.token_sha256 = p_token_sha256
      AND t.revoked_at IS NULL
      AND (t.expires_at IS NULL OR t.expires_at > now())
@@ -197,27 +211,27 @@ $$;
 -- when the code is unknown, used or expired; the caller cannot tell which.
 CREATE FUNCTION chorus_redeem_invite(p_code_sha256 text, p_token_sha256 text, p_display_name text)
   RETURNS TABLE (workspace_id uuid, actor_id uuid, room_id uuid, role text)
-  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 #variable_conflict use_column
 DECLARE
-  v_invite invites%ROWTYPE;
+  v_invite public.invites%ROWTYPE;
   v_actor  uuid;
 BEGIN
-  SELECT * INTO v_invite FROM invites i WHERE i.code_sha256 = p_code_sha256 FOR UPDATE;
+  SELECT * INTO v_invite FROM public.invites i WHERE i.code_sha256 = p_code_sha256 FOR UPDATE;
   IF NOT FOUND OR v_invite.used_at IS NOT NULL OR v_invite.expires_at <= now() THEN
     RETURN;
   END IF;
 
-  INSERT INTO actors (workspace_id, kind, display_name)
+  INSERT INTO public.actors (workspace_id, kind, display_name)
   VALUES (v_invite.workspace_id, 'agent', p_display_name)
   RETURNING id INTO v_actor;
 
-  UPDATE invites SET used_at = now(), used_by_actor_id = v_actor WHERE id = v_invite.id;
+  UPDATE public.invites SET used_at = now(), used_by_actor_id = v_actor WHERE id = v_invite.id;
 
-  INSERT INTO room_grants (workspace_id, actor_id, room_id, role)
+  INSERT INTO public.room_grants (workspace_id, actor_id, room_id, role)
   VALUES (v_invite.workspace_id, v_actor, v_invite.room_id, v_invite.role);
 
-  INSERT INTO api_tokens (workspace_id, actor_id, token_sha256)
+  INSERT INTO public.api_tokens (workspace_id, actor_id, token_sha256)
   VALUES (v_invite.workspace_id, v_actor, p_token_sha256);
 
   RETURN QUERY SELECT v_invite.workspace_id, v_actor, v_invite.room_id, v_invite.role;

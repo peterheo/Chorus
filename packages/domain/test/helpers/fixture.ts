@@ -127,6 +127,8 @@ export function createItemCommand(args: {
   gated?: boolean;
   onHandle?: () => void | Promise<void>;
   emitEvents?: boolean;
+  /** Journal the created item's event under a different room than the item's own (must be rejected). */
+  eventRoomId?: Uuid;
 }): CommandSpec<Created> {
   return {
     type: 'test.create_item',
@@ -156,7 +158,7 @@ export function createItemCommand(args: {
             ? []
             : [
                 {
-                  roomId: args.roomId,
+                  roomId: args.eventRoomId ?? args.roomId,
                   aggregateId: id,
                   aggregateVersion: 1,
                   eventType: 'task.created',
@@ -222,6 +224,23 @@ export function retitleCommand(args: {
                 },
               ],
       };
+    },
+  };
+}
+
+/** A command whose handler wrongly returns null, as untyped or `any` code could. */
+export function nullResultCommand(args: {
+  roomId: Uuid;
+  onHandle: () => void;
+}): CommandSpec<Created> {
+  const base = createItemCommand({ roomId: args.roomId, title: 'null-result' });
+  return {
+    ...base,
+    type: 'test.null_result',
+    handle: async (tx) => {
+      args.onHandle();
+      const done = await base.handle(tx);
+      return { ...done, result: null as unknown as Created };
     },
   };
 }

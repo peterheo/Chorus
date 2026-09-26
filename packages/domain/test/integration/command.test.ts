@@ -1,8 +1,15 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { isChorusError, runCommand, type ErrorCode, type Uuid } from '../../src/index.ts';
+import {
+  hashRequest,
+  isChorusError,
+  runCommand,
+  type ErrorCode,
+  type Uuid,
+} from '../../src/index.ts';
 import {
   createFixture,
   createItemCommand,
+  nullResultCommand,
   retitleCommand,
   type Fixture,
 } from '../helpers/fixture.ts';
@@ -433,13 +440,96 @@ describe('runCommand (real PostgreSQL)', () => {
 
   describe('journal', () => {
     it('writes a commands row and at least one domain event for every successful command', async () => {
-      const rows = await f.db.query<{ status: string; events: string }>(
-        `SELECT c.status, count(e.id) AS events
-           FROM commands c LEFT JOIN domain_events e ON e.command_id = c.id
-          GROUP BY c.id, c.status`,
+      const keys = ['journal-1', 'journal-2', 'journal-3'];
+      const created = await runCommand(
+        f.ctx(f.a, f.a.executorId, keys[0] ?? ''),
+        createItemCommand({ roomId: f.a.roomId, title: 'journal-a' }),
       );
-      expect(rows.length).toBeGreaterThan(5);
+      await runCommand(
+        f.ctx(f.a, f.a.executorId, keys[1] ?? ''),
+        retitleCommand({ itemId: created.item_id as Uuid, expectedVersion: 1, title: 'journal-b' }),
+      );
+      await runCommand(
+        f.ctx(f.a, f.a.executor2Id, keys[2] ?? ''),
+        createItemCommand({ roomId: f.a.roomId, title: 'journal-c' }),
+      );
+      const rows = await f.db.query<{ idempotency_key: string; status: string; events: string }>(
+        `SELECT c.idempotency_key, c.status, count(e.id) AS events
+           FROM commands c LEFT JOIN domain_events e ON e.command_id = c.id
+          WHERE c.idempotency_key = ANY($1::text[])
+          GROUP BY c.id, c.idempotency_key, c.status`,
+        [keys],
+      );
+      expect(rows.map((r) => r.idempotency_key).sort()).toEqual(keys);
       expect(rows.every((r) => r.status === 'succeeded' && Number(r.events) >= 1)).toBe(true);
+    });
+
+    it("refuses to journal an event under a room other than its aggregate's home room", async () => {
+      const actor = await f.addActor(f.a, { roomId: f.a.roomId, role: 'executor' });
+      const otherRoom = await f.addRoom(f.a, 'journal-other-room');
+      await f.db.query(
+        `INSERT INTO room_grants (workspace_id, actor_id, room_id, role) VALUES ($1, $2, $3, 'executor')`,
+        [f.a.id, actor, otherRoom],
+      );
+      const before = await itemCount(f.a.id);
+      // The actor may act in BOTH rooms; the event must still be journaled where the item lives.
+      await expectCode(
+        runCommand(
+          f.ctx(f.a, actor, 'event-room-mismatch'),
+          createItemCommand({ roomId: f.a.roomId, title: 'leaky', eventRoomId: otherRoom }),
+        ),
+        'internal_error',
+      );
+      expect(await itemCount(f.a.id)).toBe(before);
+      expect(
+        await f.count(
+          `SELECT count(*) AS n FROM commands WHERE idempotency_key = 'event-room-mismatch'`,
+        ),
+      ).toBe(0);
+    });
+
+    it('rejects a handler result of null and persists nothing', async () => {
+      let handled = 0;
+      await expectCode(
+        runCommand(
+          f.ctx(f.a, f.a.executorId, 'null-result'),
+          nullResultCommand({
+            roomId: f.a.roomId,
+            onHandle: () => {
+              handled++;
+            },
+          }),
+        ),
+        'internal_error',
+      );
+      expect(handled).toBe(1);
+      expect(await itemCount(f.a.id, 'null-result')).toBe(0);
+      expect(
+        await f.count(`SELECT count(*) AS n FROM commands WHERE idempotency_key = 'null-result'`),
+      ).toBe(0);
+    });
+
+    it('never runs the handler again when a command row exists that is not a succeeded replay', async () => {
+      let handled = 0;
+      const spec = () =>
+        createItemCommand({
+          roomId: f.a.roomId,
+          title: 'stuck',
+          onHandle: () => {
+            handled++;
+          },
+        });
+      await f.db.query(
+        `INSERT INTO commands (workspace_id, actor_id, idempotency_key, request_hash, command_type, status)
+         VALUES ($1, $2, 'stuck-row', $3, 'test.create_item', 'in_progress')`,
+        [f.a.id, f.a.executorId, hashRequest(spec())],
+      );
+      await expectCode(
+        runCommand(f.ctx(f.a, f.a.executorId, 'stuck-row'), spec()),
+        'internal_error',
+      );
+      expect(handled).toBe(0);
+      expect(await itemCount(f.a.id, 'stuck')).toBe(0);
     });
 
     it('rolls back everything when the handler emits no event', async () => {

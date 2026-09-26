@@ -3,7 +3,7 @@
 -- Tenant rule: every table carries workspace_id, and every foreign key includes it (composite), so a
 -- row can never reference a row in another workspace. Each parent exposes UNIQUE (workspace_id, id)
 -- for that purpose. workspaces is the tenant root, so its id is the workspace id.
--- Row-level security is deferred (deviation D7); isolation is enforced by the command layer and tests.
+-- Row-level security is added in 0003_rls.sql.
 
 CREATE TABLE workspaces (
   id         uuid        PRIMARY KEY DEFAULT uuidv7(),

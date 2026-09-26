@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type pg from 'pg';
 import type { Queryable } from './authz.ts';
+import { resolveLeaseDurationSeconds } from './config.ts';
 import { ChorusError } from './errors.ts';
 import { sortedUniqueUuids, type Uuid } from './ids.ts';
 
@@ -29,6 +30,8 @@ export interface CommandContext {
   readonly pool: pg.Pool;
   readonly workspaceId: Uuid;
   readonly actorId: Uuid;
+  /** Lease length for claim/renew, in seconds. Default {@link DEFAULT_LEASE_DURATION_SECONDS}. */
+  readonly leaseDurationSeconds?: number;
   /** `Idempotency-Key` (REST) or the explicit MCP argument. Required on every mutation. */
   readonly idempotencyKey: string | undefined;
 }
@@ -66,13 +69,18 @@ export interface CommandTx {
   readonly workspaceId: Uuid;
   readonly actorId: Uuid;
   readonly commandId: Uuid;
+  /** Resolved lease length in seconds; the single source for claim and renew. */
+  readonly leaseDurationSeconds: number;
   /** Rows locked FOR UPDATE for `targets`, keyed by id. */
   readonly items: ReadonlyMap<Uuid, LockedWorkItem>;
   /** Increments a locked item's version and returns the new one; the handler must emit a matching event. */
   bumpVersion: (itemId: Uuid) => Promise<number>;
 }
 
-export interface CommandSpec<TResult extends JsonValue> {
+/** A command result must be a non-null JSON value: a stored `null` would be indistinguishable from "no response". */
+export type CommandResult = Exclude<JsonValue, null>;
+
+export interface CommandSpec<TResult extends CommandResult> {
   /** Dotted command name, e.g. `task.create`. Part of the request hash. */
   readonly type: string;
   /** The caller's input, canonicalized into the request hash. Must be JSON-serializable. */
@@ -92,7 +100,7 @@ const KEY_PATTERN = /^[\x21-\x7e]{1,200}$/;
 const SERIALIZATION_FAILURE = '40001';
 const DEADLOCK_DETECTED = '40P01';
 
-export async function runCommand<TResult extends JsonValue>(
+export async function runCommand<TResult extends CommandResult>(
   ctx: CommandContext,
   spec: CommandSpec<TResult>,
 ): Promise<TResult> {
@@ -127,7 +135,7 @@ export async function runCommand<TResult extends JsonValue>(
   }
 }
 
-async function runOnce<TResult extends JsonValue>(
+async function runOnce<TResult extends CommandResult>(
   ctx: CommandContext,
   key: string,
   requestHash: string,
@@ -162,7 +170,7 @@ interface CommandRow {
   response: JsonValue | null;
 }
 
-async function executeInTransaction<TResult extends JsonValue>(
+async function executeInTransaction<TResult extends CommandResult>(
   client: pg.PoolClient,
   ctx: CommandContext,
   key: string,
@@ -190,8 +198,8 @@ async function executeInTransaction<TResult extends JsonValue>(
      RETURNING id`,
     [workspaceId, actorId, key, requestHash, spec.type],
   );
-  let commandId = inserted.rows[0]?.id;
-  if (commandId === undefined) {
+  const insertedId = inserted.rows[0]?.id;
+  if (insertedId === undefined) {
     const existing = await client.query<CommandRow>(
       `SELECT id, request_hash, status, response FROM commands
         WHERE workspace_id = $1 AND actor_id = $2 AND idempotency_key = $3 FOR UPDATE`,
@@ -207,14 +215,22 @@ async function executeInTransaction<TResult extends JsonValue>(
         'This idempotency key was already used with a different request.',
       );
     }
-    if (row.status === 'succeeded' && row.response !== null) {
+    if (row.status !== 'succeeded' || row.response === null) {
+      // A committed command row is always succeeded with a response. Anything else is corruption or a
+      // bug; never fall through and run the handler a second time.
+      throw new ChorusError('internal_error', 'Idempotency record is not in a replayable state.');
+    }
+    {
       // Repeat-safe, but not authority-free: re-authorize now, and fail exactly as a fresh call would.
+      // (Creates re-authorize against the input room; that equals the created object's room until a
+      // move-room command exists. Revisit this if one is ever added.)
       const replayItems = await loadTargets(client, workspaceId, spec.targets ?? [], false);
       await spec.authorize({
         db: client,
         workspaceId,
         actorId,
         commandId: row.id,
+        leaseDurationSeconds: resolveLeaseDurationSeconds(ctx.leaseDurationSeconds),
         items: replayItems,
         bumpVersion: () => {
           throw new ChorusError('internal_error', 'authorize must not change versions.');
@@ -222,8 +238,10 @@ async function executeInTransaction<TResult extends JsonValue>(
       });
       return row.response as TResult;
     }
-    commandId = row.id; // Own uncommitted row: cannot occur for another session's in-flight command.
   }
+
+  // Every path that left `insertedId` undefined has already replayed or thrown.
+  const commandId: Uuid = insertedId;
 
   if (spec.gated === true) {
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
@@ -238,6 +256,7 @@ async function executeInTransaction<TResult extends JsonValue>(
     workspaceId,
     actorId,
     commandId,
+    leaseDurationSeconds: resolveLeaseDurationSeconds(ctx.leaseDurationSeconds),
     items,
     bumpVersion: async (itemId) => {
       const locked = items.get(itemId);
@@ -264,6 +283,9 @@ async function executeInTransaction<TResult extends JsonValue>(
   checkExpectedVersions(spec.targets ?? [], items);
 
   const { result, events } = await spec.handle(tx);
+  if ((result as unknown) === null || (result as unknown) === undefined) {
+    throw new ChorusError('internal_error', 'A command result must be a non-null JSON value.');
+  }
   assertJournaled(events, bumped);
   await appendEvents(client, tx, events);
 
@@ -359,11 +381,42 @@ function assertJournaled(
   }
 }
 
+/**
+ * An event's room must be its aggregate's home room, checked here inside the transaction rather than
+ * trusted from the handler: otherwise an actor with grants in rooms A and B could journal a B-item
+ * event under room A and expose it to A-only members.
+ */
+async function assertEventRooms(
+  client: pg.PoolClient,
+  tx: CommandTx,
+  events: readonly DomainEventDraft[],
+): Promise<void> {
+  const ids = sortedUniqueUuids(events.map((e) => e.aggregateId));
+  const { rows } = await client.query<{ id: Uuid; home_room_id: Uuid }>(
+    'SELECT id, home_room_id FROM work_items WHERE workspace_id = $1 AND id = ANY($2::uuid[])',
+    [tx.workspaceId, ids],
+  );
+  const homeRoom = new Map(rows.map((r) => [r.id, r.home_room_id]));
+  for (const event of events) {
+    const home = homeRoom.get(event.aggregateId);
+    if (home === undefined || home !== event.roomId) {
+      throw new ChorusError(
+        'internal_error',
+        "An event must be journaled in its aggregate's home room.",
+        {
+          details: { aggregate_id: event.aggregateId, event_type: event.eventType },
+        },
+      );
+    }
+  }
+}
+
 async function appendEvents(
   client: pg.PoolClient,
   tx: CommandTx,
   events: readonly DomainEventDraft[],
 ): Promise<void> {
+  await assertEventRooms(client, tx, events);
   for (const event of events) {
     await client.query(
       `INSERT INTO domain_events

@@ -178,7 +178,8 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
         'chorus_visible_rooms',
       ]);
       for (const fn of fns) {
-        expect(fn.proconfig?.some((c) => c.startsWith('search_path=pg_catalog'))).toBe(true);
+        // pg_temp must come LAST; when omitted Postgres searches it first and temp tables can shadow.
+        expect(fn.proconfig, fn.proname).toEqual(['search_path=pg_catalog, public, pg_temp']);
         expect(fn.proacl ?? '', `${fn.proname} must not be executable by PUBLIC`).not.toMatch(
           /(^|[{,])=X/,
         );
@@ -333,6 +334,122 @@ describe('row-level security, as the runtime role chorus_app (real PostgreSQL)',
           ),
         ),
       ).rejects.toMatchObject({ code: '42501' });
+    });
+  });
+
+  describe('pg_temp shadowing of SECURITY DEFINER functions', () => {
+    const db = () => f.db.url.split('/').pop() ?? '';
+
+    /** Attacker-style lookalikes: explicit columns, because LIKE would need SELECT the role lacks. */
+    const LOOKALIKE: Record<string, string> = {
+      invites: `CREATE TEMP TABLE invites (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, room_id uuid, role text,
+        code_sha256 text, created_at timestamptz DEFAULT now(), expires_at timestamptz, used_at timestamptz, used_by_actor_id uuid)`,
+      actors: `CREATE TEMP TABLE actors (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, kind text, display_name text,
+        created_at timestamptz DEFAULT now())`,
+      room_grants: `CREATE TEMP TABLE room_grants (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, actor_id uuid, room_id uuid,
+        role text, granted_at timestamptz DEFAULT now(), revoked_at timestamptz)`,
+      api_tokens: `CREATE TEMP TABLE api_tokens (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, actor_id uuid,
+        token_sha256 text, created_at timestamptz DEFAULT now(), expires_at timestamptz, revoked_at timestamptz)`,
+    };
+
+    it('gives the runtime role no TEMP privilege by default', async () => {
+      await expect(f.pool.query('CREATE TEMP TABLE invites (x int)')).rejects.toMatchObject({
+        code: '42501',
+      });
+    });
+
+    describe('even if TEMP were granted, forged temp tables are ignored', () => {
+      beforeAll(async () => {
+        await owner(`GRANT TEMPORARY ON DATABASE ${db()} TO chorus_app`);
+      });
+      afterAll(async () => {
+        await owner(`REVOKE TEMPORARY ON DATABASE ${db()} FROM chorus_app`);
+      });
+
+      it('chorus_redeem_invite ignores a forged temp invites table', async () => {
+        const client = await f.pool.connect();
+        try {
+          await client.query(LOOKALIKE['invites'] ?? '');
+          await client.query(
+            `INSERT INTO pg_temp.invites (workspace_id, room_id, role, code_sha256, expires_at)
+             VALUES ($1, $2, 'manager', $3, now() + interval '1 hour')`,
+            [f.a.id, f.a.roomId, sha256('forged-code')],
+          );
+          const { rows } = await client.query('SELECT * FROM chorus_redeem_invite($1, $2, $3)', [
+            sha256('forged-code'),
+            sha256('forged-token'),
+            'attacker',
+          ]);
+          expect(rows).toEqual([]);
+        } finally {
+          client.release(true);
+        }
+        expect(
+          await f.count(`SELECT count(*) AS n FROM actors WHERE display_name = 'attacker'`),
+        ).toBe(0);
+        expect(
+          await f.count(`SELECT count(*) AS n FROM api_tokens WHERE token_sha256 = $1`, [
+            sha256('forged-token'),
+          ]),
+        ).toBe(0);
+      });
+
+      it('a real redemption writes to the real tables even when temp lookalikes exist', async () => {
+        await owner(
+          `INSERT INTO invites (workspace_id, room_id, role, code_sha256, expires_at)
+           VALUES ($1, $2, 'executor', $3, now() + interval '1 hour')`,
+          [f.a.id, f.a.roomId, sha256('real-code')],
+        );
+        const client = await f.pool.connect();
+        try {
+          for (const table of ['actors', 'room_grants', 'api_tokens']) {
+            await client.query(LOOKALIKE[table] ?? '');
+          }
+          const { rows } = await client.query<{ actor_id: string }>(
+            'SELECT * FROM chorus_redeem_invite($1, $2, $3)',
+            [sha256('real-code'), sha256('real-token'), 'legit'],
+          );
+          expect(rows).toHaveLength(1);
+          const temp = await client.query('SELECT (SELECT count(*) FROM pg_temp.actors) AS n');
+          expect(Number((temp.rows[0] as { n: string }).n)).toBe(0);
+        } finally {
+          client.release(true);
+        }
+        expect(await f.count(`SELECT count(*) AS n FROM actors WHERE display_name = 'legit'`)).toBe(
+          1,
+        );
+      });
+
+      it('chorus_visible_rooms and chorus_resolve_token ignore forged temp tables', async () => {
+        const client = await f.pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(
+            `SELECT set_config('chorus.workspace_id', $1, true), set_config('chorus.actor_id', $2, true)`,
+            [f.a.id, f.a.outsiderId],
+          );
+          await client.query(LOOKALIKE['room_grants'] ?? '');
+          await client.query(
+            `INSERT INTO pg_temp.room_grants (workspace_id, actor_id, room_id, role) VALUES ($1, $2, $3, 'manager')`,
+            [f.a.id, f.a.outsiderId, secondRoomA],
+          );
+          const rooms = await client.query('SELECT * FROM chorus_visible_rooms()');
+          expect(rooms.rows).toEqual([]);
+
+          await client.query(LOOKALIKE['api_tokens'] ?? '');
+          await client.query(
+            `INSERT INTO pg_temp.api_tokens (workspace_id, actor_id, token_sha256) VALUES ($1, $2, $3)`,
+            [f.a.id, f.a.outsiderId, sha256('forged-live-token')],
+          );
+          const resolved = await client.query('SELECT * FROM chorus_resolve_token($1)', [
+            sha256('forged-live-token'),
+          ]);
+          expect(resolved.rows).toEqual([]);
+          await client.query('ROLLBACK');
+        } finally {
+          client.release(true);
+        }
+      });
     });
   });
 

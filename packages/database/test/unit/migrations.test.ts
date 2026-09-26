@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MigrationError } from '../../src/errors.ts';
+import { assertTestDatabaseUrl } from '../../src/testing.ts';
 import {
   checksumOf,
   findTransactionControl,
@@ -96,5 +97,19 @@ describe('findTransactionControl', () => {
 
   it('does not flag identifiers that merely start with the keyword', () => {
     expect(findTransactionControl('CREATE TABLE beginnings (id int);')).toBeUndefined();
+  });
+});
+
+describe('assertTestDatabaseUrl', () => {
+  it('accepts databases named *_test', () => {
+    expect(() => {
+      assertTestDatabaseUrl('postgres://u:p@localhost:5432/chorus_test');
+    }).not.toThrow();
+  });
+
+  it.each(['chorus_dev', 'chorus', 'chorus_test_prod', 'production'])('refuses %s', (name) => {
+    expect(() => {
+      assertTestDatabaseUrl(`postgres://u:p@db.example.com:5432/${name}`);
+    }).toThrow(/ends in "_test"/);
   });
 });

@@ -46,7 +46,12 @@ DATABASE_URL=postgres://chorus:chorus@localhost:5432/chorus_dev pnpm migrate
   CHORUS_APP_PASSWORD='<secret>' DATABASE_URL=<owner url> pnpm migrate   # migrates, then sets the password
   ```
 
-  Tests set their own throwaway password on the local test cluster.
+  Tests set their own throwaway password on the local test cluster, and refuse to run unless
+  `DATABASE_URL` names a database ending in `_test`.
+
+- `ALTER ROLE ... PASSWORD` can appear in server logs when `log_statement` is `ddl` or `all`. Prefer
+  passing a pre-hashed SCRAM verifier (a value starting with `SCRAM-SHA-256$`) as
+  `CHORUS_APP_PASSWORD`; PostgreSQL stores such values as given.
 
 - Transactions set `chorus.workspace_id` and `chorus.actor_id` (transaction-local) through `runCommand`
   and `withReadTx`; with neither set the runtime role sees nothing.
