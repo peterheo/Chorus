@@ -1,0 +1,6 @@
+node_modules
+dist
+coverage
+pnpm-lock.yaml
+# Verbatim copy of the engineering standards artifact; keep byte-identical to the source.
+CONTRIBUTING.md
