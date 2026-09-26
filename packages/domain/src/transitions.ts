@@ -1,20 +1,13 @@
 import { ChorusError } from './errors.ts';
 
 /**
- * Task lifecycle (RC-WP2 spec section 7). Pure, so the whole matrix is unit-testable. `backlog` and
- * `cancelled` exist in the schema but no RC command produces or accepts them.
+ * Task lifecycle (RC-WP2 spec section 7, states per WP3 rev 4). Pure, so the whole matrix is unit-testable.
+ * `cancelled` exists in the schema but no P1 command produces it (cancel/reopen arrive in P3).
  */
-export const TASK_STATES = [
-  'backlog',
-  'ready',
-  'in_progress',
-  'review',
-  'done',
-  'cancelled',
-] as const;
+export const TASK_STATES = ['ready', 'in_progress', 'review', 'done', 'cancelled'] as const;
 export type TaskState = (typeof TASK_STATES)[number];
 
-export const REVIEW_STATES = ['requested', 'approved', 'changes_requested'] as const;
+export const REVIEW_STATES = ['requested', 'approved', 'changes_requested', 'cancelled'] as const;
 export type ReviewState = (typeof REVIEW_STATES)[number];
 
 export type TaskCommand = 'claim' | 'renew_lease' | 'submit_result' | 'request_review' | 'complete';

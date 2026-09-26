@@ -1,4 +1,5 @@
-import { runCommand, withReadTx, type CommandContext, type CommandTx } from '../command.ts';
+import { requireAction } from '../authz.ts';
+import { runCommand, withReadTx, type CommandContext } from '../command.ts';
 import { ChorusError } from '../errors.ts';
 import type { Uuid } from '../ids.ts';
 import { assertReviewAcceptsVerdict, assertTaskTransition } from '../transitions.ts';
@@ -12,10 +13,12 @@ import {
   requireUuid,
 } from '../validation.ts';
 import {
+  evaluateCompletionGates,
   loadLatestRevision,
   loadReviewSummaries,
   loadTaskDetails,
-  requireRole,
+  lockedItem,
+  requireSession,
   type ReviewSummary,
 } from './support.ts';
 
@@ -36,11 +39,13 @@ export async function requestReview(
   input: unknown,
 ): Promise<RequestReviewResponse> {
   const raw = requireObject(input, [
+    'session_id',
     'task_id',
     'expected_version',
     'revision',
     'reviewer_actor_id',
   ]);
+  const sessionId = requireUuid(raw['session_id'], 'session_id');
   const taskId = requireUuid(raw['task_id'], 'task_id');
   const expectedVersion = requireInteger(raw['expected_version'], 'expected_version', 1);
   const revision = requireInteger(raw['revision'], 'revision', 1);
@@ -48,12 +53,15 @@ export async function requestReview(
 
   return runCommand(ctx, {
     type: 'review.request',
+    session: { id: sessionId },
     input: { task_id: taskId, revision, reviewer_actor_id: reviewerId },
     targets: [{ id: taskId, expectedVersion, kind: 'task' }],
-    authorize: async (tx) => {
+    authorize: (tx) => {
+      // The owner (or a manager) asks for the review. Reviewer checks run in `handle`, after the version
+      // and lifecycle checks, so a replay re-authorizes only the caller.
+      requireAction(tx, 'request_review');
       const task = lockedItem(tx, taskId);
-      const roles = await requireRole(tx, task.homeRoomId, ['executor', 'manager']);
-      if (task.ownerActorId !== tx.actorId && !roles.includes('manager')) {
+      if (task.ownerActorId !== tx.actorId && !tx.roles.includes('manager')) {
         throw new ChorusError(
           'action_forbidden',
           'Only the owner or a manager can request a review.',
@@ -62,18 +70,17 @@ export async function requestReview(
           },
         );
       }
-      // A2.1-9: reviewer_is_submitter / reviewer_not_eligible run in `handle`, after the version and
-      // lifecycle checks, so replay re-authorizes only the caller (spec section 5).
+      return Promise.resolve();
     },
     handle: async (tx) => {
       const task = lockedItem(tx, taskId);
+      const session = requireSession(tx);
       assertTaskTransition('request_review', task.state);
       const latest = await loadLatestRevision(tx.db, tx.workspaceId, taskId);
       if (latest === null) {
         throw new ChorusError('internal_error', 'A task in review has no result revision.');
       }
-      // A2.1-9 order after lifecycle: reviewer_is_submitter (403), reviewer_not_eligible (400),
-      // then the review gates (precedence 11): stale, duplicate.
+      // Separation (WP3 rev 4 section 5.6): the reviewer is never the submitter or the owner.
       if (latest.submittedBy === reviewerId) {
         throw new ChorusError(
           'action_forbidden',
@@ -83,19 +90,31 @@ export async function requestReview(
           },
         );
       }
-      const grant = await tx.db.query(
-        `SELECT 1 FROM room_grants
-          WHERE workspace_id = $1 AND actor_id = $2 AND room_id = $3
-            AND role = 'reviewer' AND revoked_at IS NULL`,
-        [tx.workspaceId, reviewerId, task.homeRoomId],
+      if (task.ownerActorId === reviewerId) {
+        throw new ChorusError('action_forbidden', "A task's owner cannot review it.", {
+          details: { reason: 'reviewer_is_owner' },
+        });
+      }
+      // The reviewer must be a live member of THIS session; a manager reviews only if the session allows it.
+      const reviewer = await tx.db.query<{ roles: string[] }>(
+        `SELECT roles FROM session_members
+          WHERE workspace_id = $1 AND session_id = $2 AND actor_id = $3 AND removed_at IS NULL`,
+        [tx.workspaceId, sessionId, reviewerId],
       );
-      if (grant.rowCount === 0) {
+      const reviewerRoles = reviewer.rows[0]?.roles;
+      if (reviewerRoles === undefined) {
+        throw new ChorusError('invalid_request', 'The reviewer is not a member of this session.', {
+          details: { field: 'reviewer_actor_id', reason: 'reviewer_not_eligible' },
+        });
+      }
+      if (reviewerRoles.includes('manager') && !session.managerReviewAllowed) {
         throw new ChorusError(
           'invalid_request',
-          'The reviewer does not hold the reviewer role in this room.',
+          'This session does not allow managers to review.',
           { details: { field: 'reviewer_actor_id', reason: 'reviewer_not_eligible' } },
         );
       }
+      // Review gates (precedence 11): stale, then duplicate.
       if (revision !== latest.revision) {
         throw new ChorusError('review_stale', 'Only the latest result revision can be reviewed.', {
           details: { latest_revision: latest.revision },
@@ -111,26 +130,35 @@ export async function requestReview(
       const title = await reviewTitle(tx, taskId, revision);
       const inserted = await tx.db.query<{ id: Uuid }>(
         `INSERT INTO work_items
-           (workspace_id, kind, home_room_id, title, state, creator_actor_id, owner_actor_id)
-         VALUES ($1, 'review', $2, $3, 'requested', $4, $5)
+           (workspace_id, session_id, board_id, kind, home_room_id, title, state, creator_actor_id,
+            owner_actor_id)
+         VALUES ($1, $2, $3, 'review', $4, $5, 'requested', $6, $7)
          RETURNING id`,
-        [tx.workspaceId, task.homeRoomId, title, tx.actorId, reviewerId],
+        [tx.workspaceId, sessionId, task.boardId, task.homeRoomId, title, tx.actorId, reviewerId],
       );
       const reviewId = inserted.rows[0]?.id;
       if (reviewId === undefined) {
         throw new ChorusError('internal_error', 'Review insert returned no row.');
       }
+      // The review snapshots the criteria the revision was written under.
+      const criteria = await tx.db.query<{ acceptance_criteria: string[] }>(
+        `SELECT acceptance_criteria FROM task_criteria_revisions
+          WHERE workspace_id = $1 AND task_id = $2 AND criteria_revision = $3`,
+        [tx.workspaceId, taskId, latest.criteriaRevision],
+      );
       await tx.db.query(
         `INSERT INTO review_details
-           (workspace_id, review_item_id, subject_task_id, result_revision, content_sha256, criteria)
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+           (workspace_id, session_id, review_item_id, subject_task_id, result_revision, content_sha256,
+            criteria)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
         [
           tx.workspaceId,
+          sessionId,
           reviewId,
           taskId,
           revision,
           latest.contentSha256,
-          JSON.stringify(details.criteria),
+          JSON.stringify(criteria.rows[0]?.acceptance_criteria ?? details.criteria),
         ],
       );
       const taskVersion = await tx.bumpVersion(taskId);
@@ -164,8 +192,12 @@ export async function requestReview(
   });
 }
 
-/** Q5 default: `Review: <task title> (revision N)`, cut to 200 code points; the work_items title is NOT NULL. */
-async function reviewTitle(tx: CommandTx, taskId: Uuid, revision: number): Promise<string> {
+/** `Review: <task title> (revision N)`, cut to 200 code points; the work_items title is NOT NULL. */
+async function reviewTitle(
+  tx: Parameters<Parameters<typeof runCommand>[1]['handle']>[0],
+  taskId: Uuid,
+  revision: number,
+): Promise<string> {
   const { rows } = await tx.db.query<{ title: string }>(
     'SELECT title FROM work_items WHERE workspace_id = $1 AND id = $2',
     [tx.workspaceId, taskId],
@@ -183,16 +215,22 @@ async function reviewTitle(tx: CommandTx, taskId: Uuid, revision: number): Promi
 // review_verdict
 // --------------------------------------------------------------------------------------------------
 
-export type VerdictResponse = { review: ReviewSummary };
+export type VerdictResponse = {
+  review: ReviewSummary;
+  /** The task after the verdict: `done` when the approval completed it automatically. */
+  task: { id: string; version: number; state: string };
+};
 
 export async function reviewVerdict(ctx: CommandContext, input: unknown): Promise<VerdictResponse> {
   const raw = requireObject(input, [
+    'session_id',
     'review_id',
     'expected_version',
     'verdict',
     'content_sha256',
     'notes',
   ]);
+  const sessionId = requireUuid(raw['session_id'], 'session_id');
   const reviewId = requireUuid(raw['review_id'], 'review_id');
   const expectedVersion = requireInteger(raw['expected_version'], 'expected_version', 1);
   const verdict = requireEnum(raw['verdict'], 'verdict', VERDICTS);
@@ -205,8 +243,8 @@ export async function reviewVerdict(ctx: CommandContext, input: unknown): Promis
     const { rows } = await db.query<{ subject_task_id: Uuid }>(
       `SELECT d.subject_task_id FROM review_details d
          JOIN work_items w ON w.workspace_id = d.workspace_id AND w.id = d.review_item_id
-        WHERE d.workspace_id = $1 AND d.review_item_id = $2 AND w.kind = 'review'`,
-      [ctx.workspaceId, reviewId],
+        WHERE d.workspace_id = $1 AND d.session_id = $2 AND d.review_item_id = $3 AND w.kind = 'review'`,
+      [ctx.workspaceId, sessionId, reviewId],
     );
     return rows[0]?.subject_task_id;
   });
@@ -215,16 +253,22 @@ export async function reviewVerdict(ctx: CommandContext, input: unknown): Promis
 
   return runCommand(ctx, {
     type: 'review.verdict',
+    session: { id: sessionId },
     input: { review_id: reviewId, verdict, content_sha256: digest, notes },
     targets: [
       { id: reviewId, expectedVersion, kind: 'review' },
-      // Locked with the review so verdicts serialize with completion, but never version-bumped here.
+      // Locked with the review so verdicts serialize with completion. An approval may complete the task,
+      // in which case the handler bumps its version; otherwise the task is untouched.
       { id: taskId, lockOnly: true, kind: 'task' },
     ],
-    authorize: async (tx) => {
+    authorize: (tx) => {
+      requireAction(tx, 'review');
       const review = lockedItem(tx, reviewId);
-      await requireRole(tx, review.homeRoomId, ['reviewer']);
-      if (review.ownerActorId !== tx.actorId) {
+      const session = requireSession(tx);
+      // The assigned reviewer, or (only if the session allows it) a manager.
+      const assigned = review.ownerActorId === tx.actorId;
+      const eligibleManager = tx.roles.includes('manager') && session.managerReviewAllowed;
+      if (!assigned && !eligibleManager) {
         throw new ChorusError(
           'action_forbidden',
           'Only the assigned reviewer can record a verdict.',
@@ -233,9 +277,11 @@ export async function reviewVerdict(ctx: CommandContext, input: unknown): Promis
           },
         );
       }
+      return Promise.resolve();
     },
     handle: async (tx) => {
       const review = lockedItem(tx, reviewId);
+      const task = lockedItem(tx, taskId);
       const details = await tx.db.query<{
         subject_task_id: Uuid;
         result_revision: number;
@@ -254,8 +300,19 @@ export async function reviewVerdict(ctx: CommandContext, input: unknown): Promis
       }
 
       assertReviewAcceptsVerdict(review.state);
-      // Review gates (precedence 11): stale first, then the digest.
       const latest = await loadLatestRevision(tx.db, tx.workspaceId, taskId);
+      // Separation holds at verdict time too, whoever is recording it.
+      if (latest !== null && latest.submittedBy === tx.actorId) {
+        throw new ChorusError('action_forbidden', 'The submitter cannot review their own result.', {
+          details: { reason: 'reviewer_is_submitter' },
+        });
+      }
+      if (task.ownerActorId === tx.actorId) {
+        throw new ChorusError('action_forbidden', "A task's owner cannot review it.", {
+          details: { reason: 'reviewer_is_owner' },
+        });
+      }
+      // Review gates (precedence 11): stale first, then the digest.
       if (latest === null || stored.result_revision < latest.revision) {
         throw new ChorusError('review_stale', 'The reviewed revision has been superseded.', {
           details: {
@@ -284,24 +341,52 @@ export async function reviewVerdict(ctx: CommandContext, input: unknown): Promis
       const version = await tx.bumpVersion(reviewId);
       const [summary] = await loadReviewSummaries(tx.db, tx.workspaceId, [reviewId]);
       if (summary === undefined) throw new ChorusError('internal_error', 'Review not readable.');
+
+      const events: import('../command.ts').DomainEventDraft[] = [
+        {
+          roomId: review.homeRoomId,
+          aggregateId: reviewId,
+          aggregateVersion: version,
+          eventType: 'review.verdict_recorded',
+          payload: { task_id: taskId, revision: stored.result_revision, verdict },
+        },
+      ];
+
+      // Automatic completion: an approval of the latest revision completes the task in this transaction
+      // when every gate passes. If a gate fails the approval still stands and the task stays in review.
+      let taskVersion = task.version;
+      let taskState = task.state;
+      if (verdict === 'approved') {
+        const gates = await evaluateCompletionGates(tx, { ...task });
+        // The gate check reads the review row we just updated (approved) through the same transaction.
+        if (gates.ok) {
+          await tx.db.query(
+            `UPDATE work_items SET state = 'done' WHERE workspace_id = $1 AND id = $2`,
+            [tx.workspaceId, taskId],
+          );
+          await tx.db.query(
+            `UPDATE task_leases SET instance_id = NULL WHERE workspace_id = $1 AND task_id = $2`,
+            [tx.workspaceId, taskId],
+          );
+          taskVersion = await tx.bumpVersion(taskId);
+          taskState = 'done';
+          events.push({
+            roomId: task.homeRoomId,
+            aggregateId: taskId,
+            aggregateVersion: taskVersion,
+            eventType: 'task.completed',
+            payload: {
+              revision: gates.revision,
+              review_id: gates.reviewId,
+              trigger: 'review_approved',
+            },
+          });
+        }
+      }
       return {
-        result: { review: summary },
-        events: [
-          {
-            roomId: review.homeRoomId,
-            aggregateId: reviewId,
-            aggregateVersion: version,
-            eventType: 'review.verdict_recorded',
-            payload: { task_id: taskId, revision: stored.result_revision, verdict },
-          },
-        ],
+        result: { review: summary, task: { id: taskId, version: taskVersion, state: taskState } },
+        events,
       };
     },
   });
-}
-
-function lockedItem(tx: CommandTx, id: Uuid) {
-  const item = tx.items.get(id);
-  if (item === undefined) throw new ChorusError('internal_error', 'Target was not locked.');
-  return item;
 }

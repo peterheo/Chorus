@@ -1,4 +1,11 @@
-export { requireRoomRole, type Queryable, type RoomRole } from './authz.ts';
+export {
+  ROLE_ACTIONS,
+  actionsOf,
+  hasAction,
+  requireAction,
+  type Queryable,
+  type SessionAction,
+} from './authz.ts';
 export {
   canonicalJson,
   hashRequest,
@@ -13,6 +20,8 @@ export {
   type DomainEventDraft,
   type JsonValue,
   type LockedWorkItem,
+  type SessionFacts,
+  type SessionRole,
   type WorkItemKind,
 } from './command.ts';
 export {
@@ -34,6 +43,21 @@ export {
   type TaskSummary,
 } from './commands/tasks.ts';
 export {
+  createBoard,
+  createSession,
+  grantRole,
+  joinSession,
+  leaveSession,
+  removeMember,
+  revokeRole,
+  setSessionPolicy,
+  type MemberRemoved,
+  type PolicyChanged,
+  type RoleChanged,
+  type SessionCreated,
+  type SessionJoined,
+} from './commands/sessions.ts';
+export {
   requestReview,
   reviewVerdict,
   type RequestReviewResponse,
@@ -42,6 +66,13 @@ export {
 export type { ReviewSummary } from './commands/support.ts';
 export {
   getResult,
+  getSession,
+  listBoards,
+  listMembers,
+  listSessions,
+  type MemberListing,
+  type SessionDetail,
+  type SessionListing,
   getTask,
   listMyReviews,
   listWork,

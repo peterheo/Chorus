@@ -1,21 +1,10 @@
-import type { Queryable, RoomRole } from '../authz.ts';
-import { requireRoomRole } from '../authz.ts';
-import type { CommandTx } from '../command.ts';
+import type { Queryable } from '../authz.ts';
+import type { CommandTx, LockedWorkItem } from '../command.ts';
 import { ChorusError } from '../errors.ts';
 import type { Uuid } from '../ids.ts';
 
 export const iso = (value: Date | string | null): string | null =>
   value === null ? null : new Date(value).toISOString();
-
-/** Role check in the actor's current grants for a room: not_found if invisible, action_forbidden if not permitted. */
-export function requireRole(tx: CommandTx, roomId: Uuid, allowed: readonly RoomRole[]) {
-  return requireRoomRole(tx.db, {
-    workspaceId: tx.workspaceId,
-    actorId: tx.actorId,
-    roomId,
-    allowed,
-  });
-}
 
 export function requireInstance(tx: CommandTx): Uuid {
   if (tx.instanceId === null) {
@@ -24,6 +13,19 @@ export function requireInstance(tx: CommandTx): Uuid {
     });
   }
   return tx.instanceId;
+}
+
+export function requireSession(tx: CommandTx) {
+  if (tx.session === undefined) {
+    throw new ChorusError('internal_error', 'A session-scoped command ran without a session.');
+  }
+  return tx.session;
+}
+
+export function lockedItem(tx: CommandTx, id: Uuid): LockedWorkItem {
+  const item = tx.items.get(id);
+  if (item === undefined) throw new ChorusError('internal_error', 'Target was not locked.');
+  return item;
 }
 
 export interface LeaseRow {
@@ -59,8 +61,10 @@ export async function lockLease(db: Queryable, workspaceId: Uuid, taskId: Uuid):
 
 export interface TaskDetails {
   readonly criteria: readonly string[];
+  readonly criteriaRevision: number;
   readonly reviewRequired: boolean;
   readonly shareable: boolean;
+  readonly claimPolicy: string;
 }
 
 export async function loadTaskDetails(
@@ -70,10 +74,12 @@ export async function loadTaskDetails(
 ): Promise<TaskDetails> {
   const { rows } = await db.query<{
     acceptance_criteria: string[];
+    criteria_revision: number;
     review_required: boolean;
     shareable: boolean;
+    claim_policy: string;
   }>(
-    `SELECT acceptance_criteria, review_required, shareable
+    `SELECT acceptance_criteria, criteria_revision, review_required, shareable, claim_policy
        FROM task_details WHERE workspace_id = $1 AND item_id = $2`,
     [workspaceId, taskId],
   );
@@ -81,8 +87,10 @@ export async function loadTaskDetails(
   if (row === undefined) throw new ChorusError('internal_error', 'Task has no details row.');
   return {
     criteria: row.acceptance_criteria,
+    criteriaRevision: row.criteria_revision,
     reviewRequired: row.review_required,
     shareable: row.shareable,
+    claimPolicy: row.claim_policy,
   };
 }
 
@@ -90,11 +98,15 @@ export interface LatestRevision {
   readonly revision: number;
   readonly contentSha256: string;
   readonly submittedBy: Uuid;
+  readonly criteriaRevision: number;
+  readonly workCycle: number;
+  /** The single NON-cancelled review of this revision, if any. */
   readonly reviewId: Uuid | null;
   readonly reviewState: string | null;
+  readonly reviewerId: Uuid | null;
 }
 
-/** The task's newest result revision and the (single) review of it, if any. */
+/** The task's newest result revision and the (single) live review of it, if any. */
 export async function loadLatestRevision(
   db: Queryable,
   workspaceId: Uuid,
@@ -104,15 +116,18 @@ export async function loadLatestRevision(
     revision: number;
     content_sha256: string;
     submitted_by: Uuid;
+    criteria_revision: number;
+    work_cycle: number;
     review_id: Uuid | null;
     review_state: string | null;
+    reviewer_id: Uuid | null;
   }>(
-    `SELECT r.revision, r.content_sha256, r.submitted_by,
-            w.id AS review_id, w.state AS review_state
+    `SELECT r.revision, r.content_sha256, r.submitted_by, r.criteria_revision, r.work_cycle,
+            w.id AS review_id, w.state AS review_state, w.owner_actor_id AS reviewer_id
        FROM task_result_revisions r
        LEFT JOIN review_details d
          ON d.workspace_id = r.workspace_id AND d.subject_task_id = r.task_id
-        AND d.result_revision = r.revision
+        AND d.result_revision = r.revision AND d.cancelled_at IS NULL
        LEFT JOIN work_items w ON w.workspace_id = d.workspace_id AND w.id = d.review_item_id
       WHERE r.workspace_id = $1 AND r.task_id = $2
       ORDER BY r.revision DESC LIMIT 1`,
@@ -124,8 +139,80 @@ export async function loadLatestRevision(
     revision: row.revision,
     contentSha256: row.content_sha256,
     submittedBy: row.submitted_by,
+    criteriaRevision: row.criteria_revision,
+    workCycle: row.work_cycle,
     reviewId: row.review_id,
     reviewState: row.review_state,
+    reviewerId: row.reviewer_id,
+  };
+}
+
+export type CompletionVerdict =
+  | { readonly ok: true; readonly revision: number; readonly reviewId: string | null }
+  | { readonly ok: false; readonly error: ChorusError };
+
+/**
+ * The completion gates (WP3 rev 4 section 5.7), shared by the manager's `complete` and by automatic
+ * completion on approval: state `review`, not blocked, the latest revision is under the CURRENT criteria
+ * revision and work cycle, and (if a review is required) that revision's live review is approved.
+ */
+export async function evaluateCompletionGates(
+  tx: CommandTx,
+  task: LockedWorkItem,
+): Promise<CompletionVerdict> {
+  const fail = (error: ChorusError): CompletionVerdict => ({ ok: false, error });
+  if (task.state !== 'review') {
+    return fail(
+      new ChorusError('invalid_transition', `A task in state "${task.state}" cannot complete.`, {
+        details: {
+          reason: task.state === 'done' ? 'terminal' : 'invalid_state',
+          state: task.state,
+        },
+      }),
+    );
+  }
+  if (task.blockedAt !== null) {
+    return fail(
+      new ChorusError('invalid_transition', 'A blocked task cannot complete.', {
+        details: { reason: 'blocked', state: task.state },
+      }),
+    );
+  }
+  const details = await loadTaskDetails(tx.db, tx.workspaceId, task.id);
+  const latest = await loadLatestRevision(tx.db, tx.workspaceId, task.id);
+  if (latest === null) {
+    return fail(new ChorusError('internal_error', 'A task in review has no result revision.'));
+  }
+  if (latest.criteriaRevision !== details.criteriaRevision || latest.workCycle !== task.workCycle) {
+    return fail(
+      new ChorusError(
+        'invalid_transition',
+        'The latest result predates the current criteria or work cycle.',
+        {
+          details: { reason: 'stale_revision', state: task.state, revision: latest.revision },
+        },
+      ),
+    );
+  }
+  if (details.reviewRequired && latest.reviewState !== 'approved') {
+    return fail(
+      new ChorusError(
+        'review_required',
+        'The latest result revision needs an approved review before the task can be completed.',
+        {
+          details: {
+            revision: latest.revision,
+            review_state: latest.reviewState,
+            review_id: latest.reviewId,
+          },
+        },
+      ),
+    );
+  }
+  return {
+    ok: true,
+    revision: latest.revision,
+    reviewId: details.reviewRequired ? latest.reviewId : null,
   };
 }
 
