@@ -25,6 +25,22 @@ export function parseMigrationFilename(
   return { version: Number(version), name };
 }
 
+/**
+ * Returns the first top-level transaction-control statement (BEGIN, COMMIT, ROLLBACK, START
+ * TRANSACTION), or undefined. The runner wraps every file in its own transaction, so such a
+ * statement would silently break atomicity. Comments, quoted strings and dollar-quoted bodies
+ * (where plpgsql legitimately uses BEGIN ... END) are ignored.
+ */
+export function findTransactionControl(sql: string): string | undefined {
+  const stripped = sql
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/--[^\n]*/g, ' ')
+    .replace(/\$([A-Za-z_][A-Za-z0-9_]*)?\$[\s\S]*?\$\1\$/g, ' ')
+    .replace(/'(?:[^']|'')*'/g, ' ');
+  const match = /(?:^|;)\s*(begin|commit|rollback|start\s+transaction)\b/i.exec(stripped);
+  return match?.[1]?.toLowerCase();
+}
+
 /** Reads `NNNN_name.sql` files from `dir`, ordered by version. Rejects stray files and duplicate versions. */
 export async function loadMigrations(dir: string): Promise<Migration[]> {
   const filenames = (await readdir(dir)).filter((f) => !f.startsWith('.')).sort();
@@ -35,6 +51,12 @@ export async function loadMigrations(dir: string): Promise<Migration[]> {
       throw new MigrationError(`Unexpected file in migrations directory: ${filename}`);
     }
     const sql = await readFile(join(dir, filename), 'utf8');
+    const control = findTransactionControl(sql);
+    if (control !== undefined) {
+      throw new MigrationError(
+        `${filename} contains a top-level "${control}"; the runner already wraps each file in a transaction.`,
+      );
+    }
     migrations.push({ ...parsed, sql, checksum: checksumOf(sql) });
   }
   migrations.sort((a, b) => a.version - b.version);

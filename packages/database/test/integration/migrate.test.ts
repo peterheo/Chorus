@@ -1,13 +1,11 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MigrationChecksumError, MigrationFailedError } from '../../src/errors.ts';
 import { migrate } from '../../src/migrate.ts';
-import { createEphemeralDatabase, type EphemeralDatabase } from '../helpers/ephemeral-database.ts';
-
-const realMigrationsDir = fileURLToPath(new URL('../../migrations', import.meta.url));
+import { MIGRATIONS_DIR } from '../../src/paths.ts';
+import { createEphemeralDatabase, type EphemeralDatabase } from '../../src/testing.ts';
 
 describe('migrate (real PostgreSQL)', () => {
   let db: EphemeralDatabase;
@@ -31,8 +29,8 @@ describe('migrate (real PostgreSQL)', () => {
     ).map((r) => r.version);
 
   it('applies the repository migrations and enables pgcrypto', async () => {
-    const result = await migrate({ databaseUrl: db.url, migrationsDir: realMigrationsDir });
-    expect(result.applied).toEqual([1]);
+    const result = await migrate({ databaseUrl: db.url, migrationsDir: MIGRATIONS_DIR });
+    expect(result.applied[0]).toBe(1);
     const ext = await db.query('SELECT 1 FROM pg_extension WHERE extname = $1', ['pgcrypto']);
     expect(ext).toHaveLength(1);
   });
@@ -82,5 +80,27 @@ describe('migrate (real PostgreSQL)', () => {
     );
     expect(runs.flatMap((r) => r.applied).sort()).toEqual([1, 2]);
     expect(await applied()).toEqual([1, 2]);
+  });
+
+  it('keeps the original error as the cause when the connection dies mid-migration', async () => {
+    // ROLLBACK cannot run on a terminated connection; it must not mask the real failure.
+    await writeFile(join(dir, '0001_die.sql'), 'SELECT pg_terminate_backend(pg_backend_pid());');
+    const error: unknown = await migrate({ databaseUrl: db.url, migrationsDir: dir }).catch(
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(MigrationFailedError);
+    expect((error as MigrationFailedError).cause).toBeInstanceOf(Error);
+  });
+
+  it('rejects a migration that manages its own transaction, before applying anything', async () => {
+    await writeFile(join(dir, '0001_ok.sql'), 'CREATE TABLE t_pre (id int);');
+    await writeFile(join(dir, '0002_txn.sql'), 'BEGIN;\nCREATE TABLE t_txn (id int);\nCOMMIT;');
+    await expect(migrate({ databaseUrl: db.url, migrationsDir: dir })).rejects.toThrow(
+      /top-level "begin"/,
+    );
+    const tables = await db.query(
+      `SELECT 1 FROM information_schema.tables WHERE table_name IN ('t_pre', 'schema_migrations')`,
+    );
+    expect(tables).toHaveLength(0);
   });
 });

@@ -1,5 +1,7 @@
-import { fileURLToPath } from 'node:url';
+import pg from 'pg';
+import { setAppRolePassword } from './app-role.ts';
 import { migrate } from './migrate.ts';
+import { MIGRATIONS_DIR } from './paths.ts';
 
 const databaseUrl = process.env['DATABASE_URL'];
 if (databaseUrl === undefined || databaseUrl === '') {
@@ -7,10 +9,19 @@ if (databaseUrl === undefined || databaseUrl === '') {
   process.exit(2);
 }
 
-const migrationsDir = fileURLToPath(new URL('../migrations', import.meta.url));
-
 try {
-  const { applied } = await migrate({ databaseUrl, migrationsDir });
+  const { applied } = await migrate({ databaseUrl, migrationsDir: MIGRATIONS_DIR });
+  const appPassword = process.env['CHORUS_APP_PASSWORD'];
+  if (appPassword !== undefined && appPassword !== '') {
+    const client = new pg.Client({ connectionString: databaseUrl });
+    await client.connect();
+    try {
+      await setAppRolePassword(client, appPassword);
+      console.log('Set the chorus_app login password.');
+    } finally {
+      await client.end();
+    }
+  }
   console.log(
     applied.length === 0 ? 'Database is up to date.' : `Applied migrations: ${applied.join(', ')}`,
   );
