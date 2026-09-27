@@ -136,7 +136,10 @@ export function createHttpLedgerClient(options: HttpLedgerClientOptions): Ledger
       let body: unknown;
       try {
         body = await response.json();
-      } catch {
+      } catch (error) {
+        if (combinedSignal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+          throw new LedgerUnavailableError('timeout');
+        }
         throw new LedgerUnavailableError('contract_mismatch');
       }
       return parsePage(body);

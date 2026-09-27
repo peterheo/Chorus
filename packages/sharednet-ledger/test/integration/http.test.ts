@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { createServer } from 'node:http';
 import { createHttpLedgerClient } from '../../src/index.ts';
 import { sampleTransfer, startFakeLedgerServer } from '../../src/testing.ts';
 
@@ -42,5 +43,47 @@ describe('SharedNet ledger HTTP client', () => {
     await expect(client.listTransfers({ limit: 1 }, controller.signal)).rejects.toMatchObject({
       cause_code: 'timeout',
     });
+  });
+
+  it('maps a delayed server response to timeout and a closed server to network', async () => {
+    const delayed = createServer((_request, response) => {
+      const timer = setTimeout(() => {
+        response.end(JSON.stringify({ items: [], next_cursor: null, has_more: false }));
+      }, 50);
+      response.on('close', () => {
+        clearTimeout(timer);
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      delayed.once('error', reject);
+      delayed.listen(0, '127.0.0.1', () => {
+        delayed.off('error', reject);
+        resolve();
+      });
+    });
+    const address = delayed.address();
+    if (address === null || typeof address === 'string') {
+      await new Promise<void>((resolve, reject) => {
+        delayed.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+      throw new Error('Delayed test server did not bind a TCP port.');
+    }
+    const url = `http://127.0.0.1:${String(address.port)}`;
+    const client = createHttpLedgerClient({ baseUrl: url, token: 'token', timeoutMs: 10 });
+    await expect(
+      client.listTransfers({ limit: 1 }, new AbortController().signal),
+    ).rejects.toMatchObject({ cause_code: 'timeout' });
+    await new Promise<void>((resolve, reject) => {
+      delayed.close((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+    await expect(
+      client.listTransfers({ limit: 1 }, new AbortController().signal),
+    ).rejects.toMatchObject({ cause_code: 'network' });
   });
 });
