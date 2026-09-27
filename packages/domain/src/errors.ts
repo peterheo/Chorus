@@ -21,6 +21,12 @@ export const ERROR_STATUS = {
   rate_limited: 429,
   internal_error: 500,
   temporarily_unavailable: 503,
+  // Arena purchases (WP5-min, Arena rev 2 C8).
+  payment_required: 402,
+  payment_not_found: 404,
+  payment_not_verified: 409,
+  payment_already_used: 409,
+  request_conflict: 409,
 } as const;
 
 export type ErrorCode = keyof typeof ERROR_STATUS;
@@ -44,9 +50,9 @@ export class ChorusError extends Error {
     this.details = options.details ?? {};
   }
 
-  /** Only a retry of the same idempotency key can succeed for these. */
+  /** A retry of the same request can succeed for these (a payment not yet visible in the ledger, an outage). */
   get retryable(): boolean {
-    return this.code === 'temporarily_unavailable';
+    return this.code === 'temporarily_unavailable' || this.code === 'payment_not_found';
   }
 }
 

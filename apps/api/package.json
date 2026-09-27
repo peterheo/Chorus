@@ -12,6 +12,7 @@
     "@aicoo/sharedos-mcp": "0.1.0-alpha.5",
     "@chorus/database": "workspace:*",
     "@chorus/domain": "workspace:*",
+    "@chorus/sharednet-ledger": "workspace:*",
     "fastify": "5.12.5",
     "pg": "8.23.0"
   },

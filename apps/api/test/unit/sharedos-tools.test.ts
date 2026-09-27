@@ -124,7 +124,9 @@ describe('chorus tool definitions', () => {
       );
       expect(result).toMatchObject({ status: 'failed', error: { code, details: { n: 1 } } });
       if (result.status === 'failed') {
-        expect(result.error.retryable === true).toBe(code === 'temporarily_unavailable');
+        expect(result.error.retryable === true).toBe(
+          code === 'temporarily_unavailable' || code === 'payment_not_found',
+        );
       }
     }
   });
