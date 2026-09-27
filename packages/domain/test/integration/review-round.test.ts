@@ -490,4 +490,63 @@ describe('A4.3 review round (real PostgreSQL, as chorus_app)', () => {
       client.release(true);
     }
   });
+
+  it('K12 B7 (verdict): separation (403) outranks lifecycle (422) for a verdict on an already-decided review', async () => {
+    const w = await makeWorld(f, ws, { managerReview: true });
+    // The manager owns and submits the task; a participant reviews it and approves, which completes it.
+    const task = await newTask(w, { by: w.manager });
+    const claimed = await claimAs(w, task.id as never, task.version, w.manager);
+    const submitted = await submitAs(
+      w,
+      task.id as never,
+      claimed.version,
+      claimed.fence,
+      'x',
+      w.manager,
+    );
+    const req = await requestReview(w.manager.ctx(), {
+      session_id: w.session.id,
+      task_id: task.id,
+      expected_version: submitted.version,
+      revision: 1,
+      reviewer_actor_id: w.reviewer.id,
+    });
+    const decided = await verdictAs(
+      w,
+      req.review,
+      submitted.content_sha256,
+      'approved',
+      w.reviewer,
+    );
+    expect(decided.task.state).toBe('done');
+    // The review is now decided (lifecycle would be invalid_transition), but the task's OWNER is the
+    // manager: identity comes first, so the answer is action_forbidden, not a lifecycle error.
+    await expectCode(
+      reviewVerdict(w.manager.ctx(), {
+        session_id: w.session.id,
+        review_id: req.review.id,
+        expected_version: decided.review.version,
+        verdict: 'approved',
+        content_sha256: submitted.content_sha256,
+      }),
+      'action_forbidden',
+    );
+    // An eligible non-owner gets the lifecycle error for the same decided review.
+    const other = await w.participant('late-reviewer');
+    await grantRole(w.manager.ctx(), {
+      session_id: w.session.id,
+      actor_id: other.id,
+      role: 'manager',
+    });
+    await expectCode(
+      reviewVerdict(other.ctx(), {
+        session_id: w.session.id,
+        review_id: req.review.id,
+        expected_version: decided.review.version,
+        verdict: 'approved',
+        content_sha256: submitted.content_sha256,
+      }),
+      'invalid_transition',
+    );
+  });
 });

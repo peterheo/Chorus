@@ -1,9 +1,11 @@
 export {
   ROLE_ACTIONS,
+  ROOM_ACTIONS,
   actionsOf,
   hasAction,
   requireAction,
   type Queryable,
+  type RoomAction,
   type SessionAction,
 } from './authz.ts';
 export {
