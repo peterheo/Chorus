@@ -1,5 +1,7 @@
 import {
+  ChorusError,
   claim,
+  boardSummary,
   completeTask,
   createTask,
   getResult,
@@ -12,6 +14,7 @@ import {
   submitResult,
 } from '@chorus/domain';
 import { B, I, OA, S, SA, type ChorusToolSpec } from './define.ts';
+import { getReceipt } from '../../receipts.ts';
 
 const session = (a: Record<string, unknown>): string[] => ['sessions', a['session_id'] as string];
 const task = (a: Record<string, unknown>): string[] => [
@@ -30,6 +33,43 @@ const review = (a: Record<string, unknown>): string[] => [
 const VERSIONED = { session_id: S, task_id: S, expected_version: I };
 
 export const workTools: readonly ChorusToolSpec[] = [
+  {
+    name: 'chorus.get_receipt',
+    description: 'Returns a signed, verifiable completion receipt for a completed task.',
+    action: 'read',
+    write: false,
+    props: { session_id: S, task_id: S },
+    required: ['session_id', 'task_id'],
+    path: task,
+    run: ({ read, input, deps }) => {
+      const receipt = deps.receipts;
+      if (receipt === undefined) {
+        throw new ChorusError('temporarily_unavailable', 'Receipts are disabled.', {
+          details: { cause: 'receipts_disabled' },
+        });
+      }
+      return getReceipt(
+        read,
+        input['session_id'] as string,
+        input['task_id'] as string,
+        receipt.gitCommit,
+        receipt.publicBaseUrl,
+        receipt.privateKey,
+        receipt.keyId,
+      );
+    },
+  },
+  {
+    name: 'chorus.board_summary',
+    description:
+      'Returns task counts and the five most recently completed tasks on boards in a session.',
+    action: 'read',
+    write: false,
+    props: { session_id: S, board_id: S },
+    required: ['session_id'],
+    path: session,
+    run: ({ read, input }) => boardSummary(read, input),
+  },
   {
     name: 'chorus.list_work',
     description:

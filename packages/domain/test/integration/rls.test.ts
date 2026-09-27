@@ -64,6 +64,7 @@ const DEFINERS = [
   'chorus_resolve_token',
   'chorus_room_health',
   'chorus_room_lookup',
+  'chorus_session_member_ids',
   'chorus_session_bump',
   'chorus_session_create_board',
   'chorus_session_live_members',
@@ -212,6 +213,28 @@ describe('row-level security and definer functions, as the runtime role chorus_a
     }
   };
 
+  const sessionMemberIdsAs = async (actorId: string, sessionId: string, actorIds: string[]) => {
+    const client = await f.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `SELECT set_config('chorus.workspace_id', $1, true), set_config('chorus.actor_id', $2, true)`,
+        [wa.ws.id, actorId],
+      );
+      const { rows } = await client.query<{ actor_id: string; member_id: string | null }>(
+        'SELECT actor_id, member_id FROM chorus_session_member_ids($1, $2::uuid[])',
+        [sessionId, actorIds],
+      );
+      await client.query('ROLLBACK');
+      return rows;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+
   describe('the runtime role itself', () => {
     it('is chorus_app: not a superuser, no BYPASSRLS, and owns nothing', async () => {
       const { rows } = await f.pool.query<{ current_user: string }>('SELECT current_user');
@@ -277,6 +300,33 @@ describe('row-level security and definer functions, as the runtime role chorus_a
           /(^|[{,])=X/,
         );
       }
+    });
+
+    it('returns historical member IDs only for session actors and only to a live session member', async () => {
+      await f.owner(
+        "UPDATE agent_instances SET sharednet_member_id = 'i_ReceiptUnique01' WHERE id = $1",
+        [wa.executor.instanceId],
+      );
+      await f.owner(
+        "UPDATE agent_instances SET sharednet_member_id = 'i_ReceiptAmbig01' WHERE id = $1",
+        [wa.executor2.instanceId],
+      );
+      await f.owner(
+        "INSERT INTO agent_instances (workspace_id, actor_id, label, sharednet_member_id) VALUES ($1, $2, 'receipt ambiguous', 'i_ReceiptAmbig02')",
+        [wa.ws.id, wa.executor2.id],
+      );
+
+      const rows = await sessionMemberIdsAs(wa.manager.id, wa.session.id, [
+        wa.executor.id,
+        wa.executor2.id,
+        wa.outsider.id,
+      ]);
+      expect(rows).toHaveLength(2);
+      expect(rows).toContainEqual({ actor_id: wa.executor.id, member_id: 'i_ReceiptUnique01' });
+      expect(rows).toContainEqual({ actor_id: wa.executor2.id, member_id: null });
+      await expect(
+        sessionMemberIdsAs(wa.outsider.id, wa.session.id, [wa.executor.id]),
+      ).resolves.toEqual([]);
     });
 
     it('has no privileges on the definer-only tables', async () => {
@@ -808,6 +858,42 @@ describe('row-level security and definer functions, as the runtime role chorus_a
             [hidden.id, outsider.id],
           ),
         ).toBe(0);
+      });
+
+      it('chorus_session_member_ids ignores pg_temp sessions, members, and instances', async () => {
+        const client = await f.pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(
+            `SELECT set_config('chorus.workspace_id', $1, true), set_config('chorus.actor_id', $2, true)`,
+            [wa.ws.id, wa.manager.id],
+          );
+          await client.query(
+            `CREATE TEMP TABLE sessions (id uuid, workspace_id uuid, room_id uuid, state text)`,
+          );
+          await client.query(LOOKALIKE['session_members'] ?? '');
+          await client.query(LOOKALIKE['agent_instances'] ?? '');
+          await client.query(
+            `INSERT INTO pg_temp.sessions (id, workspace_id, room_id, state) VALUES ($1, $2, $3, 'active')`,
+            [wa.session.id, wa.ws.id, wa.ws.roomId],
+          );
+          await client.query(
+            `INSERT INTO pg_temp.session_members (workspace_id, session_id, actor_id, roles) VALUES ($1, $2, $3, ARRAY['participant'])`,
+            [wa.ws.id, wa.session.id, wa.outsider.id],
+          );
+          await client.query(
+            `INSERT INTO pg_temp.agent_instances (workspace_id, actor_id, label, sharednet_member_id) VALUES ($1, $2, 'forged', 'i_ForgedMember01')`,
+            [wa.ws.id, wa.outsider.id],
+          );
+          const result = await client.query(
+            'SELECT actor_id, member_id FROM chorus_session_member_ids($1, $2::uuid[])',
+            [wa.session.id, [wa.outsider.id]],
+          );
+          expect(result.rows).toEqual([]);
+          await client.query('ROLLBACK');
+        } finally {
+          client.release(true);
+        }
       });
 
       it('the session definers ignore forged temp sessions, members and rooms, and refuse a non-administrator', async () => {

@@ -111,7 +111,7 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     expect(asAdmin).toEqual(
       expect.arrayContaining([...ADMIN_ONLY, 'chorus.complete', 'chorus.create_board']),
     );
-    expect(asAdmin).toHaveLength(31); // 24 + room_pulse, create_action_board, create_tasks, and 4 conversation tools
+    expect(asAdmin).toHaveLength(33); // 26 + room_pulse, create_action_board, create_tasks, and 4 conversation tools
 
     expect(await toolNames(roomOnly)).toEqual([
       'chorus.create_action_board',

@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { ConfigError, loadConfig } from '../../src/config.ts';
 
@@ -39,6 +39,17 @@ describe('config.startup_guards (unit)', () => {
     for (const bad of ['', 'true', 'ENABLED', '1', 'on']) {
       expect(problem({ ...base, CHORUS_BILLING: bad })).toMatch(/CHORUS_BILLING/);
     }
+  });
+
+  it('CHORUS_RECEIPT_KEY is optional and accepts only Ed25519 PKCS#8 PEM', () => {
+    expect(loadConfig(base).receiptPrivateKey).toBeNull();
+    const key = generateKeyPairSync('ed25519')
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString();
+    const config = loadConfig({ ...base, CHORUS_RECEIPT_KEY: key });
+    expect(config.receiptPrivateKey?.asymmetricKeyType).toBe('ed25519');
+    expect(config.receiptKeyId).toMatch(/^[0-9a-f]{16}$/);
+    expect(problem({ ...base, CHORUS_RECEIPT_KEY: 'bad key' })).toMatch(/CHORUS_RECEIPT_KEY/);
   });
 
   it('requires PUBLIC_BASE_URL (https, no trailing slash) in production', () => {

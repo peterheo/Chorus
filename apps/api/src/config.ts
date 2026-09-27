@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, type KeyObject } from 'node:crypto';
 import { resolveLeaseDurationSeconds } from '@chorus/domain';
 
 /** Startup configuration, read once from the environment. Any problem is a `ConfigError`; the process exits 1. */
@@ -20,6 +20,8 @@ export interface Config {
   readonly sharednetBaseUrl: string;
   /** `enabled`: only the paid create tools exist (the free create_session / create_task are not registered). */
   readonly billing: 'enabled' | 'disabled';
+  readonly receiptPrivateKey: KeyObject | null;
+  readonly receiptKeyId: string | null;
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -96,6 +98,20 @@ export function loadConfig(env: Env): Config {
     throw new ConfigError('CHORUS_BILLING must be "enabled" or "disabled".');
   }
 
+  let receiptPrivateKey: KeyObject | null = null;
+  let receiptKeyId: string | null = null;
+  const receiptPem = env['CHORUS_RECEIPT_KEY'];
+  if (receiptPem !== undefined && receiptPem !== '') {
+    try {
+      receiptPrivateKey = createPrivateKey(receiptPem);
+      if (receiptPrivateKey.asymmetricKeyType !== 'ed25519') throw new Error('wrong key type');
+      const der = createPublicKey(receiptPrivateKey).export({ type: 'spki', format: 'der' });
+      receiptKeyId = createHash('sha256').update(der).digest('hex').slice(0, 16);
+    } catch {
+      throw new ConfigError('CHORUS_RECEIPT_KEY must be a valid Ed25519 PKCS#8 PEM private key.');
+    }
+  }
+
   return {
     env: mode,
     host: env['HOST'] ?? '127.0.0.1',
@@ -108,5 +124,7 @@ export function loadConfig(env: Env): Config {
     secretsKeyId: createHash('sha256').update(secretsKey).digest('hex').slice(0, 8),
     sharednetBaseUrl: sharednetBaseUrl.replace(/\/$/, ''),
     billing,
+    receiptPrivateKey,
+    receiptKeyId,
   };
 }
