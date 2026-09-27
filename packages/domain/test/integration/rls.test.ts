@@ -41,6 +41,7 @@ const NO_ACCESS = [
 ] as const;
 
 const DEFINERS = [
+  'chorus_activate_room',
   'chorus_create_session',
   'chorus_enroll_complete',
   'chorus_enroll_start',
@@ -51,6 +52,7 @@ const DEFINERS = [
   'chorus_my_sessions',
   'chorus_resolve_token',
   'chorus_room_health',
+  'chorus_room_lookup',
   'chorus_session_bump',
   'chorus_session_create_board',
   'chorus_session_live_members',
@@ -928,6 +930,63 @@ describe('row-level security and definer functions, as the runtime role chorus_a
         expect(await f.count('SELECT count(*) AS n FROM actors WHERE id = $1', [actorId])).toBe(1);
         expect(
           await f.count('SELECT count(*) AS n FROM room_members WHERE actor_id = $1', [actorId]),
+        ).toBe(1);
+      });
+
+      it('chorus_room_lookup and chorus_activate_room ignore forged temp workspaces, rooms, seats and cursors', async () => {
+        const external = `rom_${rid('Shadow', 8)}`;
+        const forgedExternal = `rom_${rid('Forged', 8)}`;
+        const client = await f.pool.connect();
+        try {
+          for (const table of ['rooms']) await client.query(LOOKALIKE[table] ?? '');
+          await client.query(
+            `CREATE TEMP TABLE workspaces (id uuid DEFAULT gen_random_uuid(), name text, created_at timestamptz DEFAULT now())`,
+          );
+          await client.query(
+            `CREATE TEMP TABLE sharednet_seats (workspace_id uuid, room_id uuid, member_id text, principal_id text, token_ciphertext bytea, token_nonce bytea, key_id text, created_at timestamptz DEFAULT now())`,
+          );
+          await client.query(
+            `CREATE TEMP TABLE sharednet_cursors (workspace_id uuid, room_id uuid, last_sequence bigint, consumer_epoch bigint DEFAULT 0, updated_at timestamptz DEFAULT now(), last_error text, last_ok_at timestamptz)`,
+          );
+          // A forged, suspended binding of the room we are about to activate, and a forged active one of another.
+          await client.query(
+            `INSERT INTO pg_temp.rooms (workspace_id, name, provider, external_room_id, activation_state) VALUES (gen_random_uuid(), 'x', 'sharednet', $1, 'suspended'), (gen_random_uuid(), 'y', 'sharednet', $2, 'active')`,
+            [external, forgedExternal],
+          );
+          expect(
+            (await client.query('SELECT * FROM chorus_room_lookup($1)', [forgedExternal])).rows,
+          ).toEqual([]);
+          const { rows } = await client.query(
+            'SELECT * FROM chorus_activate_room($1, $2, $3, $4, $5, $6, $7)',
+            [
+              external,
+              'i_ShadowSeat01',
+              'p_ShadowSeat01',
+              Buffer.alloc(20),
+              Buffer.alloc(12),
+              'abcdef01',
+              5,
+            ],
+          );
+          expect(rows).toEqual([expect.objectContaining({ created: true })]);
+          for (const table of ['workspaces', 'sharednet_seats', 'sharednet_cursors']) {
+            const temp = await client.query(`SELECT (SELECT count(*) FROM pg_temp.${table}) AS n`);
+            expect(Number((temp.rows[0] as { n: string }).n), `pg_temp.${table}`).toBe(0);
+          }
+        } finally {
+          client.release(true);
+        }
+        expect(
+          await f.count(
+            `SELECT count(*) AS n FROM rooms WHERE external_room_id = $1 AND activation_state = 'active'`,
+            [external],
+          ),
+        ).toBe(1);
+        expect(
+          await f.count(
+            `SELECT count(*) AS n FROM sharednet_cursors c JOIN rooms r ON r.id = c.room_id WHERE r.external_room_id = $1 AND c.last_sequence = 5`,
+            [external],
+          ),
         ).toBe(1);
       });
     });

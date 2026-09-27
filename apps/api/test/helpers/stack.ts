@@ -11,7 +11,8 @@ import { FakeSharedNet } from './fake-sharednet.ts';
 
 export const SHAREDNET_ROOM = 'rom_TestRoom01';
 export const SEAT_MEMBER = 'i_ChorusSeat01';
-const SEAT_PRINCIPAL = 'p_ChorusSeat01';
+export const SEAT_PRINCIPAL = 'p_ChorusSeat01';
+export const ACTIVATION_INVITE = 'rit_TestInvite0123456789abcdef';
 
 export interface Agent {
   memberId: string;
@@ -63,7 +64,7 @@ let counter = 0;
 
 /** A complete in-process Chorus: real PostgreSQL, the HTTP/MCP app on an ephemeral port, a fake SharedNet, and the watcher. */
 export async function startStack(
-  options: { limits?: Partial<AppLimits>; watch?: boolean } = {},
+  options: { limits?: Partial<AppLimits>; watch?: boolean; activateViaApi?: boolean } = {},
 ): Promise<Stack> {
   const db = await createMigratedEphemeralDatabase();
   const pool = new pg.Pool({ connectionString: db.appUrl, max: 10 });
@@ -74,36 +75,52 @@ export async function startStack(
   const fake = new FakeSharedNet();
   await fake.start();
   fake.addRoom(SHAREDNET_ROOM, seatToken);
+  fake.identities.set(seatToken, {
+    token: seatToken,
+    memberId: SEAT_MEMBER,
+    principalId: SEAT_PRINCIPAL,
+  });
+  if (options.activateViaApi === true) {
+    fake.addInvite(SHAREDNET_ROOM, ACTIVATION_INVITE, {
+      token: seatToken,
+      memberId: SEAT_MEMBER,
+      principalId: SEAT_PRINCIPAL,
+    });
+  }
 
-  // Owner-side activation, as the (not yet built) admin CLI will do: workspace, bound room, seat, cursor.
-  const [ws] = await db.query<{ id: string }>(
-    `INSERT INTO workspaces (name) VALUES ('stack') RETURNING id`,
-  );
-  const workspaceId = ws?.id ?? '';
-  const [room] = await db.query<{ id: string }>(
-    `INSERT INTO rooms (workspace_id, name, provider, external_room_id, activation_state)
-     VALUES ($1, 'demo', 'sharednet', $2, 'active') RETURNING id`,
-    [workspaceId, SHAREDNET_ROOM],
-  );
-  const roomId = room?.id ?? '';
-  const sealed = sealSecret(secretsKey, seatToken);
-  await db.query(
-    `INSERT INTO sharednet_seats (workspace_id, room_id, member_id, principal_id, token_ciphertext, token_nonce, key_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [
-      workspaceId,
-      roomId,
-      SEAT_MEMBER,
-      SEAT_PRINCIPAL,
-      sealed.ciphertext,
-      sealed.nonce,
-      sealed.keyId,
-    ],
-  );
-  await db.query(
-    `INSERT INTO sharednet_cursors (workspace_id, room_id, last_sequence, last_ok_at) VALUES ($1, $2, 0, now())`,
-    [workspaceId, roomId],
-  );
+  // Owner-side activation (unless the test activates through the API): workspace, bound room, seat, cursor.
+  let workspaceId = '';
+  let roomId = '';
+  if (options.activateViaApi !== true) {
+    const [ws] = await db.query<{ id: string }>(
+      `INSERT INTO workspaces (name) VALUES ('stack') RETURNING id`,
+    );
+    workspaceId = ws?.id ?? '';
+    const [room] = await db.query<{ id: string }>(
+      `INSERT INTO rooms (workspace_id, name, provider, external_room_id, activation_state)
+       VALUES ($1, 'demo', 'sharednet', $2, 'active') RETURNING id`,
+      [workspaceId, SHAREDNET_ROOM],
+    );
+    roomId = room?.id ?? '';
+    const sealed = sealSecret(secretsKey, seatToken);
+    await db.query(
+      `INSERT INTO sharednet_seats (workspace_id, room_id, member_id, principal_id, token_ciphertext, token_nonce, key_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        workspaceId,
+        roomId,
+        SEAT_MEMBER,
+        SEAT_PRINCIPAL,
+        sealed.ciphertext,
+        sealed.nonce,
+        sealed.keyId,
+      ],
+    );
+    await db.query(
+      `INSERT INTO sharednet_cursors (workspace_id, room_id, last_sequence, last_ok_at) VALUES ($1, $2, 0, now())`,
+      [workspaceId, roomId],
+    );
+  }
 
   const logs: string[] = [];
   const logStream = new Writable({
@@ -120,6 +137,10 @@ export async function startStack(
     },
     pool,
     logStream,
+    sharednet: {
+      client: new SharedNetClient({ baseUrl: fake.url, timeoutMs: 5000 }),
+      secretsKey,
+    },
     ...(options.limits === undefined ? {} : { limits: options.limits }),
   });
   await app.listen({ host: '127.0.0.1', port: 0 });
@@ -137,6 +158,23 @@ export async function startStack(
       minPollIntervalMs: 10,
       maxBackoffMs: 200,
     });
+  if (options.activateViaApi === true) {
+    const activated = await fetch(`${baseUrl}/v1/rooms/activate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sharednet_room_id: SHAREDNET_ROOM,
+        sharednet_invite_token: ACTIVATION_INVITE,
+      }),
+    });
+    if (activated.status !== 201) throw new Error(`activate -> ${String(activated.status)}`);
+    const [bound] = await db.query<{ id: string; workspace_id: string }>(
+      `SELECT id, workspace_id FROM rooms WHERE external_room_id = $1`,
+      [SHAREDNET_ROOM],
+    );
+    roomId = bound?.id ?? '';
+    workspaceId = bound?.workspace_id ?? '';
+  }
   let watcher = newWatcher();
   if (options.watch !== false) await watcher.start();
 

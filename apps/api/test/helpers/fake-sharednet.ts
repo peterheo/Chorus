@@ -22,8 +22,25 @@ interface FakeRoom {
  * `GET /api/v1/rooms/{id}/wait?after=N` with a bearer seat token, returning `{items, next_cursor, has_more}`
  * where every item carries server-assigned sender fields and a strictly increasing sequence.
  */
+export interface FakeSeat {
+  token: string;
+  memberId: string;
+  principalId: string;
+}
+
 export class FakeSharedNet {
   readonly rooms = new Map<string, FakeRoom>();
+  /** invite token -> the room it opens and the seat a join with it yields. */
+  readonly invites = new Map<string, { roomId: string; seat: FakeSeat }>();
+  /** Seat identities served by `GET /api/v1/instances/current`, by member token. */
+  readonly identities = new Map<string, FakeSeat>();
+  /** Every join request the server saw (invite tokens are NOT recorded in the clear). */
+  joins: { roomId: string; bodyName: unknown; runtimeKind: unknown }[] = [];
+  /** Tamper with the join / instance responses to exercise contract failures. */
+  joinResponse: ((body: Record<string, unknown>) => unknown) | undefined;
+  instanceResponse: ((body: Record<string, unknown>) => unknown) | undefined;
+  /** When set, joins answer with this HTTP status. */
+  joinFailWith: number | undefined;
   /** When set, every wait answers with this HTTP status (e.g. 401 to simulate a revoked seat). */
   failWith: number | undefined;
   /** When true, items are returned without sender fields (a contract violation). */
@@ -34,6 +51,16 @@ export class FakeSharedNet {
 
   addRoom(roomId: string, seatToken: string): void {
     this.rooms.set(roomId, { seatToken, messages: [], polls: [] });
+  }
+
+  /** Registers an invite: joining `roomId` with it yields `seat`, whose token then opens the room. */
+  addInvite(roomId: string, invite: string, seat: FakeSeat): void {
+    this.invites.set(invite, { roomId, seat });
+    this.identities.set(seat.token, seat);
+    const room = this.rooms.get(roomId);
+    if (room === undefined)
+      this.rooms.set(roomId, { seatToken: seat.token, messages: [], polls: [] });
+    else room.seatToken = seat.token;
   }
 
   /** Posts a message as the SharedNet server would: it assigns id and sequence, never the sender. */
@@ -70,6 +97,47 @@ export class FakeSharedNet {
   async start(): Promise<void> {
     const server = createServer((req, res) => {
       const url = new URL(req.url ?? '/', 'http://fake');
+      const json = (status: number, body: unknown): void => {
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(body));
+      };
+      const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1];
+      if (req.method === 'GET' && url.pathname === '/api/v1/instances/current') {
+        const seat = bearer === undefined ? undefined : this.identities.get(bearer);
+        if (seat === undefined) return void res.writeHead(401).end();
+        const body = {
+          principal: { id: seat.principalId },
+          agent: null,
+          instance: { id: seat.memberId, principal_id: seat.principalId, revoked_at: null },
+        };
+        json(200, this.instanceResponse === undefined ? body : this.instanceResponse(body));
+        return;
+      }
+      const joinMatch = /^\/api\/v1\/rooms\/([^/]+)\/join$/.exec(url.pathname);
+      if (req.method === 'POST' && joinMatch?.[1] !== undefined) {
+        const roomId = decodeURIComponent(joinMatch[1]);
+        let raw = '';
+        req.on('data', (c: Buffer) => (raw += c.toString('utf8')));
+        req.on('end', () => {
+          if (this.joinFailWith !== undefined) return void res.writeHead(this.joinFailWith).end();
+          const invite = bearer === undefined ? undefined : this.invites.get(bearer);
+          if (invite === undefined || invite.roomId !== roomId)
+            return void res.writeHead(401).end();
+          const parsed = JSON.parse(raw === '' ? '{}' : raw) as {
+            name?: unknown;
+            runtime?: { kind?: unknown };
+          };
+          this.joins.push({ roomId, bodyName: parsed.name, runtimeKind: parsed.runtime?.kind });
+          const items = (this.rooms.get(roomId)?.messages ?? []).map((m) => ({
+            id: m.id,
+            sequence: m.sequence,
+            content: m.content,
+          }));
+          const body = { member_token: invite.seat.token, history: { items } };
+          json(200, this.joinResponse === undefined ? body : this.joinResponse(body));
+        });
+        return;
+      }
       const match = /^\/api\/v1\/rooms\/([^/]+)\/wait$/.exec(url.pathname);
       const room =
         match?.[1] === undefined ? undefined : this.rooms.get(decodeURIComponent(match[1]));
