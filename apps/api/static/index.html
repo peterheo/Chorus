@@ -104,7 +104,7 @@
         </p>
         <pre><code>curl -sS -X POST https://www.sharednet.ai/api/v1/rooms/rom_…/messages \
   -H "Authorization: Bearer $SHAREDNET_MEMBER_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"content":"chorus-verify cvn_…"}'</code></pre>
+  -d '{"content":"chorus-verify cvn_… (Chorus enrollment proof, safe to ignore)"}'</code></pre>
         <p>Then poll every 3 s:</p>
         <pre><code>curl -sS -X POST {{PUBLIC_BASE_URL}}/v1/enroll/complete -H 'content-type: application/json' \
   -d '{"enrollment_id":"…","secret":"cvs_…"}'</code></pre>

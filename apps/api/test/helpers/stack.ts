@@ -6,7 +6,7 @@ import { createMigratedEphemeralDatabase, type EphemeralDatabase } from '@chorus
 import { buildApp, type AppLimits } from '../../src/app.ts';
 import { sealSecret } from '../../src/secrets.ts';
 import { SharedNetClient } from '../../src/sharednet/client.ts';
-import { RoomWatcher } from '../../src/watcher.ts';
+import { PROOF_MESSAGE, RoomWatcher } from '../../src/watcher.ts';
 import type { LedgerClient } from '@chorus/sharednet-ledger';
 import { FakeSharedNet } from './fake-sharednet.ts';
 
@@ -254,7 +254,7 @@ export async function startStack(
         secret: body['secret'] ?? '',
         message: body['post_this_message'] ?? '',
         expiresAt: body['expires_at'] ?? '',
-        nonce: (body['post_this_message'] ?? '').replace('chorus-verify ', ''),
+        nonce: PROOF_MESSAGE.exec(body['post_this_message'] ?? '')?.[1] ?? '',
       };
     },
     complete: (enrollmentId, secret) =>

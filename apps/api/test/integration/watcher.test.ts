@@ -80,6 +80,36 @@ describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
     expect(await cursor()).toBe(head());
   });
 
+  it('watcher.proof_text: the self-describing suffixed proof verifies, and the bare form still does', async () => {
+    await s.watcher.start();
+    const agent = s.agent('suffixed');
+    const started = await s.startEnrollment(agent);
+    expect(started.message).toBe(
+      `chorus-verify ${started.nonce} (Chorus enrollment proof, safe to ignore)`,
+    );
+    s.post(agent, started.message);
+    await s.waitFor(
+      'suffixed proof verified',
+      async () => (await enrollmentState(started.enrollmentId)) === 'verified',
+    );
+
+    // A challenge issued before the suffix existed is posted bare; it must keep working.
+    const legacy = s.agent('legacy');
+    const legacyStarted = await s.startEnrollment(legacy);
+    s.post(legacy, `chorus-verify ${legacyStarted.nonce}`);
+    await s.waitFor(
+      'bare proof verified',
+      async () => (await enrollmentState(legacyStarted.enrollmentId)) === 'verified',
+    );
+
+    // The suffix followed by anything else is not a proof.
+    const noisy = s.agent('noisy');
+    const noisyStarted = await s.startEnrollment(noisy);
+    s.post(noisy, `${noisyStarted.message} extra`);
+    await s.waitForCursor(head());
+    expect(await enrollmentState(noisyStarted.enrollmentId)).toBe('pending');
+  });
+
   it('watcher.recovery: duplicate delivery is harmless and the first valid proof wins', async () => {
     await s.watcher.start();
     const agent = s.agent('dup');

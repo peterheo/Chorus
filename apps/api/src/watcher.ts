@@ -8,10 +8,18 @@ import {
 } from './sharednet/client.ts';
 
 /**
+ * Fixed, self-describing text after the nonce in an issued challenge, so the enroller (which issues it)
+ * and the watcher (which accepts it) cannot drift.
+ */
+export const PROOF_SUFFIX = '(Chorus enrollment proof, safe to ignore)';
+
+/**
  * The SharedNet room watcher (WP3 rev 3 section 6.3, rev 4 section 6). For every ACTIVE bound room it
  * long-polls the room with Chorus's own service seat and turns exactly one kind of message into an
- * effect: a challenge `chorus-verify cvn_<22>` posted by the claimed member. Everything else is ignored
- * and never stored.
+ * effect: a challenge `chorus-verify cvn_<22>` posted by the claimed member, optionally followed by one
+ * space and exactly PROOF_SUFFIX. Chorus issues the suffixed form so other people in the room can tell
+ * what the message is; the bare form stays accepted for challenges issued before the suffix existed. Any
+ * other trailing text is rejected. Everything else is ignored and never stored.
  *
  * Identity comes only from the server-assigned sender fields. The cursor is persisted and monotonic, so a
  * restart resumes where it stopped and duplicate delivery is harmless (verification is a no-op for
@@ -23,7 +31,18 @@ import {
  * ex-holder that lost the lock can never move the cursor. A second process simply does not consume that
  * room until the lock frees (failover).
  */
-export const PROOF_MESSAGE = /^chorus-verify (cvn_[A-Za-z0-9_-]{22})$/;
+export const PROOF_MESSAGE = new RegExp(
+  `^chorus-verify (cvn_[A-Za-z0-9_-]{22})(?: ${escapeRegExp(PROOF_SUFFIX)})?$`,
+);
+
+/** The exact text an enrollee is asked to post for `nonce` (the suffixed form of PROOF_MESSAGE). */
+export function proofMessage(nonce: string): string {
+  return `chorus-verify ${nonce} ${PROOF_SUFFIX}`;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 export interface WatcherLogger {
   info: (obj: Record<string, unknown>, msg: string) => void;
