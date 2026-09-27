@@ -352,9 +352,16 @@ export async function reviewVerdict(ctx: CommandContext, input: unknown): Promis
       ]);
       await tx.db.query(
         `UPDATE review_details SET verdict = $3, verdict_at = now(), verdict_notes = $4,
-                verdict_reviewer_roles = $5::text[]
+                verdict_reviewer_roles = $5::text[], verdict_manager_review_allowed = $6
           WHERE workspace_id = $1 AND review_item_id = $2`,
-        [tx.workspaceId, reviewId, verdict, notes === '' ? null : notes, tx.roles],
+        [
+          tx.workspaceId,
+          reviewId,
+          verdict,
+          notes === '' ? null : notes,
+          tx.roles,
+          requireSession(tx).managerReviewAllowed,
+        ],
       );
       const version = await tx.bumpVersion(reviewId);
       const [summary] = await loadReviewSummaries(tx.db, tx.workspaceId, [reviewId]);

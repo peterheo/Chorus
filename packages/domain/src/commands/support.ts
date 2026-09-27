@@ -210,18 +210,24 @@ export async function evaluateCompletionGates(
     );
   }
   if (details.reviewRequired && latest.reviewId !== null) {
-    // The approval must have come from an ELIGIBLE reviewer at verdict time. The roles held then were
-    // recorded on the review, so a later role change cannot launder (or void) an approval.
-    const recorded = await tx.db.query<{ verdict_reviewer_roles: string[] | null }>(
-      `SELECT verdict_reviewer_roles FROM review_details WHERE workspace_id = $1 AND review_item_id = $2`,
+    // The approval must have come from an ELIGIBLE reviewer AT VERDICT TIME. Both the roles held then and
+    // the session's manager_review_allowed flag then were recorded on the review, and only those are
+    // evaluated here: a later role change or policy flip can neither launder nor void an approval.
+    const recorded = await tx.db.query<{
+      verdict_reviewer_roles: string[] | null;
+      verdict_manager_review_allowed: boolean | null;
+    }>(
+      `SELECT verdict_reviewer_roles, verdict_manager_review_allowed
+         FROM review_details WHERE workspace_id = $1 AND review_item_id = $2`,
       [tx.workspaceId, latest.reviewId],
     );
     const roles = recorded.rows[0]?.verdict_reviewer_roles ?? null;
-    if (roles?.includes('manager') === true && tx.session?.managerReviewAllowed !== true) {
+    const allowed = recorded.rows[0]?.verdict_manager_review_allowed ?? null;
+    if (roles?.includes('manager') === true && allowed !== true) {
       return fail(
         new ChorusError(
           'review_required',
-          'The approval came from a manager, and this session does not allow manager reviews.',
+          'The approval came from a manager when this session did not allow manager reviews.',
           {
             details: {
               revision: latest.revision,

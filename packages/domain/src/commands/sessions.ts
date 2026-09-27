@@ -182,8 +182,7 @@ export async function createSession(ctx: CommandContext, input: unknown): Promis
       const created = rows[0];
       if (created === undefined)
         throw new ChorusError('internal_error', 'Session creation returned no row.');
-      // The first board is part of the creation: it is the session's second versioned change.
-      await tx.db.query('SELECT chorus_session_bump($1)', [created.session_id]);
+      // The definer creates the session at version 1 and its first board as the second versioned change.
       return {
         result: {
           session: {
@@ -250,27 +249,22 @@ export async function joinSession(ctx: CommandContext, input: unknown): Promise<
         session_id: Uuid;
         roles: string[];
         newly_joined: boolean;
+        session_version: number;
+        room_id: Uuid;
       }>('SELECT * FROM chorus_join_session($1, NULL)', [sessionId]);
       const joined = rows[0];
       // Not eligible, nonexistent and not visible are one answer.
       if (joined === undefined) throw new ChorusError('not_found', 'Not found.');
       const result = { session_id: sessionId, roles: joined.roles, joined: joined.newly_joined };
       if (!joined.newly_joined) return { result, events: [], noop: true };
-      const bumped = await tx.db.query<{ version: number; room_id: Uuid }>(
-        `SELECT chorus_session_bump(s.id) AS version, s.room_id
-           FROM sessions s WHERE s.workspace_id = $1 AND s.id = $2`,
-        [tx.workspaceId, sessionId],
-      );
-      const row = bumped.rows[0];
-      if (row === undefined) throw new ChorusError('internal_error', 'Session disappeared.');
       return {
         result,
         events: [
           {
-            roomId: row.room_id,
+            roomId: joined.room_id,
             aggregateId: sessionId,
             aggregateType: 'session',
-            aggregateVersion: row.version,
+            aggregateVersion: joined.session_version,
             eventType: 'session.member_joined',
             payload: { actor_id: tx.actorId },
           },
@@ -301,14 +295,16 @@ export async function createBoard(
     },
     handle: async (tx) => {
       const session = requireSession(tx);
-      const { rows } = await tx.db.query<{ id: Uuid }>(
-        'INSERT INTO projects (workspace_id, session_id, name) VALUES ($1, $2, $3) RETURNING id',
-        [tx.workspaceId, sessionId, name],
+      // The definer re-verifies the manager role, inserts the board and bumps the session version.
+      const { rows } = await tx.db.query<{ board_id: Uuid; session_version: number }>(
+        'SELECT * FROM chorus_session_create_board($1, $2)',
+        [sessionId, name],
       );
-      const id = rows[0]?.id;
-      if (id === undefined)
+      const created = rows[0];
+      if (created === undefined)
         throw new ChorusError('internal_error', 'Board insert returned no row.');
-      const version = await tx.bumpSessionVersion();
+      const id = created.board_id;
+      const version = tx.recordSessionVersion(created.session_version);
       return {
         result: { board: { id, name, session_id: sessionId }, session_version: version },
         events: [
@@ -388,12 +384,12 @@ export async function setSessionPolicy(
     },
     handle: async (tx) => {
       const session = requireSession(tx);
-      // The administrator role is re-verified inside the definer; chorus_app cannot UPDATE sessions.
-      await tx.db.query('SELECT chorus_session_set_policy($1, $2::jsonb)', [
-        sessionId,
-        JSON.stringify(changes),
-      ]);
-      const version = await tx.bumpSessionVersion();
+      // The administrator role is re-verified inside the definer, which also bumps the session version.
+      const changed = await tx.db.query<{ version: number }>(
+        'SELECT chorus_session_set_policy($1, $2::jsonb) AS version',
+        [sessionId, JSON.stringify(changes)],
+      );
+      const version = tx.recordSessionVersion(changed.rows[0]?.version ?? 0);
       return {
         result: { session_id: sessionId, version, changed: fields },
         events: [
@@ -418,6 +414,16 @@ async function liveAdministrators(tx: CommandTx): Promise<Uuid[]> {
     [requireSession(tx).id],
   );
   return rows.map((r) => r.actor_id);
+}
+
+/** The database refuses to leave a session without a live administrator (CH005); surface it as the domain error. */
+async function lastAdministratorGuard<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query;
+  } catch (error) {
+    if ((error as { code?: string }).code === 'CH005') throw lastAdministrator();
+    throw error;
+  }
 }
 
 function lastAdministrator(): ChorusError {
@@ -498,12 +504,15 @@ function roleCommand(kind: 'grant' | 'revoke') {
         }
         const roles =
           kind === 'grant' ? [...member.roles, role] : member.roles.filter((r) => r !== role);
-        await tx.db.query('SELECT chorus_session_set_roles($1, $2, $3::text[])', [
-          sessionId,
-          actorId,
-          roles,
-        ]);
-        const version = await tx.bumpSessionVersion();
+        const changed = await lastAdministratorGuard(
+          tx.db.query<{ session_version: number }>(
+            'SELECT session_version FROM chorus_session_set_roles($1, $2, $3::text[])',
+            [sessionId, actorId, roles],
+          ),
+        );
+        const session_version = changed.rows[0]?.session_version;
+        if (session_version === undefined) throw new ChorusError('not_found', 'Not found.');
+        const version = tx.recordSessionVersion(session_version);
         return {
           result: { session_id: sessionId, actor_id: actorId, roles, version },
           events: [
@@ -616,7 +625,9 @@ function removalCommand(kind: 'remove' | 'leave') {
       // The member row is closed LAST (after events are journaled): a member leaving their own session
       // must still be able to journal it, and a removed member's own statements would no longer see it.
       finalize: async (tx) => {
-        await tx.db.query('SELECT chorus_session_remove_member($1, $2)', [sessionId, target]);
+        await lastAdministratorGuard(
+          tx.db.query('SELECT chorus_session_remove_member($1, $2)', [sessionId, target]),
+        );
       },
       handle: async (tx) => {
         const session = requireSession(tx);
@@ -627,7 +638,13 @@ function removalCommand(kind: 'remove' | 'leave') {
           if (admins.includes(target) && admins.length <= 1) throw lastAdministrator();
         }
         const effects = await removalEffects(tx, target);
-        const version = await tx.bumpSessionVersion();
+        // Verifies the caller (an administrator, or the member themself) and bumps the session version;
+        // the membership row itself is closed last, in `finalize`.
+        const begun = await tx.db.query<{ version: number }>(
+          'SELECT chorus_session_removal_begin($1, $2) AS version',
+          [sessionId, target],
+        );
+        const version = tx.recordSessionVersion(begun.rows[0]?.version ?? 0);
         return {
           result: { session_id: sessionId, actor_id: target, version },
           events: [

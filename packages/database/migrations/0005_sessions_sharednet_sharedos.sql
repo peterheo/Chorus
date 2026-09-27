@@ -181,6 +181,7 @@ ALTER TABLE review_details
   ADD COLUMN cancelled_at timestamptz,
   ADD COLUMN cancel_reason text CHECK (cancel_reason IS NULL OR char_length(cancel_reason) <= 2000),
   ADD CONSTRAINT review_details_cancel_ck CHECK ((cancelled_at IS NULL) = (cancel_reason IS NULL)),
+  ADD COLUMN verdict_manager_review_allowed boolean,
   ADD COLUMN verdict_reviewer_roles text[]
     CHECK (verdict_reviewer_roles IS NULL OR verdict_reviewer_roles <@ ARRAY['participant', 'manager', 'administrator']::text[]),
   ADD FOREIGN KEY (workspace_id, review_item_id, session_id) REFERENCES work_items (workspace_id, id, session_id),
@@ -794,17 +795,19 @@ BEGIN
   VALUES (v_ws, v_session, v_actor, ARRAY['participant', 'manager', 'administrator']);
   INSERT INTO public.projects (workspace_id, session_id, name)
   VALUES (v_ws, v_session, p_board_name) RETURNING id INTO v_board;
+  -- The session is created at version 1; its first board is the second versioned change.
+  UPDATE public.sessions SET version = 2 WHERE workspace_id = v_ws AND id = v_session;
   RETURN QUERY SELECT v_session, v_board;
 END;
 $$;
 
 -- Join a session per its policy. Not eligible, nonexistent and not visible are indistinguishable (zero rows).
 CREATE FUNCTION chorus_join_session(p_session_id uuid, p_credential_sha256 text)
-  RETURNS TABLE (session_id uuid, roles text[], newly_joined boolean)
+  RETURNS TABLE (session_id uuid, roles text[], newly_joined boolean, session_version integer, room_id uuid)
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 #variable_conflict use_column
 DECLARE
-  v_ws uuid := public.chorus_ws(); v_actor uuid := public.chorus_actor();
+  v_ws uuid := public.chorus_ws(); v_actor uuid := public.chorus_actor(); v_version integer;
   v_s public.sessions%ROWTYPE; v_principal text; v_tag text; v_member public.session_members%ROWTYPE;
   v_cred public.session_join_credentials%ROWTYPE; v_ok boolean := false;
 BEGIN
@@ -821,7 +824,7 @@ BEGIN
   SELECT * INTO v_member FROM public.session_members m
    WHERE m.workspace_id = v_ws AND m.session_id = p_session_id AND m.actor_id = v_actor FOR UPDATE;
   IF FOUND AND v_member.removed_at IS NULL THEN
-    RETURN QUERY SELECT p_session_id, v_member.roles, false;   -- already a member: idempotent
+    RETURN QUERY SELECT p_session_id, v_member.roles, false, v_s.version, v_s.room_id;   -- already a member: idempotent
     RETURN;
   END IF;
 
@@ -856,7 +859,10 @@ BEGIN
     INSERT INTO public.session_members (workspace_id, session_id, actor_id, roles)
     VALUES (v_ws, p_session_id, v_actor, ARRAY['participant']);
   END IF;
-  RETURN QUERY SELECT p_session_id, ARRAY['participant']::text[], true;
+  -- A join is a versioned change of the session.
+  UPDATE public.sessions SET version = version + 1
+   WHERE workspace_id = v_ws AND id = p_session_id RETURNING version INTO v_version;
+  RETURN QUERY SELECT p_session_id, ARRAY['participant']::text[], true, v_version, v_s.room_id;
 END;
 $$;
 
@@ -928,6 +934,8 @@ BEGIN
 END;
 $$;
 
+-- INTERNAL ONLY (A4.4): bumps the session version. Not executable by chorus_app; only the definers below
+-- (which run as the owner) call it, so a participant can never force version conflicts on administrators.
 CREATE FUNCTION chorus_session_bump(p_session_id uuid) RETURNS integer
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
@@ -943,7 +951,8 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION chorus_session_set_policy(p_session_id uuid, p_changes jsonb) RETURNS void
+-- Administrator-only. Applies the policy fields and bumps the session version; returns the new version.
+CREATE FUNCTION chorus_session_set_policy(p_session_id uuid, p_changes jsonb) RETURNS integer
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
   v_roles text[] := public.chorus_session_roles(p_session_id);
@@ -951,6 +960,7 @@ BEGIN
   IF v_roles IS NULL OR NOT ('administrator' = ANY (v_roles)) THEN
     RAISE EXCEPTION 'administrator role required' USING ERRCODE = '42501';
   END IF;
+  PERFORM 1 FROM public.sessions s WHERE s.workspace_id = public.chorus_ws() AND s.id = p_session_id FOR UPDATE;
   UPDATE public.sessions s SET
     name = CASE WHEN p_changes ? 'name' THEN p_changes ->> 'name' ELSE s.name END,
     discoverable = CASE WHEN p_changes ? 'discoverable'
@@ -967,6 +977,7 @@ BEGIN
     default_review_required = CASE WHEN p_changes ? 'default_review_required'
       THEN (p_changes ->> 'default_review_required')::boolean ELSE s.default_review_required END
    WHERE s.workspace_id = public.chorus_ws() AND s.id = p_session_id;
+  RETURN public.chorus_session_bump(p_session_id);
 END;
 $$;
 
@@ -986,30 +997,62 @@ CREATE FUNCTION chorus_session_live_members(p_session_id uuid)
      AND p_session_id IN (SELECT public.chorus_my_sessions())
 $$;
 
--- Administrator-only: replace a LIVE member's roles. NULL when the target is not a live member.
+-- Administrator-only: replace a LIVE member's roles and bump the session version. Returns no row when the
+-- target is not a live member. The database itself refuses to leave a session with no live administrator
+-- (CH005 last_administrator), whatever the caller's domain checks did.
 CREATE FUNCTION chorus_session_set_roles(p_session_id uuid, p_actor_id uuid, p_roles text[])
-  RETURNS text[]
+  RETURNS TABLE (roles text[], session_version integer)
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
   v_roles text[] := public.chorus_session_roles(p_session_id);
   v_new text[];
+  v_admins integer;
 BEGIN
   IF v_roles IS NULL OR NOT ('administrator' = ANY (v_roles)) THEN
     RAISE EXCEPTION 'administrator role required' USING ERRCODE = '42501';
   END IF;
+  PERFORM 1 FROM public.sessions s WHERE s.workspace_id = public.chorus_ws() AND s.id = p_session_id FOR UPDATE;
   IF NOT EXISTS (SELECT 1 FROM public.chorus_session_live_members(p_session_id) l
                   WHERE l.actor_id = p_actor_id) THEN
-    RETURN NULL;
+    RETURN;
+  END IF;
+  IF NOT ('administrator' = ANY (p_roles)) THEN
+    SELECT count(*) INTO v_admins FROM public.chorus_session_live_members(p_session_id) l
+     WHERE 'administrator' = ANY (l.roles) AND l.actor_id <> p_actor_id;
+    IF v_admins = 0 AND EXISTS (SELECT 1 FROM public.chorus_session_live_members(p_session_id) l
+                                 WHERE l.actor_id = p_actor_id AND 'administrator' = ANY (l.roles)) THEN
+      RAISE EXCEPTION 'the last administrator cannot give up administration' USING ERRCODE = 'CH005';
+    END IF;
   END IF;
   UPDATE public.session_members m SET roles = p_roles, version = m.version + 1
    WHERE m.workspace_id = public.chorus_ws() AND m.session_id = p_session_id AND m.actor_id = p_actor_id
      AND m.removed_at IS NULL
    RETURNING m.roles INTO v_new;
-  RETURN v_new;
+  RETURN QUERY SELECT v_new, public.chorus_session_bump(p_session_id);
 END;
 $$;
 
--- Administrator removes a member, or any member removes themself (leave). Closes the membership row.
+-- First half of a removal: verifies the caller (an administrator, or the member themself) and bumps the
+-- session version so the domain can journal the event at that version. The membership row is closed LAST
+-- by chorus_session_remove_member, after the events are written.
+CREATE FUNCTION chorus_session_removal_begin(p_session_id uuid, p_actor_id uuid) RETURNS integer
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+DECLARE
+  v_roles text[] := public.chorus_session_roles(p_session_id);
+BEGIN
+  IF v_roles IS NULL THEN
+    RAISE EXCEPTION 'not a live session member' USING ERRCODE = '42501';
+  END IF;
+  IF p_actor_id <> public.chorus_actor() AND NOT ('administrator' = ANY (v_roles)) THEN
+    RAISE EXCEPTION 'administrator role required' USING ERRCODE = '42501';
+  END IF;
+  PERFORM 1 FROM public.sessions s WHERE s.workspace_id = public.chorus_ws() AND s.id = p_session_id FOR UPDATE;
+  RETURN public.chorus_session_bump(p_session_id);
+END;
+$$;
+
+-- Second half: an administrator removes a member, or any member removes themself (leave). Closes the
+-- membership row. Refuses (CH005) to close the last live administrator.
 CREATE FUNCTION chorus_session_remove_member(p_session_id uuid, p_actor_id uuid) RETURNS boolean
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
@@ -1021,10 +1064,35 @@ BEGIN
   IF p_actor_id <> public.chorus_actor() AND NOT ('administrator' = ANY (v_roles)) THEN
     RAISE EXCEPTION 'administrator role required' USING ERRCODE = '42501';
   END IF;
+  PERFORM 1 FROM public.sessions s WHERE s.workspace_id = public.chorus_ws() AND s.id = p_session_id FOR UPDATE;
+  IF EXISTS (SELECT 1 FROM public.chorus_session_live_members(p_session_id) l
+              WHERE l.actor_id = p_actor_id AND 'administrator' = ANY (l.roles))
+     AND NOT EXISTS (SELECT 1 FROM public.chorus_session_live_members(p_session_id) l
+                      WHERE l.actor_id <> p_actor_id AND 'administrator' = ANY (l.roles)) THEN
+    RAISE EXCEPTION 'the last administrator cannot be removed' USING ERRCODE = 'CH005';
+  END IF;
   UPDATE public.session_members m SET removed_at = now(), version = m.version + 1
    WHERE m.workspace_id = public.chorus_ws() AND m.session_id = p_session_id AND m.actor_id = p_actor_id
      AND m.removed_at IS NULL;
   RETURN FOUND;
+END;
+$$;
+
+-- Manager-only: adds a board and bumps the session version. Returns the board id and the new version.
+CREATE FUNCTION chorus_session_create_board(p_session_id uuid, p_name text)
+  RETURNS TABLE (board_id uuid, session_version integer)
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+DECLARE
+  v_roles text[] := public.chorus_session_roles(p_session_id);
+  v_board uuid;
+BEGIN
+  IF v_roles IS NULL OR NOT ('manager' = ANY (v_roles)) THEN
+    RAISE EXCEPTION 'manager role required' USING ERRCODE = '42501';
+  END IF;
+  PERFORM 1 FROM public.sessions s WHERE s.workspace_id = public.chorus_ws() AND s.id = p_session_id FOR UPDATE;
+  INSERT INTO public.projects (workspace_id, session_id, name)
+  VALUES (public.chorus_ws(), p_session_id, p_name) RETURNING id INTO v_board;
+  RETURN QUERY SELECT v_board, public.chorus_session_bump(p_session_id);
 END;
 $$;
 
@@ -1046,14 +1114,17 @@ REVOKE ALL ON FUNCTION chorus_session_roles(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION chorus_session_lock(uuid, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION chorus_session_bump(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION chorus_session_set_policy(uuid, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION chorus_session_removal_begin(uuid, uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION chorus_session_create_board(uuid, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION chorus_session_live_members(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION chorus_session_set_roles(uuid, uuid, text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION chorus_session_remove_member(uuid, uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION chorus_my_sessions() TO chorus_app;
 GRANT EXECUTE ON FUNCTION chorus_session_roles(uuid) TO chorus_app;
 GRANT EXECUTE ON FUNCTION chorus_session_lock(uuid, text) TO chorus_app;
-GRANT EXECUTE ON FUNCTION chorus_session_bump(uuid) TO chorus_app;
 GRANT EXECUTE ON FUNCTION chorus_session_set_policy(uuid, jsonb) TO chorus_app;
+GRANT EXECUTE ON FUNCTION chorus_session_removal_begin(uuid, uuid) TO chorus_app;
+GRANT EXECUTE ON FUNCTION chorus_session_create_board(uuid, text) TO chorus_app;
 GRANT EXECUTE ON FUNCTION chorus_session_live_members(uuid) TO chorus_app;
 GRANT EXECUTE ON FUNCTION chorus_session_set_roles(uuid, uuid, text[]) TO chorus_app;
 GRANT EXECUTE ON FUNCTION chorus_session_remove_member(uuid, uuid) TO chorus_app;

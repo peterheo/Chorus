@@ -111,8 +111,11 @@ export interface CommandTx {
   readonly items: ReadonlyMap<Uuid, LockedWorkItem>;
   /** Increments a locked item's version and returns the new one; the handler must emit a matching event. */
   bumpVersion: (itemId: Uuid) => Promise<number>;
-  /** Increments the (locked) session's version and returns the new one; the handler must emit a matching event. */
-  bumpSessionVersion: () => Promise<number>;
+  /**
+   * Registers the session version a session-administration definer just produced (the definers bump it
+   * internally; chorus_app cannot bump it directly). The handler must emit a matching event.
+   */
+  recordSessionVersion: (version: number) => number;
 }
 
 /** A command result must be a non-null JSON value: a stored `null` would be indistinguishable from "no response". */
@@ -310,7 +313,7 @@ async function executeInTransaction<TResult extends CommandResult>(
         bumpVersion: () => {
           throw new ChorusError('internal_error', 'authorize must not change versions.');
         },
-        bumpSessionVersion: () => {
+        recordSessionVersion: () => {
           throw new ChorusError('internal_error', 'authorize must not change versions.');
         },
       };
@@ -376,17 +379,10 @@ async function executeInTransaction<TResult extends CommandResult>(
       bumped.set(itemId, version);
       return version;
     },
-    bumpSessionVersion: async () => {
+    recordSessionVersion: (version) => {
       if (sessionInfo === undefined || spec.session?.lock !== true) {
-        throw new ChorusError('internal_error', 'bumpSessionVersion requires a locked session.');
+        throw new ChorusError('internal_error', 'recordSessionVersion requires a locked session.');
       }
-      const updated = await client.query<{ version: number }>(
-        'SELECT chorus_session_bump($1) AS version',
-        [sessionInfo.session.id],
-      );
-      const version = updated.rows[0]?.version;
-      if (version === undefined)
-        throw new ChorusError('internal_error', 'Locked session disappeared.');
       bumpedSessions.set(sessionInfo.session.id, version);
       return version;
     },

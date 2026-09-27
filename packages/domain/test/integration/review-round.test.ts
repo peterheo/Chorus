@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
+  completeTask,
   createSession,
   grantRole,
   isChorusError,
@@ -397,6 +398,96 @@ describe('A4.3 review round (real PostgreSQL, as chorus_app)', () => {
     } finally {
       await client.query('ROLLBACK').catch(() => undefined);
       client.release();
+    }
+  });
+
+  it('A4.4-1: the completion gate uses the flag recorded at verdict time, not the current one', async () => {
+    const w = await makeWorld(f, ws, { managerReview: true });
+    const t = await taskInReview(w);
+    const req = await requestReviewAs(w, t.taskId, t.version, t.revision, w.manager);
+    // Block the task so the approval stands but auto-completion does not happen.
+    await f.owner(
+      `UPDATE work_items SET blocked_at = now(), blocked_reason = 'waiting' WHERE id = $1`,
+      [t.taskId],
+    );
+    const approved = await verdictAs(w, req.review, t.digest, 'approved', w.manager);
+    expect(approved.task.state).toBe('review');
+    const [rec] = await f.owner<{ f: boolean; r: string[] }>(
+      `SELECT verdict_manager_review_allowed AS f, verdict_reviewer_roles AS r FROM review_details WHERE review_item_id = $1`,
+      [req.review.id],
+    );
+    expect(rec).toEqual({ f: true, r: ['participant', 'manager', 'administrator'] });
+    // The blocker clears and an administrator turns manager review off afterwards.
+    await f.owner(`UPDATE work_items SET blocked_at = NULL, blocked_reason = NULL WHERE id = $1`, [
+      t.taskId,
+    ]);
+    await setSessionPolicy(w.manager.ctx(), {
+      session_id: w.session.id,
+      expected_version: await version(w.session.id),
+      manager_review_allowed: false,
+    });
+    const [row] = await f.owner<{ version: number }>(
+      'SELECT version FROM work_items WHERE id = $1',
+      [t.taskId],
+    );
+    const done = await completeTask(w.manager.ctx(), {
+      session_id: w.session.id,
+      task_id: t.taskId,
+      expected_version: row?.version,
+    });
+    expect(done.state).toBe('done');
+  });
+
+  it('A4.4-4: the database refuses to leave a session without a live administrator (CH005)', async () => {
+    const w = await makeWorld(f, ws);
+    const other = await w.participant('other-admin');
+    const client = await f.pool.connect();
+    const asManager = async () => {
+      await client.query('ROLLBACK').catch(() => undefined);
+      await client.query('BEGIN');
+      await client.query(
+        `SELECT set_config('chorus.workspace_id', $1, true), set_config('chorus.actor_id', $2, true)`,
+        [ws.id, w.manager.id],
+      );
+    };
+    try {
+      await asManager();
+      await expect(
+        client.query(
+          `SELECT * FROM chorus_session_set_roles($1, $2, ARRAY['participant','manager'])`,
+          [w.session.id, w.manager.id],
+        ),
+      ).rejects.toMatchObject({ code: 'CH005' });
+      await asManager();
+      await expect(
+        client.query('SELECT chorus_session_remove_member($1, $2)', [w.session.id, w.manager.id]),
+      ).rejects.toMatchObject({ code: 'CH005' });
+      // With a second LIVE administrator both are allowed; a room-removed one does not count.
+      await f.owner(
+        `UPDATE session_members SET roles = ARRAY['participant','administrator'] WHERE session_id = $1 AND actor_id = $2`,
+        [w.session.id, other.id],
+      );
+      await removeFromRoom(other);
+      await asManager();
+      await expect(
+        client.query(
+          `SELECT * FROM chorus_session_set_roles($1, $2, ARRAY['participant','manager'])`,
+          [w.session.id, w.manager.id],
+        ),
+      ).rejects.toMatchObject({ code: 'CH005' });
+      await f.owner(
+        `UPDATE room_members SET removed_at = NULL WHERE workspace_id = $1 AND room_id = $2 AND actor_id = $3`,
+        [ws.id, ws.roomId, other.id],
+      );
+      await asManager();
+      const ok = await client.query(
+        `SELECT * FROM chorus_session_set_roles($1, $2, ARRAY['participant','manager'])`,
+        [w.session.id, w.manager.id],
+      );
+      expect(ok.rows).toHaveLength(1);
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release(true);
     }
   });
 });

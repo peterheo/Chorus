@@ -52,9 +52,11 @@ const DEFINERS = [
   'chorus_resolve_token',
   'chorus_room_health',
   'chorus_session_bump',
+  'chorus_session_create_board',
   'chorus_session_live_members',
   'chorus_session_lock',
   'chorus_session_remove_member',
+  'chorus_session_removal_begin',
   'chorus_session_roles',
   'chorus_session_set_policy',
   'chorus_session_set_roles',
@@ -744,6 +746,113 @@ describe('row-level security and definer functions, as the runtime role chorus_a
             'SELECT count(*) AS n FROM session_members WHERE session_id = $1 AND actor_id = $2',
             [hidden.id, outsider.id],
           ),
+        ).toBe(0);
+      });
+
+      it('the session definers ignore forged temp sessions, members and rooms, and refuse a non-administrator', async () => {
+        const target = wa.executor2;
+        const client = await f.pool.connect();
+        const asActor = async (actorId: string) => {
+          await client.query('ROLLBACK').catch(() => undefined);
+          await client.query('BEGIN');
+          await client.query(
+            `SELECT set_config('chorus.workspace_id', $1, true), set_config('chorus.actor_id', $2, true)`,
+            [wa.ws.id, actorId],
+          );
+          for (const ddl of [
+            `CREATE TEMP TABLE sessions (id uuid, workspace_id uuid, room_id uuid, name text, discoverable boolean, join_policy text, listed_principals text[], policy_agent_ids text[], default_claim_policy text, manager_review_allowed boolean, default_review_required boolean, state text, version int DEFAULT 1, created_by uuid)`,
+            LOOKALIKE['session_members'] ?? '',
+            LOOKALIKE['room_members'] ?? '',
+            `CREATE TEMP TABLE rooms (id uuid, workspace_id uuid, name text, activation_state text)`,
+            `CREATE TEMP TABLE projects (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, session_id uuid, name text)`,
+          ])
+            await client.query(ddl);
+          // The forgery: the actor is an administrator and manager of the session, in a live room.
+          await client.query(
+            `INSERT INTO pg_temp.rooms (id, workspace_id, name, activation_state) VALUES ($1, $2, 'r', 'active')`,
+            [wa.ws.roomId, wa.ws.id],
+          );
+          await client.query(
+            `INSERT INTO pg_temp.room_members (workspace_id, room_id, actor_id) VALUES ($1, $2, $3)`,
+            [wa.ws.id, wa.ws.roomId, actorId],
+          );
+          await client.query(
+            `INSERT INTO pg_temp.sessions (id, workspace_id, room_id, name, state) VALUES ($1, $2, $3, 'forged', 'active')`,
+            [wa.session.id, wa.ws.id, wa.ws.roomId],
+          );
+          await client.query(
+            `INSERT INTO pg_temp.session_members (workspace_id, session_id, actor_id, roles) VALUES ($1, $2, $3, ARRAY['participant','manager','administrator'])`,
+            [wa.ws.id, wa.session.id, actorId],
+          );
+        };
+        const denied = async (sql: string, params: unknown[], code = '42501') => {
+          await client.query('SAVEPOINT probe');
+          await expect(client.query(sql, params), sql).rejects.toMatchObject({ code });
+          await client.query('ROLLBACK TO SAVEPOINT probe');
+        };
+        try {
+          // A non-member forging membership in temp tables learns and changes nothing.
+          await asActor(wa.outsider.id);
+          const sid = wa.session.id;
+          expect(
+            (await client.query('SELECT chorus_session_roles($1) AS r', [sid])).rows[0],
+          ).toEqual({ r: null });
+          expect(
+            (await client.query('SELECT * FROM chorus_session_lock($1, $2)', [sid, 'update'])).rows,
+          ).toEqual([]);
+          expect(
+            (await client.query('SELECT * FROM chorus_session_live_members($1)', [sid])).rows,
+          ).toEqual([]);
+          await denied('SELECT chorus_session_set_policy($1, $2::jsonb)', [sid, '{"name":"x"}']);
+          await denied("SELECT * FROM chorus_session_set_roles($1, $2, ARRAY['participant'])", [
+            sid,
+            target.id,
+          ]);
+          await denied('SELECT chorus_session_removal_begin($1, $2)', [sid, target.id]);
+          await denied('SELECT chorus_session_remove_member($1, $2)', [sid, target.id]);
+          await denied('SELECT * FROM chorus_session_create_board($1, $2)', [sid, 'b']);
+
+          // A plain participant forging administrator/manager roles in temp tables is still a participant.
+          await asActor(wa.executor.id);
+          expect(
+            (await client.query('SELECT chorus_session_roles($1) AS r', [sid])).rows[0],
+          ).toEqual({ r: ['participant'] });
+          await denied('SELECT chorus_session_set_policy($1, $2::jsonb)', [sid, '{"name":"x"}']);
+          await denied(
+            "SELECT * FROM chorus_session_set_roles($1, $2, ARRAY['participant','administrator'])",
+            [sid, wa.executor.id],
+          );
+          await denied('SELECT chorus_session_removal_begin($1, $2)', [sid, target.id]); // not an administrator
+          await denied('SELECT chorus_session_remove_member($1, $2)', [sid, target.id]);
+          await denied('SELECT * FROM chorus_session_create_board($1, $2)', [sid, 'b']); // not a manager
+          // The version bump is internal: not executable by the runtime role at all.
+          await denied('SELECT chorus_session_bump($1)', [sid]);
+          // A member may still leave (self-only): the begin step is allowed for themself.
+          await client.query('SAVEPOINT self');
+          expect(
+            (
+              await client.query('SELECT chorus_session_removal_begin($1, $2) AS v', [
+                sid,
+                wa.executor.id,
+              ])
+            ).rows,
+          ).toHaveLength(1);
+          await client.query('ROLLBACK TO SAVEPOINT self');
+        } finally {
+          await client.query('ROLLBACK').catch(() => undefined);
+          client.release(true);
+        }
+        // Nothing real changed, and no temp table leaked a write into the real ones.
+        const [row] = await f.owner<{ roles: string[] }>(
+          'SELECT roles FROM session_members WHERE session_id = $1 AND actor_id = $2',
+          [wa.session.id, wa.executor.id],
+        );
+        expect(row?.roles).toEqual(['participant']);
+        expect(
+          await f.count('SELECT count(*) AS n FROM projects WHERE session_id = $1 AND name = $2', [
+            wa.session.id,
+            'b',
+          ]),
         ).toBe(0);
       });
 
