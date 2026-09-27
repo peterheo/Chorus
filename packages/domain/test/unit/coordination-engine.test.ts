@@ -248,6 +248,25 @@ describe('CC-2a engine: handoffs', () => {
     expect(statuses(s.run().state)).toEqual({ H1: 'accepted', C1: 'open' });
   });
 
+  it("a target commitment that is their next message and names nothing accepts it ('I've got this')", () => {
+    const s = new Script();
+    s.say(alice, { type: 'handoff', targets: [bob] });
+    s.say(bob, { type: 'commitment' });
+    s.say(alice, { type: 'handoff', targets: [carol] });
+    s.say(carol, { type: 'commitment', refs: ['C1'] }); // names something else: a plain commitment
+    s.say(alice, { type: 'handoff', targets: [dave] });
+    s.say(dave, []);
+    s.say(dave, { type: 'commitment' }); // not his next message
+    expect(statuses(s.run().state)).toEqual({
+      H1: 'accepted',
+      C1: 'open',
+      H2: 'pending',
+      C2: 'open',
+      H3: 'pending',
+      C3: 'open',
+    });
+  });
+
   it('declined by a target decline; completed when its commitment completes', () => {
     const s = new Script();
     const h1 = s.say(alice, { type: 'handoff', targets: [bob] });

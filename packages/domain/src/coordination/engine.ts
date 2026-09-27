@@ -9,6 +9,7 @@
  */
 import type { SourceMessage } from '../conversation/extract.ts';
 import type { CoordEvent, CoordEventType, ExtractEvents } from './events.ts';
+import { extractEvents } from './extract.ts';
 import { contentTokens, jaccard } from './similarity.ts';
 import {
   OBJECT_STATUSES,
@@ -244,9 +245,9 @@ export function applyEvents(
    * replies to nothing, those for which this is the target's first message since the handoff (a pending
    * handoff's later sources are exactly its targets' messages, see the end of this function).
    */
-  const pendingFor = (event: CoordEvent): CoordObject[] => {
+  const pendingFor = (event: CoordEvent, nextMessage = true): CoordObject[] => {
     const direct = named(event).filter(pendingToSender);
-    if (direct.length > 0 || event.reply_to_message_id !== null) return direct;
+    if (direct.length > 0 || event.reply_to_message_id !== null || !nextMessage) return direct;
     return list().filter((object) => pendingToSender(object) && object.sources.length === 1);
   };
 
@@ -374,7 +375,9 @@ export function applyEvents(
         return;
       }
       case 'commitment': {
-        const handoffs = named(event).filter(pendingToSender);
+        // Like an acknowledgement, a target's commitment accepts the handoffs it names, or, when it is their next
+        // message and names nothing ("I've got this"), the pending ones: rules-v2 extracts those as commitments.
+        const handoffs = pendingFor(event, event.refs.length === 0);
         for (const handoff of handoffs) accept(handoff);
         const questions = named(event).filter((object) => object.kind === 'question');
         if (handoffs.length === 0) {
@@ -543,3 +546,6 @@ export function createEngine(extract: ExtractEvents): ApplyMessages {
 
 const skipped = (message: SourceMessage, excluded: ReadonlySet<string>): boolean =>
   excluded.has(message.sender_member_id) || message.content.startsWith('chorus-verify ');
+
+/** The production engine: `createEngine` over the rules-v2 extractor. */
+export const applyMessages: ApplyMessages = createEngine(extractEvents);
