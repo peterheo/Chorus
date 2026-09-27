@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fetchRetry, readJson, requireStatus } from './lib/http.mjs';
+import { forbiddenMatches } from './lib/forbidden.mjs';
 import { connectMcp } from './lib/mcp.mjs';
 import { redact } from './lib/redact.mjs';
 
@@ -13,21 +14,6 @@ const ROOM_TOOLS = [
   'chorus.list_sessions',
   'chorus.whoami',
 ].sort();
-const FORBIDDEN = [
-  /cht_[^…]/iu,
-  /cvs_[^…]/iu,
-  /rit_[^…]/iu,
-  /sni_/iu,
-  /snk_/iu,
-  /ev1\./iu,
-  /trycloudflare/iu,
-  /operator/iu,
-  /invite code/iu,
-  /request access/iu,
-  /evidence link/iu,
-  /Chorus creates/iu,
-];
-
 function check(condition, code = 'assertion_failed') {
   if (!condition) {
     const error = new Error(code);
@@ -360,8 +346,7 @@ export async function runE2E() {
         }
         const text = await response.text();
         check(text !== '', 'entry_body_missing');
-        const scanText = text.replace(/Not yet available:[^\n]*/gu, '');
-        check(!FORBIDDEN.some((pattern) => pattern.test(scanText)), 'entry_forbidden_string');
+        check(forbiddenMatches(text).length === 0, 'entry_forbidden_string');
       }
       return { http_status: health.response.status };
     });
@@ -753,6 +738,7 @@ export async function runE2E() {
       );
       ids.tasks.push(staleTask.task.id);
       const staleLease = await claimTask(ctx.clients.B, ctx.sessionId, staleTask.task);
+      check(staleLease.fence >= 1, 'stale_fence_requires_prior_fence');
       await toolError(
         ctx.clients.B,
         'chorus.renew_lease',
@@ -760,7 +746,7 @@ export async function runE2E() {
           session_id: ctx.sessionId,
           task_id: staleTask.task.id,
           expected_version: staleLease.version,
-          fence: staleLease.fence + 1,
+          fence: staleLease.fence - 1,
           idempotency_key: randomUUID(),
         },
         'lease_lost',
