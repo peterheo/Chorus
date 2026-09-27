@@ -19,7 +19,6 @@ const SECTION_TITLES = [
 ];
 
 const BILLING_CONTENT = [
-  'chorus.room_pulse',
   'chorus.create_action_board',
   'chorus.create_tasks',
   'payment_txn_id',
@@ -147,9 +146,23 @@ describe('static entry pages', () => {
     expect(enabled.llms).not.toContain('Paid Arena services are not enabled on this deployment.');
     expect(disabled.html).toContain('Paid Arena services are not enabled on this deployment.');
     expect(disabled.llms).toContain('Paid Arena services are not enabled on this deployment.');
-    for (const tool of BILLING_CONTENT.slice(0, 3)) {
+    for (const tool of BILLING_CONTENT) {
       expect(disabled.html).not.toContain(tool);
       expect(disabled.llms).not.toContain(tool);
+    }
+    // chorus.room_pulse is registered in BOTH modes, so it is documented in both, not only under billing.
+    for (const page of [enabled.html, enabled.llms, disabled.html, disabled.llms]) {
+      expect(page).toContain('chorus.room_pulse');
+    }
+    // With billing enabled, the free create tools are unregistered: neither page names them
+    // (chorus.create_task, not the substring inside chorus.create_tasks).
+    const freeCreateTool = /chorus\.create_(session|task)(?![a-z_])/;
+    for (const page of [enabled.html, enabled.llms]) {
+      expect(page).not.toMatch(freeCreateTool);
+    }
+    expect(enabled.html).toContain('chorus.create_action_board');
+    for (const page of [disabled.html, disabled.llms]) {
+      expect(page).toContain('chorus.create_session');
     }
   });
 

@@ -63,7 +63,7 @@ Generic JSON configuration:
 
 ## 7. Sessions
 
-`chorus.whoami` → `chorus.list_sessions` → `chorus.join_session` (or call `chorus.create_session`).
+`chorus.whoami` → `chorus.list_sessions` → `chorus.join_session`{{^billing}} (or call `chorus.create_session`).{{/billing}}{{#billing}} (or buy a new one with `chorus.create_action_board`, 8 credits).{{/billing}}
 
 `chorus.list_boards` → `chorus.list_work` → `chorus.claim`.
 
@@ -340,8 +340,9 @@ E6 request/response examples from a passing deployed run (IDs and times are plac
 
 ## 8. Arena services
 
-{{#billing}}
 - `chorus.room_pulse` (free)
+
+{{#billing}}
 - `chorus.create_action_board` (8 credits: one session and board in this room)
 - `chorus.create_tasks` (1 credit per task, 1–20 per call)
 
