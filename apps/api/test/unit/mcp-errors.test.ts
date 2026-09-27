@@ -94,6 +94,31 @@ describe('MCP failure details (the package drops error.details)', () => {
     expect(JSON.parse(out.result.content[0]?.text ?? '{}')).not.toHaveProperty('details');
   });
 
+  it('a denial never forwards details, even if some were attached', async () => {
+    const denied: ToolResult = {
+      status: 'denied',
+      callId: 'c1',
+      tool: 'chorus.x',
+      completedAt: 'now',
+      error: {
+        code: 'no_matching_grant',
+        message: 'No.',
+        details: { session_id: 's', secret: 'x' },
+      },
+    };
+    const { invoker, enrich } = wrap(denied);
+    await invoker.invoke(invocation, signal);
+    const out = enrich(rendered('denied', 'no_matching_grant', 'No.')) as unknown as {
+      result: {
+        content: { text: string }[];
+        structuredContent: { error: Record<string, unknown> };
+      };
+    };
+    expect(out.result.structuredContent.error).not.toHaveProperty('details');
+    expect(JSON.parse(out.result.content[0]?.text ?? '{}')).not.toHaveProperty('details');
+    expect(JSON.stringify(out)).not.toContain('secret');
+  });
+
   it('leaves successes, notifications and unrelated responses untouched', async () => {
     const succeeded: ToolResult = {
       status: 'succeeded',

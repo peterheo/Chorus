@@ -41,7 +41,9 @@ export function keepFailureDetails(inner: McpToolInvoker): FailureDetails {
     } catch {
       return response;
     }
-    if (error.details !== undefined) body['details'] = error.details;
+    // Details are forwarded only for a tool FAILURE (ChorusError.details); a SharedOS denial never carries any.
+    const details = status === 'failed' ? error.details : undefined;
+    if (details !== undefined) body['details'] = details;
     const enriched = {
       ...result,
       content: [{ type: 'text', text: JSON.stringify(body) }],
@@ -51,7 +53,7 @@ export function keepFailureDetails(inner: McpToolInvoker): FailureDetails {
           code: error.code,
           message: error.message,
           ...(error.retryable === undefined ? {} : { retryable: error.retryable }),
-          ...(error.details === undefined ? {} : { details: error.details }),
+          ...(details === undefined ? {} : { details }),
         },
       },
     };
