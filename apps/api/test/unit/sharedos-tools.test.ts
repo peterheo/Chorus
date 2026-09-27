@@ -24,9 +24,9 @@ const scope: ChorusRequestScope = {
 describe('chorus tool definitions', () => {
   const tools = chorusTools(deps);
 
-  it('K11 tools.snapshot: exactly the 31 shipped tools (23 + whoami + 3 Arena + 4 conversation), with stable definitions', () => {
+  it('K11 tools.snapshot: exactly the 33 shipped tools, with stable definitions', () => {
     const definitions = tools.map((t) => t.definition).sort((a, b) => (a.name < b.name ? -1 : 1));
-    expect(definitions).toHaveLength(31);
+    expect(definitions).toHaveLength(33);
     expect(definitions).toMatchSnapshot();
   });
 

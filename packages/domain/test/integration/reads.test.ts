@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   claim,
+  boardSummary,
+  completeTask,
   createTask,
   getResult,
   getTask,
@@ -242,6 +244,64 @@ describe('session reads (real PostgreSQL, as chorus_app)', () => {
     expect(await ids({ blocked: true })).toEqual([b.id]);
     expect(await ids({ blocked: false })).toEqual([a.id]);
     expect((await ids({})).sort()).toEqual([a.id, b.id].sort());
+  });
+
+  it('reads.board_summary: scopes by session and board and counts blocked tasks', async () => {
+    const world = await makeWorld(f, await f.workspace('reads-summary'));
+    const board2 = await f.owner<{ id: string }>(
+      "INSERT INTO projects (workspace_id, session_id, name) VALUES ($1, $2, 'Second') RETURNING id",
+      [world.ws.id, world.session.id],
+    );
+    const first = await newTask(world);
+    const second = (
+      await createTask(world.manager.ctx(), {
+        session_id: world.session.id,
+        board_id: board2[0]?.id,
+        title: 'blocked task',
+        acceptance_criteria: ['c'],
+      })
+    ).task;
+    await f.owner(
+      "UPDATE work_items SET blocked_reason = 'waiting', blocked_at = now() WHERE id = $1",
+      [second.id],
+    );
+
+    for (let index = 0; index < 6; index++) {
+      const done = await newTask(world, { reviewRequired: false });
+      const lease = await claimAs(world, done.id as Uuid, done.version);
+      const submitted = await submitAs(world, done.id as Uuid, lease.version, lease.fence);
+      await completeTask(world.manager.ctx(), {
+        session_id: world.session.id,
+        task_id: done.id,
+        expected_version: submitted.version,
+      });
+    }
+
+    const summary = await boardSummary(read(world.executor), { session_id: world.session.id });
+    expect(summary.boards).toHaveLength(2);
+    expect(summary.boards.find((b) => b.board_id === first.board_id)).toMatchObject({
+      counts: { ready: 1, in_progress: 0, review: 0, done: 6, blocked: 0 },
+    });
+    const recentDone = summary.boards.find((b) => b.board_id === first.board_id)?.recent_done ?? [];
+    expect(recentDone).toHaveLength(5);
+    expect(recentDone.every((task) => task.completed_at.length > 0)).toBe(true);
+    expect(summary.boards.find((b) => b.board_id === board2[0]?.id)).toMatchObject({
+      counts: { ready: 1, blocked: 1 },
+    });
+    await expect(
+      boardSummary(read(world.executor), {
+        session_id: world.session.id,
+        board_id: '00000000-0000-4000-8000-000000000000',
+      }),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    expect(
+      (
+        await boardSummary(read(world.executor), {
+          session_id: world.session.id,
+          board_id: first.board_id,
+        })
+      ).boards,
+    ).toHaveLength(1);
   });
 
   it('reads.list_my_reviews: only my reviews, cancelled ones excluded, by session', async () => {

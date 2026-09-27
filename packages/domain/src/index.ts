@@ -90,6 +90,8 @@ export {
   type SessionDetail,
   type SessionListing,
   getTask,
+  boardSummary,
+  type BoardSummary,
   listMyReviews,
   listWork,
   type ListWorkResponse,

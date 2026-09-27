@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, createPublicKey, randomBytes, type KeyObject } from 'node:crypto';
 import { Writable } from 'node:stream';
 import type { FastifyInstance } from 'fastify';
 import pg from 'pg';
@@ -74,6 +74,7 @@ export async function startStack(
     billing?: 'enabled' | 'disabled';
     /** The ledger the paid tools verify against (default: none configured, so verification would fail). */
     ledger?: LedgerClient;
+    receiptKey?: KeyObject;
   } = {},
 ): Promise<Stack> {
   const db = await createMigratedEphemeralDatabase();
@@ -144,6 +145,15 @@ export async function startStack(
       publicBaseUrl: 'http://127.0.0.1:0',
       leaseDurationSeconds: 900,
       gitCommit: options.gitCommit ?? 'abc1234',
+      ...(options.receiptKey === undefined
+        ? {}
+        : {
+            receiptPrivateKey: options.receiptKey,
+            receiptKeyId: createHash('sha256')
+              .update(createPublicKey(options.receiptKey).export({ type: 'spki', format: 'der' }))
+              .digest('hex')
+              .slice(0, 16),
+          }),
       billing: options.billing ?? 'disabled',
       sharednetBaseUrl: fake.url,
     },

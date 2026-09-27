@@ -624,3 +624,70 @@ export async function listBoards(
     };
   });
 }
+
+export type BoardSummary = {
+  board_id: string;
+  name: string;
+  counts: { ready: number; in_progress: number; review: number; done: number; blocked: number };
+  recent_done: { id: string; title: string; completed_at: string }[];
+};
+type BoardSummaryRow = {
+  board_id: Uuid;
+  name: string;
+  ready: string;
+  in_progress: string;
+  review: string;
+  done: string;
+  blocked: string;
+  recent_done: BoardSummary['recent_done'];
+};
+
+export async function boardSummary(
+  ctx: ReadContext,
+  input: unknown,
+): Promise<{ boards: BoardSummary[] }> {
+  const raw = requireObject(input, ['session_id', 'board_id']);
+  const sessionId = requireUuid(raw['session_id'], 'session_id');
+  const boardId = raw['board_id'] === undefined ? null : requireUuid(raw['board_id'], 'board_id');
+  return withReadTx(ctx, async (db) => {
+    await assertMember(db, ctx, sessionId);
+    const { rows } = await db.query<BoardSummaryRow>(
+      `SELECT b.id AS board_id, b.name, count(w.id) FILTER (WHERE w.state = 'ready') AS ready,
+              count(w.id) FILTER (WHERE w.state = 'in_progress') AS in_progress,
+              count(w.id) FILTER (WHERE w.state = 'review') AS review,
+              count(w.id) FILTER (WHERE w.state = 'done') AS done,
+              count(w.id) FILTER (WHERE w.blocked_reason IS NOT NULL AND w.state <> 'done') AS blocked,
+              COALESCE(recent.items, '[]'::jsonb) AS recent_done
+         FROM projects b LEFT JOIN work_items w
+           ON w.workspace_id = b.workspace_id AND w.session_id = b.session_id AND w.board_id = b.id AND w.kind = 'task'
+         LEFT JOIN LATERAL (
+           SELECT jsonb_agg(jsonb_build_object('id', d.id, 'title', d.title, 'completed_at', d.completed_at)
+                            ORDER BY d.completed_at DESC, d.id) AS items
+             FROM (SELECT t.id, t.title, max(e.occurred_at) AS completed_at
+                     FROM work_items t JOIN domain_events e
+                       ON e.workspace_id = t.workspace_id AND e.aggregate_id = t.id AND e.event_type = 'task.completed'
+                    WHERE t.workspace_id = b.workspace_id AND t.session_id = b.session_id AND t.board_id = b.id
+                      AND t.kind = 'task' AND t.state = 'done'
+                    GROUP BY t.id, t.title ORDER BY max(e.occurred_at) DESC, t.id LIMIT 5) d
+         ) recent ON true
+        WHERE b.workspace_id = $1 AND b.session_id = $2 AND ($3::uuid IS NULL OR b.id = $3)
+        GROUP BY b.id, b.name, b.created_at, recent.items ORDER BY b.created_at, b.id`,
+      [ctx.workspaceId, sessionId, boardId],
+    );
+    if (boardId !== null && rows.length === 0) throw new ChorusError('not_found', 'Not found.');
+    return {
+      boards: rows.map((r) => ({
+        board_id: r.board_id,
+        name: r.name,
+        counts: {
+          ready: Number(r.ready),
+          in_progress: Number(r.in_progress),
+          review: Number(r.review),
+          done: Number(r.done),
+          blocked: Number(r.blocked),
+        },
+        recent_done: r.recent_done,
+      })),
+    };
+  });
+}

@@ -13,6 +13,7 @@ import { RateLimiter } from './rate-limit.ts';
 import type { SharedNetClient } from './sharednet/client.ts';
 import { createChorusKernel } from './sharedos/kernel.ts';
 import { registerStaticPages } from './static.ts';
+import { registerReceiptRoutes } from './receipts.ts';
 
 export interface AppLimits {
   readonly enrollStartPerRoomPerMinute: number;
@@ -23,6 +24,7 @@ export interface AppLimits {
   readonly paidPerActorPerMinute: number;
   readonly pulsePerActorPerMinute: number;
   readonly conversationScanPerActorPerMinute: number;
+  readonly receiptVerifyPerIpPerMinute: number;
 }
 
 const DEFAULT_LIMITS: AppLimits = {
@@ -34,11 +36,12 @@ const DEFAULT_LIMITS: AppLimits = {
   paidPerActorPerMinute: 30,
   pulsePerActorPerMinute: 10,
   conversationScanPerActorPerMinute: 6,
+  receiptVerifyPerIpPerMinute: 30,
 };
 
 export interface AppOptions {
   readonly config: Pick<Config, 'publicBaseUrl' | 'leaseDurationSeconds' | 'gitCommit'> &
-    Partial<Pick<Config, 'billing' | 'sharednetBaseUrl'>>;
+    Partial<Pick<Config, 'billing' | 'sharednetBaseUrl' | 'receiptPrivateKey' | 'receiptKeyId'>>;
   readonly pool: pg.Pool;
   /** For `POST /v1/rooms/activate`: the SharedNet client and the key that seals the seat token. */
   readonly sharednet: { readonly client: SharedNetClient; readonly secretsKey: Buffer };
@@ -185,6 +188,12 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       baseUrl: sharednetBaseUrl.replace(/\/$/, ''),
       secretsKey: options.sharednet.secretsKey,
     },
+    receipts: {
+      privateKey: config.receiptPrivateKey ?? null,
+      keyId: config.receiptKeyId ?? null,
+      gitCommit: config.gitCommit,
+      publicBaseUrl: config.publicBaseUrl,
+    },
     arena,
     limits: {
       paid: new RateLimiter({ limit: limits.paidPerActorPerMinute, windowMs: 60_000 }),
@@ -216,6 +225,12 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     limiter: new RateLimiter({ limit: limits.activateGlobalPerMinute, windowMs: 60_000 }),
   });
   registerAuditRoutes(app, { pool });
+  registerReceiptRoutes(app, {
+    pool,
+    privateKey: config.receiptPrivateKey ?? null,
+    keyId: config.receiptKeyId ?? null,
+    limiter: new RateLimiter({ limit: limits.receiptVerifyPerIpPerMinute, windowMs: 60_000 }),
+  });
   registerStaticPages(app, {
     publicBaseUrl: config.publicBaseUrl,
     billingEnabled: billing === 'enabled',

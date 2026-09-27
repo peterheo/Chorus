@@ -84,6 +84,14 @@ The public URL is fronted by a Cloudflare Worker relay to a tunnel on this host.
 
 Changing `CHORUS_SECRETS_KEY` makes stored SharedNet seat tokens unreadable, so the affected rooms must be activated again.
 
+Signed task receipts are disabled when `CHORUS_RECEIPT_KEY` is unset. To create an Ed25519 PKCS#8 PEM key:
+
+```sh
+openssl genpkey -algorithm ed25519 -out chorus-receipt-key.pem
+```
+
+Keep the private key secret and set `CHORUS_RECEIPT_KEY` to its PEM contents in `.env.prod`. The API publishes the matching public key at `/v1/keys/:key_id`; `public_key_raw_b64` is unpadded Base64url per RFC 4648 section 5. Rotating this key creates a new key ID, so retain old public keys separately if old receipts need continued independent verification.
+
 ## 10. Backups
 
 ```sh

@@ -11,6 +11,7 @@ import {
 } from '@chorus/domain';
 import type { ArenaDeps } from '../../arena/payments.ts';
 import type { RateLimiter } from '../../rate-limit.ts';
+import type { KeyObject } from 'node:crypto';
 import { requireRequestScope, type ChorusRequestScope } from '../request-scope.ts';
 
 export interface ToolDeps {
@@ -28,6 +29,12 @@ export interface ToolDeps {
   /** `enabled`: the free create_session / create_task are not registered (only their paid equivalents). */
   readonly billing?: 'enabled' | 'disabled';
   readonly sharednet?: { readonly baseUrl: string; readonly secretsKey: Buffer };
+  readonly receipts?: {
+    readonly privateKey: KeyObject | null;
+    readonly keyId: string | null;
+    readonly gitCommit: string;
+    readonly publicBaseUrl: string;
+  };
   readonly logger: { error: (obj: Record<string, unknown>, msg: string) => void };
 }
 

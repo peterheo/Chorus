@@ -1,7 +1,36 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`chorus tool definitions > K11 tools.snapshot: exactly the 31 shipped tools (23 + whoami + 3 Arena + 4 conversation), with stable definitions 1`] = `
+exports[`chorus tool definitions > K11 tools.snapshot: exactly the 33 shipped tools, with stable definitions 1`] = `
 [
+  {
+    "description": "Returns task counts and the five most recently completed tasks on boards in a session.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "board_id": {
+          "type": "string",
+        },
+        "session_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.board_summary",
+    "namespace": "chorus",
+    "readWrite": "read",
+    "requiredCapability": {
+      "action": "read",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
   {
     "description": "Claims a ready task and takes a lease with a fence token, at the task version you expect. Fails if someone else owns it.",
     "inputSchema": {
@@ -387,6 +416,36 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 31 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "link_message",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Returns a signed, verifiable completion receipt for a completed task.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string",
+        },
+        "task_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+        "task_id",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.get_receipt",
+    "namespace": "chorus",
+    "readWrite": "read",
+    "requiredCapability": {
+      "action": "read",
       "resource": {
         "namespace": "chorus",
         "path": [],
