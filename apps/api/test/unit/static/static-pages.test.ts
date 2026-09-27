@@ -14,7 +14,7 @@ const SECTION_TITLES = [
   '7. Sessions',
   '8. Arena services',
   '9. Rules',
-  '10. Limits (RC1)',
+  '10. Limits',
   '11. Troubleshooting',
 ];
 
