@@ -42,6 +42,26 @@ describe('deployed E2E evidence redaction', () => {
     }
   });
 
+  it('refuses the conversation step outside the paid run before any network request', async () => {
+    vi.stubEnv('CHORUS_URL', 'https://chorus.example.test');
+    vi.stubEnv('EXPECTED_COMMIT', 'a'.repeat(40));
+    vi.stubEnv('E2E_ROOM', 'rom_ExampleRoom01');
+    vi.stubEnv('E2E_SEATS_FILE', '/secure/seats.json');
+    vi.stubEnv('E2E_PAID', '');
+    vi.stubEnv('E2E_CONVERSATION', '1');
+    const fetch = vi.fn(() => {
+      throw new Error('network_called_before_conversation_validation');
+    });
+    vi.stubGlobal('fetch', fetch);
+    try {
+      await expect(runE2E()).rejects.toThrow('conversation_requires_paid_run');
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('exempts only evidence links on the unavailable line', () => {
     expect(forbiddenMatches('Not yet available: evidence links')).toEqual([]);
     expect(
