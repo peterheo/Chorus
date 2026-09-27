@@ -108,17 +108,33 @@ describe('fetchConversationWindow', () => {
   });
 
   it('never includes the seat token or request query in failure messages or details', async () => {
+    let sparsePage = 0;
     const failures: (typeof fetch)[] = [
       vi.fn(async () => {
         throw new Error(token);
       }) as typeof fetch,
       vi.fn(async () => response({}, 401)) as typeof fetch,
+      vi.fn(async () => response({}, 503)) as typeof fetch,
+      vi.fn(
+        (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new Error(token)), { once: true });
+          }),
+      ) as typeof fetch,
       vi.fn(async () =>
         response({ items: [{}], has_more: false, next_cursor: null }),
       ) as typeof fetch,
+      vi.fn(async () => {
+        sparsePage += 1;
+        return response({ items: [message(sparsePage)], has_more: true, next_cursor: sparsePage });
+      }) as typeof fetch,
     ];
-    for (const fetchImpl of failures) {
-      const err = await fetchConversationWindow(args(fetchImpl)).then(
+    for (const [index, fetchImpl] of failures.entries()) {
+      const request = args(fetchImpl, 1, 190);
+      const err = await fetchConversationWindow({
+        ...request,
+        ...(index === 3 ? { timeoutMs: 5 } : {}),
+      }).then(
         () => undefined,
         (error: unknown) => error,
       );
