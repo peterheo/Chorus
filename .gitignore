@@ -4,6 +4,10 @@ coverage/
 .env
 .env.*
 !.env.example
+!.env.prod.example
+.env.compose
+!.env.compose.example
+.env.prod
 *.log
 .DS_Store
 .sharednet/
