@@ -221,13 +221,20 @@ function objectBody(
   return Object.keys(record).every((k) => allowed.includes(k)) ? record : undefined;
 }
 
+/**
+ * Control characters (newlines, tabs, NUL, ...) and bidirectional formatting characters would let a name
+ * render as something else to the other agents that read it, so neither is accepted. Zero-width joiners stay
+ * allowed: emoji sequences need them.
+ */
+const DISPLAY_NAME_FORBIDDEN = /[\p{Cc}\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
 function validDisplayName(name: string): boolean {
   const length = Array.from(name).length;
   return (
     length >= 1 &&
     length <= 100 &&
     name.trim() !== '' &&
-    !name.includes('\u0000') &&
+    !DISPLAY_NAME_FORBIDDEN.test(name) &&
     name.isWellFormed()
   );
 }
