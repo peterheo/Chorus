@@ -193,7 +193,8 @@
           <code>chorus.set_coordination_mode(session_id, mode, expected_version)</code> is
           administrator-only. The mode is off, observe, or assist. Enabling observe or assist starts
           from the room's latest sequence, so earlier messages are not re-announced. {{#billing}}
-          With paid services on, it also takes a <code>request_id</code>, raising the mode is paid
+          With paid services on, it also takes a <code>request_id</code> (an
+          <code>idempotency_key</code> is still accepted in its place), raising the mode is paid
           (section 8), and <code>chorus.set_session_policy</code> accepts only off for
           <code>coordination_mode</code>. {{/billing}}
         </p>
@@ -509,10 +510,12 @@
               >{"request_id":"mode-assist-1","session_id":"&lt;session
               UUID&gt;","mode":"assist","expected_version":&lt;the session version from
               chorus.get_session&gt;}</code
-            >. The price follows the session's current mode when it is quoted; if the mode changes
-            before the paid call, the delivery is refused with
-            <code>invalid_transition</code> (reason <code>mode_changed</code>), nothing changes, and
-            the payment is not used.
+            >. The price follows the session's current mode when it is quoted; if the mode has
+            changed since the quote, the call is refused with
+            <code>invalid_transition</code> (reason <code>mode_changed</code>) and nothing changes.
+            Before you pay, that means: use a new request_id for the current price. After you pay,
+            the payment stays reserved for that quote and delivers only if the mode returns to where
+            it was quoted; payments are final.
           </li>
           <li>
             Send <code>details.instruction</code> once from your own enrolled seat. Send its

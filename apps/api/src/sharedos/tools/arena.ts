@@ -252,13 +252,21 @@ export const arenaTools: readonly ChorusToolSpec[] = [
  */
 export const paidCoordinationModeTool: ChorusToolSpec = {
   name: 'chorus.set_coordination_mode',
-  description: `Sets a session's room-message coordination mode ('off', 'observe' or 'assist'). Requires an administrator and the latest session version. Paid when it raises the mode: off → observe ${String(PRICES.set_coordination_mode_observe)} credits, off → assist ${String(PRICES.set_coordination_mode_assist)}, observe → assist ${String(PRICES.set_coordination_mode_assist - PRICES.set_coordination_mode_observe)} (the difference); the same mode, lowering it, and 'off' are free. A raise answers payment_required with what to pay; call again with the same arguments plus payment_txn_id.`,
+  description: `Sets a session's room-message coordination mode ('off', 'observe' or 'assist'). Requires an administrator and the latest session version. Paid when it raises the mode: off → observe ${String(PRICES.set_coordination_mode_observe)} credits, off → assist ${String(PRICES.set_coordination_mode_assist)}, observe → assist ${String(PRICES.set_coordination_mode_assist - PRICES.set_coordination_mode_observe)} (the difference); the same mode, lowering it, and 'off' are free. A raise answers payment_required with what to pay; call again with the same arguments plus payment_txn_id. Pass request_id (idempotency_key is accepted in its place).`,
   action: 'administer',
   write: true,
   idempotency: 'request_id',
   rateLimit: 'paid',
-  props: { request_id: S, session_id: S, mode: S, expected_version: I, payment_txn_id: S },
-  required: ['request_id', 'session_id', 'mode', 'expected_version'],
+  // idempotency_key stays accepted so callers of the pre-billing shape keep working; request_id wins.
+  props: {
+    request_id: S,
+    idempotency_key: S,
+    session_id: S,
+    mode: S,
+    expected_version: I,
+    payment_txn_id: S,
+  },
+  required: ['session_id', 'mode', 'expected_version'],
   path: session,
   run: async ({ command, read, input, deps }) => {
     const change = parseCoordinationModeChange(
@@ -268,24 +276,41 @@ export const paidCoordinationModeTool: ChorusToolSpec = {
         mode: input['mode'],
       }),
     );
-    const requestId = requestIdOf(input);
+    const requestId = requestIdOrKey(input, command.idempotencyKey);
     // Administrator only, before anything is quoted (a non-member learns nothing: not_found).
     const current = await coordinationModeOf(read, change.sessionId);
     const existing = await findPurchase(read, 'set_coordination_mode', requestId);
     const due = coordinationModePrice(current.mode, change.mode);
+    if (existing?.state === 'quoted' && existing.amount !== due) {
+      // An unpaid quote whose price no longer holds is refused BEFORE anyone is asked to pay it: paying
+      // would only be refused at delivery. A new request_id quotes the current price (or is free).
+      throw modeChanged(current.mode, existing.amount, due);
+    }
     if (existing === undefined && due === 0) {
       // Free (the same mode, lowering, off): the ordinary command, keyed by the caller's request_id.
-      return setCoordinationMode(
-        { ...command, idempotencyKey: `set_coordination_mode:${requestId}` },
-        {
-          session_id: change.sessionId,
-          expected_version: change.expectedVersion,
-          mode: change.mode,
-        },
-      );
+      try {
+        return await setCoordinationMode(
+          { ...command, idempotencyKey: `set_coordination_mode:${requestId}` },
+          {
+            session_id: change.sessionId,
+            expected_version: change.expectedVersion,
+            mode: change.mode,
+          },
+        );
+      } catch (error) {
+        // Same answer as the paid path for a request_id reused with different arguments.
+        if (error instanceof ChorusError && error.code === 'idempotency_conflict') {
+          throw new ChorusError(
+            'request_conflict',
+            'This request_id was already used for a different request.',
+          );
+        }
+        throw error;
+      }
     }
-    if (existing === undefined && current.version !== change.expectedVersion) {
-      // Refused before a quote, so nobody pays for a change that cannot be delivered at this version.
+    if (existing?.state !== 'delivered' && current.version !== change.expectedVersion) {
+      // Refused before a quote or a payment request, so nobody pays for a change that cannot be delivered
+      // at this version. (A delivered purchase replays whatever the version is now.)
       throw new ChorusError('version_conflict', 'The session changed after the supplied version.', {
         details: { session_id: change.sessionId, current_version: current.version },
       });
@@ -313,20 +338,7 @@ export const paidCoordinationModeTool: ChorusToolSpec = {
           mode: change.mode,
           guard: (now) => {
             const price = coordinationModePrice(now, change.mode);
-            if (price !== amount) {
-              throw new ChorusError(
-                'invalid_transition',
-                `The coordination mode changed to '${now}' after the quote, so this change now costs ${String(price)}, not the ${String(amount)} quoted. Nothing was delivered and the payment was not used.`,
-                {
-                  details: {
-                    reason: 'mode_changed',
-                    current_mode: now,
-                    quoted_amount: amount,
-                    current_amount: price,
-                  },
-                },
-              );
-            }
+            if (price !== amount) throw modeChanged(now, amount, price);
           },
         });
         return { result: applied.result as unknown as JsonValue, events: applied.events };
@@ -334,3 +346,27 @@ export const paidCoordinationModeTool: ChorusToolSpec = {
     );
   },
 };
+
+/** The paid mode tool's idempotency: `request_id`, or the `idempotency_key` of the pre-billing call shape. */
+function requestIdOrKey(input: Record<string, unknown>, key: string | undefined): string {
+  const value = input['request_id'];
+  if (typeof value === 'string') return value;
+  if (key !== undefined) return key;
+  throw invalid('request_id is required.', 'request_id');
+}
+
+/** The quoted price of a mode change no longer holds, because the session's mode moved since the quote. */
+function modeChanged(now: string, quoted: number, current: number): ChorusError {
+  return new ChorusError(
+    'invalid_transition',
+    `The coordination mode is now '${now}', so this change costs ${String(current)}, not the ${String(quoted)} quoted. Nothing was delivered. A payment already made for this quote stays reserved for it and delivers only if the mode returns to where it was quoted; to change the mode now, use a new request_id.`,
+    {
+      details: {
+        reason: 'mode_changed',
+        current_mode: now,
+        quoted_amount: quoted,
+        current_amount: current,
+      },
+    },
+  );
+}

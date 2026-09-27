@@ -1417,12 +1417,15 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 36 shipped to
 
 exports[`chorus tool definitions > paid coordination: with billing on, set_coordination_mode is the paid variant (request_id, payment_txn_id) 1`] = `
 {
-  "description": "Sets a session's room-message coordination mode ('off', 'observe' or 'assist'). Requires an administrator and the latest session version. Paid when it raises the mode: off → observe 2 credits, off → assist 3, observe → assist 1 (the difference); the same mode, lowering it, and 'off' are free. A raise answers payment_required with what to pay; call again with the same arguments plus payment_txn_id.",
+  "description": "Sets a session's room-message coordination mode ('off', 'observe' or 'assist'). Requires an administrator and the latest session version. Paid when it raises the mode: off → observe 2 credits, off → assist 3, observe → assist 1 (the difference); the same mode, lowering it, and 'off' are free. A raise answers payment_required with what to pay; call again with the same arguments plus payment_txn_id. Pass request_id (idempotency_key is accepted in its place).",
   "inputSchema": {
     "additionalProperties": false,
     "properties": {
       "expected_version": {
         "type": "integer",
+      },
+      "idempotency_key": {
+        "type": "string",
       },
       "mode": {
         "type": "string",
@@ -1438,7 +1441,6 @@ exports[`chorus tool definitions > paid coordination: with billing on, set_coord
       },
     },
     "required": [
-      "request_id",
       "session_id",
       "mode",
       "expected_version",

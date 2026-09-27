@@ -40,6 +40,8 @@ docker compose -f docker-compose.prod.yml --profile tools run --rm migrate
 
 Migrations are an explicit step and do not run automatically during startup.
 
+Run them before starting a new version. A version whose migrations are missing fails on the first use of what they add; for example, without `0012_paid_coordination` a paid `chorus.set_coordination_mode` quote fails with an internal error.
+
 ## 5. Start, stop, and logs
 
 ```sh

@@ -101,11 +101,15 @@ describe('chorus tool definitions', () => {
     ]);
     expect(free?.description).not.toContain('Paid');
     expect(paid).toMatchSnapshot();
-    expect(paid?.inputSchema.required).toEqual([
+    // request_id is the paid idempotency; idempotency_key stays accepted for the pre-billing call shape.
+    expect(paid?.inputSchema.required).toEqual(['session_id', 'mode', 'expected_version']);
+    expect(Object.keys(paid?.inputSchema.properties ?? {}).sort()).toEqual([
+      'expected_version',
+      'idempotency_key',
+      'mode',
+      'payment_txn_id',
       'request_id',
       'session_id',
-      'mode',
-      'expected_version',
     ]);
     expect(paid?.description).toContain(
       'off → observe 2 credits, off → assist 3, observe → assist 1',

@@ -9,6 +9,7 @@ import {
   type Fixture,
   type SessionSeed,
 } from '../../../../packages/domain/test/helpers/fixture.ts';
+import { coordinationModeOf, isChorusError } from '@chorus/domain';
 import { RateLimiter } from '../../src/rate-limit.ts';
 import { buildAccessContext } from '../../src/sharedos/access-context.ts';
 import { createChorusKernel } from '../../src/sharedos/kernel.ts';
@@ -21,9 +22,14 @@ describe('paid coordination modes (real PostgreSQL as chorus_app, fake ledger)',
   let f: Fixture;
   const transfers: CreditTransfer[] = [];
   let ledgerCalls = 0;
+  /** Runs once, DURING the next payment verification (outside any transaction), to interleave a change. */
+  let duringVerification: (() => Promise<unknown>) | undefined;
   const ledger: LedgerClient = {
-    listTransfers: (args, signal) => {
+    listTransfers: async (args, signal) => {
       ledgerCalls++;
+      const hook = duringVerification;
+      duringVerification = undefined;
+      if (hook !== undefined) await hook();
       return createFakeLedgerClient(transfers).listTransfers(args, signal);
     },
   };
@@ -380,14 +386,22 @@ describe('paid coordination modes (real PostgreSQL as chorus_app, fake ledger)',
       'chorus.set_coordination_mode',
       await modeArgs(w, 'assist', 'n-assist'),
     );
-    expect(result.status).not.toBe('succeeded');
-    const code =
-      result.status === 'failed'
-        ? (result as { error: { code: string } }).error.code
-        : result.status;
-    expect(['action_forbidden', 'denied']).toContain(code);
+    // SharedOS refuses it at the grant (administer) before the tool runs.
+    expect(result.status).toBe('denied');
     expect(await purchases(w)).toBe(0);
     expect((await sessionState(w)).mode).toBe('off');
+    // The tool's own pricing read refuses a non-administrator too, and a non-member learns nothing.
+    const refusal = async (read: ReturnType<Fixture['readCtx']>) => {
+      try {
+        await coordinationModeOf(read, w.session.id);
+        return 'allowed';
+      } catch (error) {
+        return isChorusError(error) ? error.code : 'thrown';
+      }
+    };
+    expect(await refusal(f.readCtx(member))).toBe('action_forbidden');
+    const stranger = await seated(w.admin.ws, 'stranger');
+    expect(await refusal(f.readCtx(stranger))).toBe('not_found');
   });
 
   it('the quote-vs-delivery race: a changed mode is refused (never under-delivered); an unrelated change needs only a retry at the new version', async () => {
@@ -510,5 +524,129 @@ describe('paid coordination modes (real PostgreSQL as chorus_app, fake ledger)',
     );
     expect(stale.code).toBe('version_conflict');
     expect(await purchases(w)).toBe(0);
+  });
+  it('a stale unpaid quote is refused BEFORE payment is requested; a new request_id gets the current price', async () => {
+    const w = await world('stale-quote');
+    const r1 = await modeArgs(w, 'observe', 'sq-r1');
+    expect(
+      failed(await invoke('enabled', w.admin, 'chorus.set_coordination_mode', r1)).details,
+    ).toMatchObject({ amount: 2 });
+    await buy(w, 'assist', 'sq-r2');
+    // observe is now a free downgrade: r1 must not ask for its old 2 credits.
+    const callsBefore = ledgerCalls;
+    const stale = failed(
+      await invoke('enabled', w.admin, 'chorus.set_coordination_mode', {
+        ...r1,
+        expected_version: (await sessionState(w)).version,
+      }),
+    );
+    expect(stale).toMatchObject({
+      code: 'invalid_transition',
+      details: {
+        reason: 'mode_changed',
+        current_mode: 'assist',
+        quoted_amount: 2,
+        current_amount: 0,
+      },
+    });
+    expect(ledgerCalls).toBe(callsBefore);
+    expect((await sessionState(w)).mode).toBe('assist');
+    const free = okOut(
+      await invoke(
+        'enabled',
+        w.admin,
+        'chorus.set_coordination_mode',
+        await modeArgs(w, 'observe', 'sq-r3'),
+      ),
+    );
+    expect(free).toMatchObject({ changed: ['coordination_mode'] });
+    expect((await sessionState(w)).mode).toBe('observe');
+  });
+
+  it('the in-transaction guard: a mode change DURING payment verification is refused at delivery', async () => {
+    const w = await world('guard');
+    const args = await modeArgs(w, 'assist', 'g-assist');
+    const quote =
+      failed(await invoke('enabled', w.admin, 'chorus.set_coordination_mode', args)).details ?? {};
+    const transfer = pay(w, quote);
+    // Verification runs outside any transaction; the mode moves to observe while it does (no version bump).
+    duringVerification = () =>
+      f.owner(`UPDATE sessions SET coordination_mode = 'observe' WHERE id = $1`, [w.session.id]);
+    const refused = failed(
+      await invoke('enabled', w.admin, 'chorus.set_coordination_mode', {
+        ...args,
+        payment_txn_id: transfer.id,
+      }),
+    );
+    expect(refused).toMatchObject({
+      code: 'invalid_transition',
+      details: { reason: 'mode_changed', quoted_amount: 3, current_amount: 1 },
+    });
+    expect(duringVerification).toBeUndefined();
+    expect((await sessionState(w)).mode).toBe('observe');
+    const stored = await f.owner<{ state: string; txn_id: string | null }>(
+      `SELECT state, txn_id FROM purchases WHERE session_id = $1 AND request_id = 'g-assist'`,
+      [w.session.id],
+    );
+    expect(stored).toEqual([{ state: 'quoted', txn_id: null }]);
+  });
+
+  it('the pre-billing call shape still works: idempotency_key in place of request_id', async () => {
+    const w = await world('compat');
+    const key = randomUUID();
+    const quote = failed(
+      await invoke('enabled', w.admin, 'chorus.set_coordination_mode', {
+        idempotency_key: key,
+        session_id: w.session.id,
+        mode: 'observe',
+        expected_version: (await sessionState(w)).version,
+      }),
+    );
+    expect(quote).toMatchObject({
+      code: 'payment_required',
+      details: { amount: 2, request_id: key },
+    });
+    await buy(w, 'assist', 'c-assist');
+    const lower = {
+      idempotency_key: randomUUID(),
+      session_id: w.session.id,
+      mode: 'off',
+      expected_version: (await sessionState(w)).version,
+    };
+    okOut(await invoke('enabled', w.admin, 'chorus.set_coordination_mode', lower));
+    const version = (await sessionState(w)).version;
+    okOut(await invoke('enabled', w.admin, 'chorus.set_coordination_mode', lower));
+    expect(await sessionState(w)).toMatchObject({ mode: 'off', version });
+    const missing = failed(
+      await invoke('enabled', w.admin, 'chorus.set_coordination_mode', {
+        session_id: w.session.id,
+        mode: 'off',
+        expected_version: version,
+      }),
+    );
+    expect(missing).toMatchObject({ code: 'invalid_request', details: { field: 'request_id' } });
+  });
+
+  it('a request_id reused with different arguments is request_conflict on the free path too', async () => {
+    const w = await world('conflict');
+    await buy(w, 'assist', 'k-assist');
+    okOut(
+      await invoke(
+        'enabled',
+        w.admin,
+        'chorus.set_coordination_mode',
+        await modeArgs(w, 'observe', 'k-free'),
+      ),
+    );
+    const reused = failed(
+      await invoke(
+        'enabled',
+        w.admin,
+        'chorus.set_coordination_mode',
+        await modeArgs(w, 'off', 'k-free'),
+      ),
+    );
+    expect(reused.code).toBe('request_conflict');
+    expect((await sessionState(w)).mode).toBe('observe');
   });
 });
