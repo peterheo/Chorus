@@ -58,6 +58,7 @@ interface WatchedRoom {
 
 const noopLogger: WatcherLogger = { info: () => undefined, warn: () => undefined };
 const LOCK_SQL = `SELECT pg_try_advisory_lock(hashtextextended('chorus:room-consumer:' || $1::text, 0)) AS got`;
+const ignoreError = (): void => undefined;
 const UNLOCK_SQL = `SELECT pg_advisory_unlock(hashtextextended('chorus:room-consumer:' || $1::text, 0))`;
 
 export class RoomWatcher {
@@ -194,16 +195,25 @@ export class RoomWatcher {
             await lock.query('SELECT 1');
             return true;
           } catch {
+            // A dead lease connection is destroyed on release, never returned to the pool.
+            lockState.broken = true;
             this.held.delete(key);
             return false;
           }
         },
         roomAbort.signal,
       );
+    } catch (error) {
+      lockState.broken = true; // whatever went wrong, do not hand this connection back to the pool
+      throw error;
     } finally {
       this.held.delete(key); // synchronously, before any await: exit for any reason ends the lease
       this.abort.signal.removeEventListener('abort', onStop);
-      lock.off('error', onLockError); // a released client goes back to the pool and is reused
+      // A healthy client goes back to the pool and is reused, so it must not keep our listener. A client
+      // being destroyed may still emit 'error' after this point (pg reports a terminated connection when its
+      // socket closes), and an 'error' with no listener is an uncaught exception: keep a permanent no-op.
+      if (lockState.broken) lock.on('error', ignoreError);
+      else lock.off('error', onLockError);
       if (gotLock && !lockState.broken) {
         await lock.query(UNLOCK_SQL, [room.room_id]).catch(() => undefined);
       }

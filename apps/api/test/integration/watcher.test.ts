@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import pg from 'pg';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RoomWatcher } from '../../src/watcher.ts';
@@ -354,6 +355,7 @@ describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
 
   /** Everything the S1-2b tests need to drive a watcher's internals without widening its public surface. */
   interface Internals {
+    consumeRoom: (room: unknown) => Promise<void>;
     handleMessage: (room: unknown, message: SharedNetMessage) => Promise<void>;
     watchRoom: (
       room: unknown,
@@ -504,5 +506,70 @@ describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
     expect(calls).toBe(2);
     expect(handled).not.toHaveBeenCalled();
     expect(await cursor()).toBe(before);
+  });
+
+  /**
+   * A stand-in for the lease connection whose destruction is reported the way pg does it: an 'error' event
+   * that arrives AFTER the client was released, once its socket closes.
+   */
+  class StubLease extends EventEmitter {
+    destroyed: boolean | undefined;
+    private readonly acquired: boolean;
+    constructor(acquired: boolean) {
+      super();
+      this.acquired = acquired;
+    }
+    query(sql: string): Promise<{ rows: { got: boolean }[] }> {
+      if (sql.includes('pg_try_advisory_lock'))
+        return Promise.resolve({ rows: [{ got: this.acquired }] });
+      return Promise.reject(new Error('Connection terminated unexpectedly'));
+    }
+    release(destroy?: boolean): void {
+      this.destroyed = destroy === true;
+      setImmediate(() => this.emit('error', new Error('Connection terminated unexpectedly')));
+    }
+  }
+  const stubbedWatcher = (lease: StubLease) =>
+    new RoomWatcher({
+      pool: {
+        connect: () => Promise.resolve(lease),
+        query: (sql: string) =>
+          Promise.resolve({
+            rows: [sql.includes('claim_epoch') ? { e: '1' } : { last_sequence: '0' }],
+          }),
+      } as unknown as pg.Pool,
+      secretsKey: s.secretsKey,
+      client: {
+        wait: () => Promise.reject(new Error('never polled')),
+      } as unknown as SharedNetClient,
+      minPollIntervalMs: 10,
+    });
+
+  it('watcher.dead_lease_no_uncaught: a lease connection found dead is destroyed, and its late error event never crashes the process', async () => {
+    const [room] = (await s.pool.query('SELECT * FROM chorus_watcher_rooms()')).rows as unknown[];
+    const uncaught: unknown[] = [];
+    const onUncaught = (error: unknown) => uncaught.push(error);
+    process.on('uncaughtException', onUncaught);
+    try {
+      // The lock is taken, the epoch claimed, and then the health check (SELECT 1) finds the connection dead
+      // BEFORE pg has emitted 'error' on it: the order that used to leave the client with no listener.
+      const lease = new StubLease(true);
+      await internals(stubbedWatcher(lease)).consumeRoom(room);
+      await new Promise((resolve) => setTimeout(resolve, 50)); // let the late 'error' fire
+      expect(lease.destroyed).toBe(true);
+      expect(uncaught).toEqual([]);
+    } finally {
+      process.off('uncaughtException', onUncaught);
+    }
+  });
+
+  it('watcher.lease_listener_released: a healthy client goes back to the pool without our error listener', async () => {
+    const [room] = (await s.pool.query('SELECT * FROM chorus_watcher_rooms()')).rows as unknown[];
+    const lease = new StubLease(false); // another process holds the lock: a quiet, healthy exit
+    lease.on('error', () => undefined); // the stub emits after release; only OUR listener is under test
+    const before = lease.listenerCount('error');
+    await internals(stubbedWatcher(lease)).consumeRoom(room);
+    expect(lease.destroyed).toBe(false);
+    expect(lease.listenerCount('error')).toBe(before);
   });
 });
