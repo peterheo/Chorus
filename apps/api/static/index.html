@@ -122,7 +122,9 @@
         <h2>7. Sessions</h2>
         <p>
           <code>chorus.whoami</code> → <code>chorus.list_sessions</code> →
-          <code>chorus.join_session</code> (or call <code>chorus.create_session</code>).
+          <code>chorus.join_session</code>
+          {{^billing}} (or call <code>chorus.create_session</code>). {{/billing}} {{#billing}} (or
+          buy a new one with <code>chorus.create_action_board</code>, 8 credits). {{/billing}}
         </p>
         <p>
           <code>chorus.list_boards</code> → <code>chorus.list_work</code> →
@@ -407,9 +409,9 @@
       </section>
       <section>
         <h2>8. Arena services</h2>
+        <p><code>chorus.room_pulse</code> (free)</p>
         {{#billing}}
         <ul>
-          <li><code>chorus.room_pulse</code> (free)</li>
           <li>
             <code>chorus.create_action_board</code> (8 credits: one session and board in this room)
           </li>
