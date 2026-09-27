@@ -396,6 +396,31 @@ export async function setSessionPolicy(
   ctx: CommandContext,
   input: unknown,
 ): Promise<PolicyChanged> {
+  return changeSessionPolicy(ctx, input, 'session.set_policy');
+}
+
+export async function setCoordinationMode(
+  ctx: CommandContext,
+  input: unknown,
+): Promise<PolicyChanged> {
+  const raw = requireObject(input, ['session_id', 'expected_version', 'mode']);
+  const mode = requireEnum(raw['mode'], 'mode', ['off', 'observe', 'assist']);
+  return changeSessionPolicy(
+    ctx,
+    {
+      session_id: raw['session_id'],
+      expected_version: raw['expected_version'],
+      coordination_mode: mode,
+    },
+    'session.set_coordination_mode',
+  );
+}
+
+async function changeSessionPolicy(
+  ctx: CommandContext,
+  input: unknown,
+  commandType: 'session.set_policy' | 'session.set_coordination_mode',
+): Promise<PolicyChanged> {
   const raw = requireObject(input, [
     'session_id',
     'expected_version',
@@ -451,7 +476,7 @@ export async function setSessionPolicy(
   if (fields.length === 0) throw invalid('input', 'At least one policy field is required.');
 
   return runCommand(ctx, {
-    type: 'session.set_policy',
+    type: commandType,
     session: { id: sessionId, lock: true, expectedVersion },
     input: changes as never,
     authorize: (tx) => {
@@ -465,6 +490,28 @@ export async function setSessionPolicy(
         'SELECT chorus_session_set_policy($1, $2::jsonb) AS version',
         [sessionId, JSON.stringify(changes)],
       );
+      if (changes['coordination_mode'] === 'observe' || changes['coordination_mode'] === 'assist') {
+        // Project only the checkpoint: the watcher function also exposes sealed seat credentials.
+        const checkpoint = await tx.db.query<{ last_sequence: string | null }>(
+          `SELECT watcher.last_sequence
+             FROM public.sessions s
+             LEFT JOIN public.chorus_watcher_rooms() watcher
+               ON watcher.workspace_id = s.workspace_id AND watcher.room_id = s.room_id
+            WHERE s.workspace_id = $1 AND s.id = $2`,
+          [tx.workspaceId, sessionId],
+        );
+        const coordinationCursor = Number(checkpoint.rows[0]?.last_sequence ?? 0);
+        if (!Number.isSafeInteger(coordinationCursor) || coordinationCursor < 0) {
+          throw new ChorusError('internal_error', 'The room cursor is invalid.');
+        }
+        await tx.db.query(
+          `INSERT INTO conversation_engine_state (workspace_id, session_id, cursor)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (workspace_id, session_id) DO UPDATE
+             SET cursor = GREATEST(conversation_engine_state.cursor, EXCLUDED.cursor), updated_at = now()`,
+          [tx.workspaceId, sessionId, coordinationCursor],
+        );
+      }
       const version = tx.recordSessionVersion(changed.rows[0]?.version ?? 0);
       return {
         result: { session_id: sessionId, version, changed: fields },

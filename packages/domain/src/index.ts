@@ -58,6 +58,7 @@ export {
   removeMember,
   revokeRole,
   setSessionPolicy,
+  setCoordinationMode,
   type CreateSessionParams,
   type MemberRemoved,
   type PolicyChanged,

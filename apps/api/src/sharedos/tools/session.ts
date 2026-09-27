@@ -8,6 +8,7 @@ import {
   removeMember,
   revokeRole,
   setSessionPolicy,
+  setCoordinationMode,
 } from '@chorus/domain';
 import { B, I, S, SA, type ChorusToolSpec } from './define.ts';
 
@@ -101,6 +102,17 @@ export const sessionTools: readonly ChorusToolSpec[] = [
     required: ['session_id', 'expected_version'],
     path: session,
     run: ({ command, input }) => setSessionPolicy(command, input),
+  },
+  {
+    name: 'chorus.set_coordination_mode',
+    description:
+      'Sets a session’s room-message coordination mode. Requires an administrator and the latest session version.',
+    action: 'administer',
+    write: true,
+    props: { session_id: S, mode: S, expected_version: I },
+    required: ['session_id', 'mode', 'expected_version'],
+    path: session,
+    run: ({ command, input }) => setCoordinationMode(command, input),
   },
   {
     name: 'chorus.remove_member',
