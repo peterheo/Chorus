@@ -67,6 +67,14 @@ export {
 } from './commands/reviews.ts';
 export type { ReviewSummary } from './commands/support.ts';
 export {
+  roomPulse,
+  type PulseAction,
+  type PulseActionKind,
+  type PulseCounts,
+  type RoomPulse,
+  type SessionPulse,
+} from './queries/pulse.ts';
+export {
   getResult,
   getSession,
   listBoards,
