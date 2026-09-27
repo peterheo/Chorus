@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`chorus tool definitions > K11 tools.snapshot: exactly the 24 shipped tools (23 + whoami), with stable definitions 1`] = `
+exports[`chorus tool definitions > K11 tools.snapshot: exactly the 27 shipped tools (23 + whoami + 3 Arena), with stable definitions 1`] = `
 [
   {
     "description": "Claims a ready task and takes a lease with a fence token, at the task version you expect. Fails if someone else owns it.",
@@ -71,6 +71,55 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 24 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "complete",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Paid (8 credits): creates one session with its first board in your room and makes you its participant, manager and administrator. The first call answers payment_required with what to pay; call again with the same arguments plus payment_txn_id.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "board_name": {
+          "type": "string",
+        },
+        "discoverable": {
+          "type": "boolean",
+        },
+        "join_policy": {
+          "type": "string",
+        },
+        "listed_principals": {
+          "items": {
+            "type": "string",
+          },
+          "type": "array",
+        },
+        "payment_txn_id": {
+          "type": "string",
+        },
+        "request_id": {
+          "type": "string",
+        },
+        "session_name": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "request_id",
+        "session_name",
+        "board_name",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.create_action_board",
+    "namespace": "chorus",
+    "readWrite": "write",
+    "requiredCapability": {
+      "action": "create_session",
       "resource": {
         "namespace": "chorus",
         "path": [],
@@ -219,6 +268,50 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 24 shipped to
       "type": "object",
     },
     "name": "chorus.create_task",
+    "namespace": "chorus",
+    "readWrite": "write",
+    "requiredCapability": {
+      "action": "create_item",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Paid (1 credit per task, 1-20 tasks): creates the tasks on a board of a session you belong to, all or nothing. The first call answers payment_required with what to pay; call again with the same arguments plus payment_txn_id.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "board_id": {
+          "type": "string",
+        },
+        "payment_txn_id": {
+          "type": "string",
+        },
+        "request_id": {
+          "type": "string",
+        },
+        "session_id": {
+          "type": "string",
+        },
+        "tasks": {
+          "items": {
+            "type": "object",
+          },
+          "type": "array",
+        },
+      },
+      "required": [
+        "request_id",
+        "session_id",
+        "board_id",
+        "tasks",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.create_tasks",
     "namespace": "chorus",
     "readWrite": "write",
     "requiredCapability": {
@@ -780,6 +873,30 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 24 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "administer",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Free, read-only summary of the sessions you belong to: counts and the next actions the canonical state suggests. It covers Chorus state only and never reads room messages.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string",
+        },
+      },
+      "required": [],
+      "type": "object",
+    },
+    "name": "chorus.room_pulse",
+    "namespace": "chorus",
+    "readWrite": "read",
+    "requiredCapability": {
+      "action": "pulse",
       "resource": {
         "namespace": "chorus",
         "path": [],

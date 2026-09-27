@@ -7,6 +7,7 @@ import { buildApp, type AppLimits } from '../../src/app.ts';
 import { sealSecret } from '../../src/secrets.ts';
 import { SharedNetClient } from '../../src/sharednet/client.ts';
 import { RoomWatcher } from '../../src/watcher.ts';
+import type { LedgerClient } from '@chorus/sharednet-ledger';
 import { FakeSharedNet } from './fake-sharednet.ts';
 
 export const SHAREDNET_ROOM = 'rom_TestRoom01';
@@ -69,6 +70,10 @@ export async function startStack(
     watch?: boolean;
     activateViaApi?: boolean;
     gitCommit?: string;
+    /** CHORUS_BILLING for the app under test (default: disabled). */
+    billing?: 'enabled' | 'disabled';
+    /** The ledger the paid tools verify against (default: none configured, so verification would fail). */
+    ledger?: LedgerClient;
   } = {},
 ): Promise<Stack> {
   const db = await createMigratedEphemeralDatabase();
@@ -139,7 +144,12 @@ export async function startStack(
       publicBaseUrl: 'http://127.0.0.1:0',
       leaseDurationSeconds: 900,
       gitCommit: options.gitCommit ?? 'abc1234',
+      billing: options.billing ?? 'disabled',
+      sharednetBaseUrl: fake.url,
     },
+    ...(options.ledger === undefined
+      ? {}
+      : { arena: { ledgerFor: () => options.ledger as LedgerClient } }),
     pool,
     logStream,
     sharednet: {

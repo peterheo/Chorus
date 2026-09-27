@@ -111,12 +111,14 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     expect(asAdmin).toEqual(
       expect.arrayContaining([...ADMIN_ONLY, 'chorus.complete', 'chorus.create_board']),
     );
-    expect(asAdmin).toHaveLength(24);
+    expect(asAdmin).toHaveLength(27); // 24 + room_pulse, create_action_board, create_tasks
 
     expect(await toolNames(roomOnly)).toEqual([
+      'chorus.create_action_board',
       'chorus.create_session',
       'chorus.join_session',
       'chorus.list_sessions',
+      'chorus.room_pulse',
       'chorus.whoami',
     ]);
     // A stranger to the room sees nothing at all.
@@ -341,7 +343,7 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     expect(grants[0]?.capabilities).toEqual([
       {
         resource: { namespace: 'chorus', path: ['room'] },
-        actions: ['read_sessions', 'create_session', 'join_session'],
+        actions: ['read_sessions', 'create_session', 'join_session', 'pulse'],
         scope: 'exact',
       },
     ]);

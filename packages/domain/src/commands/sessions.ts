@@ -87,7 +87,24 @@ export type SessionCreated = {
   membership: { actor_id: string; roles: string[] };
 };
 
-export async function createSession(ctx: CommandContext, input: unknown): Promise<SessionCreated> {
+export type CreateSessionParams = {
+  roomId: Uuid;
+  name: string;
+  boardName: string;
+  discoverable: boolean;
+  policy: 'open' | 'listed';
+  listed: string[];
+  agentIds: string[];
+  claim: 'open';
+  managerReview: boolean;
+  reviewRequired: boolean;
+};
+
+/** Validates the input of `create_session` (shape and P1 limits only; no I/O). */
+export function parseCreateSession(
+  scope: { readonly roomId?: Uuid | undefined },
+  input: unknown,
+): CreateSessionParams {
   const raw = requireObject(input, [
     'room_id',
     'name',
@@ -100,7 +117,8 @@ export async function createSession(ctx: CommandContext, input: unknown): Promis
     'manager_review_allowed',
     'default_review_required',
   ]);
-  const roomId = raw['room_id'] === undefined ? ctx.roomId : requireUuid(raw['room_id'], 'room_id');
+  const roomId =
+    raw['room_id'] === undefined ? scope.roomId : requireUuid(raw['room_id'], 'room_id');
   if (roomId === undefined) throw invalid('room_id', 'room_id is required.');
   const name = requireNonBlank(raw['name'], 'name', 200);
   const boardName = requireNonBlank(raw['board_name'], 'board_name', 200);
@@ -128,6 +146,108 @@ export async function createSession(ctx: CommandContext, input: unknown): Promis
     'default_review_required',
     true,
   );
+  return {
+    roomId,
+    name,
+    boardName,
+    discoverable,
+    policy,
+    listed,
+    agentIds,
+    claim,
+    managerReview,
+    reviewRequired,
+  };
+}
+
+/**
+ * The write half of `create_session`, callable inside another command's transaction (the paid
+ * `create_action_board` delivery): creates the session and its first board through the definer and returns the
+ * result and the events to journal. The public command journals exactly these.
+ */
+export async function createSessionInTx(
+  tx: CommandTx,
+  params: CreateSessionParams,
+): Promise<{ result: SessionCreated; events: DomainEventDraft[] }> {
+  const {
+    roomId,
+    name,
+    boardName,
+    discoverable,
+    policy,
+    listed,
+    agentIds,
+    claim,
+    managerReview,
+    reviewRequired,
+  } = params;
+  const { rows } = await tx.db.query<{ session_id: Uuid; board_id: Uuid }>(
+    'SELECT * FROM chorus_create_session($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+    [
+      roomId,
+      name,
+      boardName,
+      discoverable,
+      policy,
+      listed,
+      agentIds,
+      claim,
+      managerReview,
+      reviewRequired,
+    ],
+  );
+  const created = rows[0];
+  if (created === undefined)
+    throw new ChorusError('internal_error', 'Session creation returned no row.');
+  // The definer creates the session at version 1 and its first board as the second versioned change.
+  return {
+    result: {
+      session: {
+        id: created.session_id,
+        room_id: roomId,
+        name,
+        version: 2,
+        join_policy: policy,
+        discoverable,
+      },
+      board: { id: created.board_id, name: boardName, session_id: created.session_id },
+      membership: { actor_id: tx.actorId, roles: ['participant', 'manager', 'administrator'] },
+    },
+    events: [
+      {
+        roomId,
+        aggregateId: created.session_id,
+        aggregateType: 'session',
+        aggregateVersion: 1,
+        eventType: 'session.created',
+        payload: { join_policy: policy, discoverable, created_by: tx.actorId },
+      },
+      {
+        roomId,
+        aggregateId: created.session_id,
+        aggregateType: 'session',
+        aggregateVersion: 2,
+        eventType: 'board.created',
+        payload: { board_id: created.board_id },
+      },
+    ],
+  };
+}
+
+export async function createSession(ctx: CommandContext, input: unknown): Promise<SessionCreated> {
+  const params = parseCreateSession(ctx, input);
+  const {
+    roomId,
+    name,
+    boardName,
+    discoverable,
+    policy,
+    listed,
+    agentIds,
+    claim,
+    managerReview,
+    reviewRequired,
+  } = params;
 
   return runCommand(ctx, {
     type: 'session.create',
@@ -163,59 +283,7 @@ export async function createSession(ctx: CommandContext, input: unknown): Promis
       if (roles.rows[0]?.roles === null || roles.rows[0]?.roles === undefined)
         throw new ChorusError('not_found', 'Not found.');
     },
-    handle: async (tx) => {
-      const { rows } = await tx.db.query<{ session_id: Uuid; board_id: Uuid }>(
-        'SELECT * FROM chorus_create_session($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
-        [
-          roomId,
-          name,
-          boardName,
-          discoverable,
-          policy,
-          listed,
-          agentIds,
-          claim,
-          managerReview,
-          reviewRequired,
-        ],
-      );
-      const created = rows[0];
-      if (created === undefined)
-        throw new ChorusError('internal_error', 'Session creation returned no row.');
-      // The definer creates the session at version 1 and its first board as the second versioned change.
-      return {
-        result: {
-          session: {
-            id: created.session_id,
-            room_id: roomId,
-            name,
-            version: 2,
-            join_policy: policy,
-            discoverable,
-          },
-          board: { id: created.board_id, name: boardName, session_id: created.session_id },
-          membership: { actor_id: tx.actorId, roles: ['participant', 'manager', 'administrator'] },
-        },
-        events: [
-          {
-            roomId,
-            aggregateId: created.session_id,
-            aggregateType: 'session',
-            aggregateVersion: 1,
-            eventType: 'session.created',
-            payload: { join_policy: policy, discoverable, created_by: tx.actorId },
-          },
-          {
-            roomId,
-            aggregateId: created.session_id,
-            aggregateType: 'session',
-            aggregateVersion: 2,
-            eventType: 'board.created',
-            payload: { board_id: created.board_id },
-          },
-        ],
-      };
-    },
+    handle: (tx) => createSessionInTx(tx, params),
   });
 }
 

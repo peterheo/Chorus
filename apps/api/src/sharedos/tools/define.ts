@@ -1,6 +1,7 @@
 import type { AccessContext, JsonObject, ToolCall, ToolHandler, ToolResult } from '@aicoo/sharedos';
 import type pg from 'pg';
 import {
+  ChorusError,
   isChorusError,
   type CommandContext,
   type ReadContext,
@@ -8,12 +9,20 @@ import {
   type RoomAction,
   type Uuid,
 } from '@chorus/domain';
+import type { ArenaDeps } from '../../arena/payments.ts';
+import type { RateLimiter } from '../../rate-limit.ts';
 import { requireRequestScope, type ChorusRequestScope } from '../request-scope.ts';
 
 export interface ToolDeps {
   readonly pool: pg.Pool;
   readonly leaseDurationSeconds: number;
   readonly gitCommit: string;
+  /** Paid Arena tools need the ledger; absent in tests that never call them. */
+  readonly arena?: ArenaDeps;
+  /** Per-actor limits for the tools that name one (`rateLimit`). */
+  readonly limits?: { readonly paid: RateLimiter; readonly pulse: RateLimiter };
+  /** `enabled`: the free create_session / create_task are not registered (only their paid equivalents). */
+  readonly billing?: 'enabled' | 'disabled';
   readonly logger: { error: (obj: Record<string, unknown>, msg: string) => void };
 }
 
@@ -48,6 +57,13 @@ export interface ChorusToolSpec {
   readonly write: boolean;
   readonly props: Readonly<Record<string, Prop>>;
   readonly required: readonly string[];
+  /**
+   * `key` (default): a write tool takes an `idempotency_key`. `request_id`: the tool's own `request_id` is its
+   * idempotency (paid tools), so no `idempotency_key` is injected and the command context carries none.
+   */
+  readonly idempotency?: 'key' | 'request_id';
+  /** Which per-actor limiter this tool counts against. */
+  readonly rateLimit?: 'paid' | 'pulse';
   /** The resource path under the `chorus` namespace, from the parsed arguments only. */
   readonly path: (args: Args) => string[];
   readonly run: (run: ToolRun) => Promise<unknown>;
@@ -81,10 +97,11 @@ const jsonObject = (value: unknown): JsonObject =>
 
 /** Builds one SharedOS ToolHandler from a declarative spec; every tool shares this mapping and error translation. */
 export function defineChorusTool(spec: ChorusToolSpec, deps: ToolDeps): ToolHandler {
-  const props: Record<string, Prop> = spec.write
+  const keyed = spec.write && spec.idempotency !== 'request_id';
+  const props: Record<string, Prop> = keyed
     ? { ...spec.props, idempotency_key: S }
     : { ...spec.props };
-  const required = spec.write ? [...spec.required, 'idempotency_key'] : [...spec.required];
+  const required = keyed ? [...spec.required, 'idempotency_key'] : [...spec.required];
 
   const parseArguments = (raw: unknown): Args => {
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -152,6 +169,14 @@ export function defineChorusTool(spec: ChorusToolSpec, deps: ToolDeps): ToolHand
           context.owner.conversationId !== scope.roomId
         ) {
           return failed(call, 'internal_error', 'The request scope does not match the caller.');
+        }
+        if (spec.rateLimit !== undefined && deps.limits !== undefined) {
+          const decision = deps.limits[spec.rateLimit].hit(scope.actorId);
+          if (!decision.ok) {
+            throw new ChorusError('rate_limited', 'Too many requests; retry later.', {
+              details: { retry_after_seconds: decision.retryAfterSeconds },
+            });
+          }
         }
         const { idempotency_key: key, ...input } = parseArguments(call.arguments);
         const base = { pool: deps.pool, workspaceId: scope.workspaceId, actorId: scope.actorId };

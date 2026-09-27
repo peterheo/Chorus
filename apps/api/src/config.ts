@@ -18,6 +18,8 @@ export interface Config {
   readonly secretsKey: Buffer;
   readonly secretsKeyId: string;
   readonly sharednetBaseUrl: string;
+  /** `enabled`: only the paid create tools exist (the free create_session / create_task are not registered). */
+  readonly billing: 'enabled' | 'disabled';
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -89,6 +91,11 @@ export function loadConfig(env: Env): Config {
     throw new ConfigError('SHAREDNET_BASE_URL must be an absolute URL.');
   }
 
+  const billing = env['CHORUS_BILLING'] ?? 'disabled';
+  if (billing !== 'enabled' && billing !== 'disabled') {
+    throw new ConfigError('CHORUS_BILLING must be "enabled" or "disabled".');
+  }
+
   return {
     env: mode,
     host: env['HOST'] ?? '127.0.0.1',
@@ -100,5 +107,6 @@ export function loadConfig(env: Env): Config {
     secretsKey,
     secretsKeyId: createHash('sha256').update(secretsKey).digest('hex').slice(0, 8),
     sharednetBaseUrl: sharednetBaseUrl.replace(/\/$/, ''),
+    billing,
   };
 }
