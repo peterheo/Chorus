@@ -10,13 +10,8 @@ import { redact } from './lib/redact.mjs';
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const ROOM_TOOLS = [
-  'chorus.create_session',
-  'chorus.join_session',
-  'chorus.list_sessions',
-  'chorus.whoami',
-].sort();
-const PAID_ROOM_TOOLS = [
   'chorus.create_action_board',
+  'chorus.create_session',
   'chorus.join_session',
   'chorus.list_sessions',
   'chorus.room_pulse',
@@ -733,8 +728,11 @@ export async function runE2E() {
       }
       const listed = await ctx.clients.D.listTools();
       const names = (listed.tools ?? []).map((tool) => tool.name).sort();
+      const expectedRoomTools = ROOM_TOOLS.filter(
+        (name) => !(paidMode && name === 'chorus.create_session'),
+      );
       check(
-        json(names) === json(paidMode ? PAID_ROOM_TOOLS : ROOM_TOOLS),
+        json(names) === json(expectedRoomTools),
         'outsider_room_tool_list',
       );
       return { ids: { outsider_tools: names } };
