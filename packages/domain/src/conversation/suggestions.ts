@@ -11,6 +11,12 @@ import { requireSession } from '../commands/support.ts';
 import { ChorusError } from '../errors.ts';
 import type { Uuid } from '../ids.ts';
 import type { ExtractedSuggestion, SourceMessage, SuggestionKind } from './extract.ts';
+import {
+  applyScanToCoordination,
+  syncObjectFromSuggestion,
+  type CoordinationApplied,
+  type CoordinationEngine,
+} from '../coordination/store.ts';
 
 /**
  * CC-1b domain: scans and suggestions (CC-1 rev1.1 section 4). Every mutation goes through `runCommand`; the
@@ -129,6 +135,8 @@ export interface RecordScanArgs {
   /** The fetched window, to snapshot sources by `message_id`. Never persisted verbatim beyond the 32 KiB cap. */
   readonly messages: readonly SourceMessage[];
   readonly extracted: readonly ExtractedSuggestion[];
+  /** CC-2: the coordination engine to run on this scan's in-window messages (spec §9); omitted = CC-1 only. */
+  readonly coordination?: CoordinationEngine;
 }
 
 export type ScanRecorded = {
@@ -141,6 +149,8 @@ export type ScanRecorded = {
     readonly extractor: 'rules-v1';
   };
   readonly suggestions: readonly (Suggestion & { readonly is_new: boolean })[];
+  /** CC-2 (spec §9): what the coordination engine did with this scan, when the tool wired one in. */
+  readonly coordination?: CoordinationApplied;
 };
 
 /**
@@ -246,6 +256,19 @@ export async function recordScan(ctx: CommandContext, args: RecordScanArgs): Pro
         suggestions.push({ ...toSuggestion(row), is_new: row.is_new });
       }
 
+      const coordination =
+        args.coordination === undefined
+          ? undefined
+          : await applyScanToCoordination(
+              tx.db,
+              tx.workspaceId,
+              args.session_id,
+              tx.actorId,
+              { from: args.from_sequence, to: args.to_sequence },
+              args.messages,
+              args.coordination,
+            );
+
       return {
         result: {
           scan: {
@@ -257,6 +280,7 @@ export async function recordScan(ctx: CommandContext, args: RecordScanArgs): Pro
             extractor: 'rules-v1',
           },
           suggestions,
+          ...(coordination === undefined ? {} : { coordination }),
         },
         events: [],
         noop: true,
@@ -435,6 +459,16 @@ export async function linkSuggestion(
       const updatedRow = linked.rows[0];
       if (updatedRow === undefined)
         throw new ChorusError('internal_error', 'The link was not stored.');
+      await syncObjectFromSuggestion(
+        tx.db,
+        tx.workspaceId,
+        args.session_id,
+        args.suggestion_id,
+        tx.actorId,
+        {
+          linkedItemId: args.item_id,
+        },
+      );
 
       const event: DomainEventDraft = {
         roomId: item.homeRoomId,
@@ -492,6 +526,16 @@ export async function dismissSuggestion(
       const updatedRow = dismissed.rows[0];
       if (updatedRow === undefined)
         throw new ChorusError('internal_error', 'The dismissal was not stored.');
+      await syncObjectFromSuggestion(
+        tx.db,
+        tx.workspaceId,
+        args.session_id,
+        args.suggestion_id,
+        tx.actorId,
+        {
+          dismiss: true,
+        },
+      );
       return { result: { suggestion: toSuggestion(updatedRow) }, events: [], noop: true };
     },
   });

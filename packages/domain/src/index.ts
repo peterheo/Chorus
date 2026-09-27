@@ -173,6 +173,19 @@ export {
   type SignalKind,
   type Transition,
 } from './coordination/types.ts';
+export {
+  applyScanToCoordination,
+  loadCoordState,
+  type CoordinationApplied,
+  type CoordinationEngine,
+} from './coordination/store.ts';
+export {
+  coordinationStatus,
+  updateConversationObject,
+  type CoordinationStatus,
+  type UpdateAction,
+  type UpdateConversationObjectResult,
+} from './coordination/commands.ts';
 export type {
   CoordEvent,
   CoordEventType,
