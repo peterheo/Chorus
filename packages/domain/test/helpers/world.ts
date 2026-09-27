@@ -10,44 +10,58 @@ import {
   type TaskSummary,
   type Uuid,
 } from '../../src/index.ts';
-import type { Fixture, Workspace } from './fixture.ts';
+import type { Actor, Fixture, SessionSeed, Workspace } from './fixture.ts';
 
 export const uniqueKey = (prefix = 'k') => `${prefix}-${randomBytes(6).toString('hex')}`;
 
-/** An actor with a grant, and its agent instance (one per token, D2.1). */
-export interface Agent {
-  actorId: Uuid;
-  instanceId: Uuid;
-  ctx: (key?: string) => CommandContext;
-}
-
+/** A session with its cast: manager (+admin), participants, and an actor who is in the room but not the session. */
 export interface World {
   f: Fixture;
   ws: Workspace;
-  roomId: Uuid;
-  manager: Agent;
-  executor: Agent;
-  executor2: Agent;
-  reviewer: Agent;
-  reviewer2: Agent;
-  agent: (role: string | null, roomId?: Uuid) => Promise<Agent>;
+  session: SessionSeed;
+  /** participant + manager + administrator: the session creator. */
+  manager: Actor;
+  executor: Actor;
+  executor2: Actor;
+  reviewer: Actor;
+  reviewer2: Actor;
+  /** Verified room member, not a member of the session. */
+  outsider: Actor;
+  /** A new participant of the session. */
+  participant: (label?: string) => Promise<Actor>;
 }
 
-export async function makeWorld(f: Fixture, ws: Workspace): Promise<World> {
-  const roomId = await f.addRoom(ws, uniqueKey('room'));
-  const agent = async (role: string | null, room: Uuid = roomId): Promise<Agent> => {
-    const actorId = await f.addActor(ws, role === null ? undefined : { roomId: room, role });
-    const instanceId = await f.addInstance(ws, actorId);
-    return { actorId, instanceId, ctx: (key = uniqueKey()) => f.ctx(ws, actorId, key, instanceId) };
+export async function makeWorld(
+  f: Fixture,
+  ws: Workspace,
+  options: { managerReview?: boolean } = {},
+): Promise<World> {
+  const manager = await f.actor(ws, 'manager');
+  const session = await f.session(manager, { managerReview: options.managerReview ?? false });
+  const participant = async (label?: string): Promise<Actor> => {
+    const a = await f.actor(ws, label);
+    await f.join(session, a);
+    return a;
   };
-  const [manager, executor, executor2, reviewer, reviewer2] = await Promise.all([
-    agent('manager'),
-    agent('executor'),
-    agent('executor'),
-    agent('reviewer'),
-    agent('reviewer'),
+  const [executor, executor2, reviewer, reviewer2] = await Promise.all([
+    participant('executor'),
+    participant('executor2'),
+    participant('reviewer'),
+    participant('reviewer2'),
   ]);
-  return { f, ws, roomId, manager, executor, executor2, reviewer, reviewer2, agent };
+  const outsider = await f.actor(ws, 'outsider');
+  return {
+    f,
+    ws,
+    session,
+    manager,
+    executor,
+    executor2,
+    reviewer,
+    reviewer2,
+    outsider,
+    participant,
+  };
 }
 
 export const CRITERIA = ['Compiles', 'Has tests'];
@@ -58,22 +72,26 @@ export const MAPPING = [
 
 export async function newTask(
   w: World,
-  opts: { reviewRequired?: boolean; shareable?: boolean; criteria?: string[] } = {},
+  opts: { reviewRequired?: boolean; shareable?: boolean; criteria?: string[]; by?: Actor } = {},
 ): Promise<TaskSummary> {
-  const { task } = await createTask(w.manager.ctx(), {
-    room_id: w.roomId,
+  const { task } = await createTask((opts.by ?? w.manager).ctx(), {
+    session_id: w.session.id,
+    board_id: w.session.boardId,
     title: `task ${uniqueKey('t')}`,
     body: 'do the thing',
     acceptance_criteria: opts.criteria ?? CRITERIA,
-    review_required: opts.reviewRequired ?? true,
+    ...(opts.reviewRequired === undefined ? {} : { review_required: opts.reviewRequired }),
     shareable: opts.shareable ?? false,
   });
   return task;
 }
 
-/** Claim as `agent` (default executor). Returns the response and the current version. */
-export async function claimAs(w: World, taskId: Uuid, version: number, agent: Agent = w.executor) {
-  return claim(agent.ctx(), { task_id: taskId, expected_version: version });
+export async function claimAs(w: World, taskId: Uuid, version: number, agent: Actor = w.executor) {
+  return claim(agent.ctx(), {
+    session_id: w.session.id,
+    task_id: taskId,
+    expected_version: version,
+  });
 }
 
 export async function submitAs(
@@ -82,9 +100,10 @@ export async function submitAs(
   version: number,
   fence: number,
   content = 'the result',
-  agent: Agent = w.executor,
+  agent: Actor = w.executor,
 ) {
   return submitResult(agent.ctx(), {
+    session_id: w.session.id,
     task_id: taskId,
     expected_version: version,
     fence,
@@ -112,25 +131,28 @@ export async function requestReviewAs(
   taskId: Uuid,
   version: number,
   revision: number,
-  reviewer: Agent = w.reviewer,
-  caller: Agent = w.executor,
+  reviewer: Actor = w.reviewer,
+  caller: Actor = w.executor,
 ) {
   return requestReview(caller.ctx(), {
+    session_id: w.session.id,
     task_id: taskId,
     expected_version: version,
     revision,
-    reviewer_actor_id: reviewer.actorId,
+    reviewer_actor_id: reviewer.id,
   });
 }
 
 export async function verdictAs(
+  w: World,
   review: ReviewSummary,
   digest: string,
   verdict: 'approved' | 'changes_requested',
-  reviewer: Agent,
+  reviewer: Actor,
   notes?: string,
 ) {
   return reviewVerdict(reviewer.ctx(), {
+    session_id: w.session.id,
     review_id: review.id,
     expected_version: review.version,
     verdict,
@@ -138,3 +160,5 @@ export async function verdictAs(
     ...(notes === undefined ? {} : { notes }),
   });
 }
+
+export type { CommandContext };

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { runCommand, type CommandContext, type CommandTx } from '../command.ts';
+import { runCommand, type CommandContext } from '../command.ts';
 import { ChorusError } from '../errors.ts';
 import type { Uuid } from '../ids.ts';
 import { assertTaskTransition } from '../transitions.ts';
@@ -15,19 +15,25 @@ import {
   requireTitle,
   requireUuid,
 } from '../validation.ts';
+import { requireAction } from '../authz.ts';
 import {
+  evaluateCompletionGates,
   iso,
   loadLatestRevision,
   loadTaskDetails,
   lockLease,
+  lockedItem,
   requireInstance,
-  requireRole,
+  requireSession,
 } from './support.ts';
 
 const CONTENT_TYPES = ['text/plain', 'text/markdown', 'application/json'] as const;
 
 export type TaskSummary = {
   id: string;
+  session_id: string;
+  board_id: string;
+  priority: number;
   room_id: string;
   title: string;
   state: string;
@@ -57,60 +63,99 @@ export async function createTask(
   input: unknown,
 ): Promise<{ task: TaskSummary }> {
   const raw = requireObject(input, [
-    'room_id',
+    'session_id',
+    'board_id',
     'title',
     'body',
     'acceptance_criteria',
+    'priority',
     'review_required',
     'shareable',
   ]);
-  const roomId = requireUuid(raw['room_id'], 'room_id');
+  const sessionId = requireUuid(raw['session_id'], 'session_id');
+  const boardId = requireUuid(raw['board_id'], 'board_id');
   const title = requireTitle(raw['title']);
   const body = requireString(raw['body'] ?? '', 'body', { maxBytes: 16384 });
   const criteria = requireArray(raw['acceptance_criteria'], 'acceptance_criteria', 1, 20).map(
     (c, i) => requireNonBlank(c, `acceptance_criteria[${String(i)}]`, 500),
   );
-  const reviewRequired = optionalBoolean(raw['review_required'], 'review_required', true);
+  const priority =
+    raw['priority'] === undefined ? 2 : requireInteger(raw['priority'], 'priority', 0, 4);
+  const requestedReview =
+    raw['review_required'] === undefined
+      ? undefined
+      : optionalBoolean(raw['review_required'], 'review_required', true);
   const shareable = optionalBoolean(raw['shareable'], 'shareable', false);
 
   return runCommand(ctx, {
     type: 'task.create',
+    session: { id: sessionId },
     input: {
-      room_id: roomId,
+      session_id: sessionId,
+      board_id: boardId,
       title,
       body,
       acceptance_criteria: criteria,
-      review_required: reviewRequired,
+      priority,
+      review_required: requestedReview ?? null,
       shareable,
     },
-    authorize: async (tx) => {
-      await requireRole(tx, roomId, ['manager']);
+    authorize: (tx) => {
+      requireAction(tx, 'create_item');
+      return Promise.resolve();
     },
     handle: async (tx) => {
+      const session = requireSession(tx);
+      const reviewRequired = requestedReview ?? session.defaultReviewRequired;
+      const board = await tx.db.query(
+        'SELECT 1 FROM projects WHERE workspace_id = $1 AND id = $2 AND session_id = $3',
+        [tx.workspaceId, boardId, sessionId],
+      );
+      if (board.rowCount === 0) throw new ChorusError('not_found', 'Not found.');
+
       const { rows } = await tx.db.query<{ id: Uuid; created_at: Date; updated_at: Date }>(
         `INSERT INTO work_items
-           (workspace_id, kind, home_room_id, title, body, state, creator_actor_id)
-         VALUES ($1, 'task', $2, $3, $4, 'ready', $5)
+           (workspace_id, session_id, board_id, kind, home_room_id, title, body, state, priority,
+            creator_actor_id)
+         VALUES ($1, $2, $3, 'task', $4, $5, $6, 'ready', $7, $8)
          RETURNING id, created_at, updated_at`,
-        [tx.workspaceId, roomId, title, body, tx.actorId],
+        [tx.workspaceId, sessionId, boardId, session.roomId, title, body, priority, tx.actorId],
       );
       const row = rows[0];
       if (row === undefined)
         throw new ChorusError('internal_error', 'Task insert returned no row.');
       await tx.db.query(
-        `INSERT INTO task_details (workspace_id, item_id, acceptance_criteria, review_required, shareable)
-         VALUES ($1, $2, $3::jsonb, $4, $5)`,
-        [tx.workspaceId, row.id, JSON.stringify(criteria), reviewRequired, shareable],
+        `INSERT INTO task_details
+           (workspace_id, session_id, item_id, acceptance_criteria, criteria_revision, review_required,
+            shareable, claim_policy)
+         VALUES ($1, $2, $3, $4::jsonb, 1, $5, $6, $7)`,
+        [
+          tx.workspaceId,
+          sessionId,
+          row.id,
+          JSON.stringify(criteria),
+          reviewRequired,
+          shareable,
+          session.defaultClaimPolicy,
+        ],
       );
       await tx.db.query(
-        `INSERT INTO task_leases (workspace_id, task_id, fence) VALUES ($1, $2, 0)`,
-        [tx.workspaceId, row.id],
+        `INSERT INTO task_criteria_revisions
+           (workspace_id, session_id, task_id, criteria_revision, acceptance_criteria, created_by)
+         VALUES ($1, $2, $3, 1, $4::jsonb, $5)`,
+        [tx.workspaceId, sessionId, row.id, JSON.stringify(criteria), tx.actorId],
+      );
+      await tx.db.query(
+        `INSERT INTO task_leases (workspace_id, session_id, task_id, fence) VALUES ($1, $2, $3, 0)`,
+        [tx.workspaceId, sessionId, row.id],
       );
       return {
         result: {
           task: {
             id: row.id,
-            room_id: roomId,
+            session_id: sessionId,
+            board_id: boardId,
+            room_id: session.roomId,
             title,
             state: 'ready',
             version: 1,
@@ -118,13 +163,14 @@ export async function createTask(
             review_required: reviewRequired,
             shareable,
             criteria_count: criteria.length,
+            priority,
             created_at: iso(row.created_at) ?? '',
             updated_at: iso(row.updated_at) ?? '',
           },
         },
         events: [
           {
-            roomId,
+            roomId: session.roomId,
             aggregateId: row.id,
             aggregateVersion: 1,
             eventType: 'task.created',
@@ -133,6 +179,7 @@ export async function createTask(
               criteria_count: criteria.length,
               review_required: reviewRequired,
               shareable,
+              board_id: boardId,
             },
           },
         ],
@@ -146,26 +193,33 @@ export async function createTask(
 // --------------------------------------------------------------------------------------------------
 
 export async function claim(ctx: CommandContext, input: unknown): Promise<LeaseResponse> {
-  const raw = requireObject(input, ['task_id', 'expected_version']);
+  const raw = requireObject(input, ['session_id', 'task_id', 'expected_version']);
+  const sessionId = requireUuid(raw['session_id'], 'session_id');
   const taskId = requireUuid(raw['task_id'], 'task_id');
   const expectedVersion = requireInteger(raw['expected_version'], 'expected_version', 1);
 
   return runCommand(ctx, {
     type: 'task.claim',
+    session: { id: sessionId },
     input: { task_id: taskId },
     gated: true,
     targets: [{ id: taskId, expectedVersion, kind: 'task' }],
-    authorize: async (tx) => {
-      const task = lockedTask(tx, taskId);
-      await requireRole(tx, task.homeRoomId, ['executor', 'manager']);
+    authorize: (tx) => {
+      requireAction(tx, 'claim');
       requireInstance(tx);
+      return Promise.resolve();
     },
     handle: async (tx) => {
-      const task = lockedTask(tx, taskId);
+      const task = lockedItem(tx, taskId);
       const instanceId = requireInstance(tx);
 
       // Lifecycle (precedence 7): source state, then a pending review on the latest revision.
       assertTaskTransition('claim', task.state);
+      if (task.blockedAt !== null) {
+        throw new ChorusError('invalid_transition', 'A blocked task cannot be claimed.', {
+          details: { reason: 'blocked', state: task.state },
+        });
+      }
       if (task.state === 'review') {
         const latest = await loadLatestRevision(tx.db, tx.workspaceId, taskId);
         if (latest?.reviewState === 'requested') {
@@ -233,22 +287,24 @@ export async function claim(ctx: CommandContext, input: unknown): Promise<LeaseR
 // --------------------------------------------------------------------------------------------------
 
 export async function renewLease(ctx: CommandContext, input: unknown): Promise<LeaseResponse> {
-  const raw = requireObject(input, ['task_id', 'expected_version', 'fence']);
+  const raw = requireObject(input, ['session_id', 'task_id', 'expected_version', 'fence']);
+  const sessionId = requireUuid(raw['session_id'], 'session_id');
   const taskId = requireUuid(raw['task_id'], 'task_id');
   const expectedVersion = requireInteger(raw['expected_version'], 'expected_version', 1);
   const fence = requireInteger(raw['fence'], 'fence', 1);
 
   return runCommand(ctx, {
     type: 'task.renew_lease',
+    session: { id: sessionId },
     input: { task_id: taskId, fence },
     targets: [{ id: taskId, expectedVersion, kind: 'task' }],
-    authorize: async (tx) => {
-      const task = lockedTask(tx, taskId);
-      await requireRole(tx, task.homeRoomId, ['executor', 'manager']);
+    authorize: (tx) => {
+      requireAction(tx, 'renew_lease');
       requireInstance(tx);
+      return Promise.resolve();
     },
     handle: async (tx) => {
-      const task = lockedTask(tx, taskId);
+      const task = lockedItem(tx, taskId);
       assertTaskTransition('renew_lease', task.state);
       const lease = await lockLease(tx.db, tx.workspaceId, taskId);
       if (!lease.live || lease.instanceId !== tx.instanceId || lease.fence !== fence) {
@@ -305,6 +361,7 @@ type SupportingRef = {
 
 export async function submitResult(ctx: CommandContext, input: unknown): Promise<SubmitResponse> {
   const raw = requireObject(input, [
+    'session_id',
     'task_id',
     'expected_version',
     'fence',
@@ -313,6 +370,7 @@ export async function submitResult(ctx: CommandContext, input: unknown): Promise
     'criteria_mapping',
     'supporting_refs',
   ]);
+  const sessionId = requireUuid(raw['session_id'], 'session_id');
   const taskId = requireUuid(raw['task_id'], 'task_id');
   const expectedVersion = requireInteger(raw['expected_version'], 'expected_version', 1);
   const fence = requireInteger(raw['fence'], 'fence', 1);
@@ -368,6 +426,7 @@ export async function submitResult(ctx: CommandContext, input: unknown): Promise
 
   return runCommand(ctx, {
     type: 'task.submit_result',
+    session: { id: sessionId },
     input: {
       task_id: taskId,
       fence,
@@ -377,13 +436,18 @@ export async function submitResult(ctx: CommandContext, input: unknown): Promise
       supporting_refs: refs,
     },
     targets: [{ id: taskId, expectedVersion, kind: 'task' }],
-    authorize: async (tx) => {
-      const task = lockedTask(tx, taskId);
-      await requireRole(tx, task.homeRoomId, ['executor', 'manager']);
+    authorize: (tx) => {
+      requireAction(tx, 'submit_result');
+      return Promise.resolve();
     },
     handle: async (tx) => {
-      const task = lockedTask(tx, taskId);
+      const task = lockedItem(tx, taskId);
       assertTaskTransition('submit_result', task.state);
+      if (task.blockedAt !== null) {
+        throw new ChorusError('invalid_transition', 'A blocked task cannot accept a result.', {
+          details: { reason: 'blocked', state: task.state },
+        });
+      }
       if (task.ownerActorId !== tx.actorId) {
         throw new ChorusError('owner_conflict', 'Only the task owner can submit a result.');
       }
@@ -416,11 +480,13 @@ export async function submitResult(ctx: CommandContext, input: unknown): Promise
       const revision = next.rows[0]?.revision ?? 1;
       await tx.db.query(
         `INSERT INTO task_result_revisions
-           (workspace_id, task_id, revision, content, content_type, content_sha256, byte_length,
-            submitted_by, fence, supporting_refs, criteria_mapping)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)`,
+           (workspace_id, session_id, task_id, revision, content, content_type, content_sha256,
+            byte_length, submitted_by, fence, supporting_refs, criteria_mapping, criteria_revision,
+            work_cycle)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14)`,
         [
           tx.workspaceId,
+          sessionId,
           taskId,
           revision,
           content,
@@ -431,6 +497,8 @@ export async function submitResult(ctx: CommandContext, input: unknown): Promise
           fence,
           JSON.stringify(refs),
           JSON.stringify(mapping),
+          details.criteriaRevision,
+          task.workCycle,
         ],
       );
       // Submitting releases the lease (the fence is kept) and moves the task to review.
@@ -481,50 +549,28 @@ export async function submitResult(ctx: CommandContext, input: unknown): Promise
 export type CompleteResponse = { task_id: string; version: number; state: string };
 
 export async function completeTask(ctx: CommandContext, input: unknown): Promise<CompleteResponse> {
-  const raw = requireObject(input, ['task_id', 'expected_version']);
+  const raw = requireObject(input, ['session_id', 'task_id', 'expected_version']);
+  const sessionId = requireUuid(raw['session_id'], 'session_id');
   const taskId = requireUuid(raw['task_id'], 'task_id');
   const expectedVersion = requireInteger(raw['expected_version'], 'expected_version', 1);
 
+  // The manager's gated command. (Tasks that need a review complete automatically when the review is
+  // approved; this covers review_required=false tasks and re-running the gates after a blocker clears.)
   return runCommand(ctx, {
     type: 'task.complete',
+    session: { id: sessionId },
     input: { task_id: taskId },
     gated: true,
     targets: [{ id: taskId, expectedVersion, kind: 'task' }],
-    authorize: async (tx) => {
-      const task = lockedTask(tx, taskId);
-      const roles = await requireRole(tx, task.homeRoomId, ['executor', 'manager']);
-      if (task.ownerActorId !== tx.actorId && !roles.includes('manager')) {
-        throw new ChorusError(
-          'action_forbidden',
-          'Only the owner or a manager can complete a task.',
-          {
-            details: { reason: 'not_owner' },
-          },
-        );
-      }
+    authorize: (tx) => {
+      requireAction(tx, 'complete');
+      return Promise.resolve();
     },
     handle: async (tx) => {
-      const task = lockedTask(tx, taskId);
+      const task = lockedItem(tx, taskId);
       assertTaskTransition('complete', task.state);
-      const details = await loadTaskDetails(tx.db, tx.workspaceId, taskId);
-      const latest = await loadLatestRevision(tx.db, tx.workspaceId, taskId);
-      if (latest === null) {
-        throw new ChorusError('internal_error', 'A task in review has no result revision.');
-      }
-      // Completion truth table (spec section 7): only an APPROVED review of the LATEST revision counts.
-      if (details.reviewRequired && latest.reviewState !== 'approved') {
-        throw new ChorusError(
-          'review_required',
-          'The latest result revision needs an approved review before the task can be completed.',
-          {
-            details: {
-              revision: latest.revision,
-              review_state: latest.reviewState,
-              review_id: latest.reviewId,
-            },
-          },
-        );
-      }
+      const verdict = await evaluateCompletionGates(tx, task);
+      if (!verdict.ok) throw verdict.error;
       await tx.db.query(
         `UPDATE work_items SET state = 'done' WHERE workspace_id = $1 AND id = $2`,
         [tx.workspaceId, taskId],
@@ -543,18 +589,13 @@ export async function completeTask(ctx: CommandContext, input: unknown): Promise
             aggregateVersion: version,
             eventType: 'task.completed',
             payload: {
-              revision: latest.revision,
-              review_id: details.reviewRequired ? latest.reviewId : null,
+              revision: verdict.revision,
+              review_id: verdict.reviewId,
+              trigger: 'manager_complete',
             },
           },
         ],
       };
     },
   });
-}
-
-function lockedTask(tx: CommandTx, taskId: Uuid) {
-  const task = tx.items.get(taskId);
-  if (task === undefined) throw new ChorusError('internal_error', 'Target task was not locked.');
-  return task;
 }
