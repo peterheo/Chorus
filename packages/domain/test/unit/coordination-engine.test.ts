@@ -179,17 +179,32 @@ describe('CC-2a engine: commitments', () => {
     expect(statuses(s.run().state)).toEqual({ C1: 'completed', C2: 'open' });
   });
 
-  it("withdrawn by the owner's withdrawal (unnamed: the latest created)", () => {
+  it("withdrawn by the owner's withdrawal: by ref or reply, else the best-matching text", () => {
     const s = new Script();
-    s.say(bob, { type: 'commitment' });
-    s.say(bob, { type: 'commitment' });
-    s.say(alice, { type: 'withdrawal' });
-    s.say(bob, { type: 'withdrawal' });
-    s.say(bob, { type: 'withdrawal', refs: ['C1'] });
-    expect(statuses(s.run().state)).toEqual({ C1: 'withdrawn', C2: 'withdrawn' });
-    expect(transitionsOf(s)).toEqual([
-      'C1:null>open',
-      'C2:null>open',
+    const c1 = s.say(bob, { type: 'commitment', text: 'I will write the docs today' });
+    s.say(bob, { type: 'commitment', text: 'I will fix the login redirect' });
+    s.say(bob, {
+      type: 'claim',
+      text: 'The login page is slow',
+      subject: 'login page',
+      predicate: 'slow',
+    });
+    s.say(bob, { type: 'commitment', text: 'I will fix the login form' });
+    s.say(alice, { type: 'withdrawal', text: 'Scratch the login fix' }); // not hers
+    s.say(bob, { type: 'withdrawal', text: 'Scratch that, ignore my last' }); // shares no word
+    expect(statuses(s.run().state)).toEqual({ C1: 'open', C2: 'open', K1: 'active', C3: 'open' });
+    // "never mind the login fix" matches C2 and C3 equally (2/5 each, K1 1/6): the newest wins.
+    s.say(bob, { type: 'withdrawal', text: 'Never mind the login fix' });
+    s.say(bob, { type: 'withdrawal', text: 'Withdrawing the redirect work' });
+    s.say(bob, { type: 'withdrawal' }, { reply: c1 });
+    expect(statuses(s.run().state)).toEqual({
+      C1: 'withdrawn',
+      C2: 'withdrawn',
+      K1: 'active',
+      C3: 'withdrawn',
+    });
+    expect(transitionsOf(s).slice(4)).toEqual([
+      'C3:open>withdrawn',
       'C2:open>withdrawn',
       'C1:open>withdrawn',
     ]);
@@ -265,6 +280,16 @@ describe('CC-2a engine: handoffs', () => {
       H3: 'pending',
       C3: 'open',
     });
+  });
+
+  it('a handoff needs exactly one target: otherwise nothing, not even the take-over withdrawal', () => {
+    const s = new Script();
+    s.say(alice, { type: 'commitment' });
+    s.say(bob, { type: 'handoff', take_over: 'C1' }); // "I can take over C1": no target
+    s.say(alice, { type: 'handoff', targets: [bob, carol] });
+    s.say(alice, { type: 'handoff', targets: [alice] }); // only herself
+    expect(statuses(s.run().state)).toEqual({ C1: 'open' });
+    expect(s.run().state.next.H).toBe(1);
   });
 
   it('declined by a target decline; completed when its commitment completes', () => {
@@ -576,10 +601,61 @@ describe('CC-2a engine: roster', () => {
     expect(s.rosters).toEqual(batchRosters);
     expect(batchRosters.get('msg_003')?.map((m) => m.name)).toEqual(['alice', 'dana']);
     expect(find(batch, 'H1').targets).toEqual([dana]);
-    // Once danny is on an object, "dan" is ambiguous and resolves to nobody.
+    // Once danny is on an object, "dan" is ambiguous: no target, so no handoff at all.
     s.say(danny, { type: 'commitment' });
     s.say(alice, { type: 'handoff', mentions: ['dan'] });
-    expect(find(s.run().state, 'H2').targets).toEqual([]);
+    expect(s.run().state.objects.map((o) => o.ref)).toEqual(['C1', 'H1', 'C2']);
+  });
+});
+
+describe('CC-2a engine: ctx.roster (the room members from the caller)', () => {
+  it('lets a member who only chatted be addressed; object and sender names win; excluded seats never appear', () => {
+    const s = new Script();
+    s.say(alice, { type: 'handoff', mentions: ['dav'] });
+    s.say(carol, { type: 'question', targets: [{ member_id: dave.member_id, name: 'dave' }] });
+    const roster = [
+      { member_id: dave.member_id, name: 'david' },
+      { member_id: carol.member_id, name: 'caroline' },
+      chorus,
+    ];
+    const { state } = s.engine(EMPTY_STATE, s.messages, {
+      excludeMemberIds: [chorus.member_id],
+      roster,
+    });
+    expect(s.rosters.get('msg_001')).toEqual([
+      alice,
+      { member_id: carol.member_id, name: 'caroline' },
+      { member_id: dave.member_id, name: 'david' },
+    ]);
+    // "dav" is a unique 3+ prefix of dave's roster name ("david"): resolved.
+    expect(find(state, 'H1').targets).toEqual([{ member_id: dave.member_id, name: 'david' }]);
+    // At msg 2 dave is on H1 (as "david") and the question names him "dave": the object name wins.
+    expect(s.rosters.get('msg_002')).toEqual([
+      alice,
+      carol,
+      { member_id: dave.member_id, name: 'david' },
+    ]);
+  });
+
+  it('keeps one message at a time == one call when every call gets the same roster', () => {
+    const s = new Script();
+    s.say(danny, []);
+    s.say(dana, { type: 'commitment' });
+    s.say(alice, { type: 'handoff', mentions: ['dan'] }); // danny and dana both known: ambiguous
+    s.say(alice, { type: 'handoff', mentions: ['danny'] });
+    const ctx = { excludeMemberIds: [], roster: [danny, dana] };
+    const batch = s.engine(EMPTY_STATE, s.messages, ctx);
+    let state = EMPTY_STATE;
+    const transitions = [];
+    for (const message of s.messages) {
+      const step = s.engine(state, [message], ctx);
+      state = step.state;
+      transitions.push(...step.transitions);
+    }
+    expect(state).toEqual(batch.state);
+    expect(transitions).toEqual(batch.transitions);
+    expect(statuses(batch.state)).toEqual({ C1: 'open', H1: 'pending' });
+    expect(find(batch.state, 'H1').targets).toEqual([danny]);
   });
 });
 

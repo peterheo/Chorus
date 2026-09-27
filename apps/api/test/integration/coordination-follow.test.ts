@@ -3,6 +3,7 @@ import type {
   ApplyMessages,
   CoordObject,
   Evaluate,
+  Member,
   ObjectKind,
   RefPrefix,
   Signal,
@@ -41,9 +42,10 @@ const ALL_KINDS = Object.keys(OBJECT_KIND) as SignalKind[];
 const ORDER = [...POSTABLE_KINDS, ...ALL_KINDS.filter((k) => !POSTABLE_KINDS.includes(k))];
 
 function fakeEngine() {
-  const calls = { apply: 0, applied: 0 };
+  const calls = { apply: 0, applied: 0, roster: undefined as readonly Member[] | undefined };
   const apply: ApplyMessages = (state, messages, ctx) => {
     calls.apply += 1;
+    calls.roster = ctx.roster;
     if (state.objects.some((o) => o.text === 'POISON')) throw new Error('poisoned engine state');
     const objects = state.objects.map((o) => ({ ...o }));
     const next: Record<RefPrefix, number> = { ...state.next };
@@ -236,6 +238,14 @@ describe('coordination follow + assist posting (real PostgreSQL, fake SharedNet,
     ]);
     expect(Number(await engineCursor(a.id))).toBe(3);
     expect(engine.calls.applied).toBe(2);
+    // The engine gets the room's roster: every sender seen, never the Chorus seat.
+    expect(engine.calls.roster).toEqual(
+      expect.arrayContaining([
+        { member_id: 'i_alicex', name: 'alice' },
+        { member_id: 'i_bobxxx', name: 'bob' },
+      ]),
+    );
+    expect(engine.calls.roster?.some((m) => m.member_id === SEAT_MEMBER)).toBe(false);
     const transitions = async () =>
       Number(
         (

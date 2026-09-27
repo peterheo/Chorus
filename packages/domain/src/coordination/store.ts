@@ -9,6 +9,7 @@ import {
   type ApplyResult,
   type CoordObject,
   type CoordState,
+  type Member,
   type RefPrefix,
   type Transition,
 } from './types.ts';
@@ -23,6 +24,8 @@ import {
 export interface CoordinationEngine {
   readonly apply: ApplyMessages;
   readonly excludeMemberIds: readonly string[];
+  /** The room's known members (`ApplyContext.roster`). */
+  readonly roster?: readonly Member[];
 }
 
 /** What a scan reports about the engine run (spec §9: counts only). */
@@ -207,7 +210,10 @@ export async function applyScanToCoordination(
   const fresh = inWindow
     .filter((m) => m.sequence > before.cursor)
     .sort((a, b) => a.sequence - b.sequence);
-  const result = engine.apply(before, fresh, { excludeMemberIds: engine.excludeMemberIds });
+  const result = engine.apply(before, fresh, {
+    excludeMemberIds: engine.excludeMemberIds,
+    ...(engine.roster === undefined ? {} : { roster: engine.roster }),
+  });
   const { newObjects } = await persistCoordResult(
     db,
     workspaceId,
