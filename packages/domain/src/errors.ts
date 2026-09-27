@@ -16,6 +16,9 @@ export const ERROR_STATUS = {
   evidence_required: 422,
   review_required: 422,
   precondition_required: 428,
+  room_not_available: 404,
+  enrollment_invalid: 404,
+  rate_limited: 429,
   internal_error: 500,
   temporarily_unavailable: 503,
 } as const;
