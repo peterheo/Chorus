@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type pg from 'pg';
 import type { SharedOSKernel, ToolResult } from '@aicoo/sharedos';
-import { removeMember, revokeRole, type Uuid } from '@chorus/domain';
+import { removeMember, revokeRole, setCoordinationMode, type Uuid } from '@chorus/domain';
 import {
   createFixture,
   type Actor,
@@ -15,7 +15,7 @@ import { createChorusGrantSource } from '../../src/sharedos/grant-source.ts';
 import { createChorusKernel } from '../../src/sharedos/kernel.ts';
 import { runInRequestScope, type ChorusRequestScope } from '../../src/sharedos/request-scope.ts';
 
-const noopLogger = { error: () => undefined };
+const noopLogger = { error: vi.fn() };
 
 describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
   let f: Fixture;
@@ -135,6 +135,27 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     const participant = await f.actor(ws, 'coordination-mode-participant');
     await f.join(session, participant);
     const sealedMemberId = 'i_SealedSeatMember01';
+    const ciphertext = Buffer.from('sealed-token-sentinel');
+    const nonce = Buffer.from('nonce-secret');
+    const assertNoSeatData = (value: unknown) => {
+      const json = JSON.stringify(value);
+      for (const forbidden of [
+        'token_ciphertext',
+        'token_nonce',
+        'key_id',
+        'deadbeef',
+        sealedMemberId,
+        ...[ciphertext, nonce].flatMap((buffer) => [
+          buffer.toString(),
+          buffer.toString('hex'),
+          buffer.toString('base64'),
+          JSON.stringify(buffer),
+          JSON.stringify([...buffer]),
+        ]),
+      ]) {
+        expect(json).not.toContain(forbidden);
+      }
+    };
     await f.owner(
       "UPDATE rooms SET provider = 'sharednet', external_room_id = 'rom_ModeTest01' WHERE id = $1",
       [session.roomId],
@@ -143,13 +164,7 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
       `INSERT INTO sharednet_seats
          (workspace_id, room_id, member_id, principal_id, token_ciphertext, token_nonce, key_id)
        VALUES ($1, $2, $3, 'p_SealedPrincipal01', $4, $5, 'deadbeef')`,
-      [
-        ws.id,
-        session.roomId,
-        sealedMemberId,
-        Buffer.from('sealed-token-sentinel'),
-        Buffer.alloc(12, 7),
-      ],
+      [ws.id, session.roomId, sealedMemberId, ciphertext, nonce],
     );
     await f.owner(
       'INSERT INTO sharednet_cursors (workspace_id, room_id, last_sequence) VALUES ($1, $2, 42)',
@@ -164,19 +179,29 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
       }),
     ).toMatchObject({ status: 'denied' });
 
-    const observe = okOutput(
-      await call(admin, 'chorus.set_coordination_mode', {
-        session_id: session.id,
-        mode: 'observe',
-        expected_version: 2,
-      }),
-    );
-    const serialized = JSON.stringify(observe);
-    expect(serialized).not.toContain('sealed-token-sentinel');
-    expect(serialized).not.toContain('token_ciphertext');
-    expect(serialized).not.toContain('token_nonce');
-    expect(serialized).not.toContain('deadbeef');
-    expect(serialized).not.toContain(sealedMemberId);
+    const replayKey = randomUUID();
+    const replayTrace = randomUUID();
+    const observeArgs = {
+      session_id: session.id,
+      mode: 'observe',
+      expected_version: 2,
+      idempotency_key: replayKey,
+    };
+    const observeResult = await call(admin, 'chorus.set_coordination_mode', observeArgs, {
+      traceId: replayTrace,
+    });
+    const observe = okOutput(observeResult);
+    assertNoSeatData(observeResult);
+    const stale = await call(admin, 'chorus.set_coordination_mode', {
+      session_id: session.id,
+      mode: 'assist',
+      expected_version: 2,
+    });
+    expect(stale).toMatchObject({ status: 'failed', error: { code: 'version_conflict' } });
+    assertNoSeatData(stale);
+    await audit.flush();
+    assertNoSeatData(noopLogger.error.mock.calls);
+
     const cursor = async () =>
       Number(
         (
@@ -191,10 +216,33 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     await f.owner('UPDATE sharednet_cursors SET last_sequence = 57 WHERE room_id = $1', [
       session.roomId,
     ]);
-    okOutput(
-      await call(admin, 'chorus.set_coordination_mode', {
+    const replay = okOutput(
+      await call(admin, 'chorus.set_coordination_mode', observeArgs, { traceId: replayTrace }),
+    );
+    expect(replay).toEqual(observe);
+    expect(await cursor()).toBe(42);
+    const [replayedSession] = await f.owner<{ version: number }>(
+      'SELECT version FROM sessions WHERE id = $1',
+      [session.id],
+    );
+    expect(replayedSession?.version).toBe(3);
+    const [record] = await f.owner<{ command_type: string }>(
+      'SELECT command_type FROM commands WHERE idempotency_key = $1',
+      [replayKey],
+    );
+    expect(record?.command_type).toBe('session.set_coordination_mode');
+    expect(
+      await call(admin, 'chorus.set_session_policy', {
         session_id: session.id,
-        mode: 'assist',
+        coordination_mode: 'observe',
+        expected_version: 2,
+        idempotency_key: replayKey,
+      }),
+    ).toMatchObject({ status: 'failed', error: { code: 'idempotency_conflict' } });
+    okOutput(
+      await call(admin, 'chorus.set_session_policy', {
+        session_id: session.id,
+        coordination_mode: 'assist',
         expected_version: 3,
       }),
     );
@@ -231,6 +279,58 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
       [session.id],
     );
     expect(row?.coordination_mode).toBe('off');
+    expect(
+      await call(admin, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'invalid',
+        expected_version: 6,
+      }),
+    ).toMatchObject({ status: 'failed', error: { code: 'invalid_request' } });
+    await audit.flush();
+    assertNoSeatData(noopLogger.error.mock.calls);
+  });
+
+  it('CC-2d-1 off creates no state, missing checkpoints start at zero, and invalid IDs never reach SQL', async () => {
+    const isolated = await f.workspace('mode-no-checkpoint');
+    const admin = await f.actor(isolated, 'mode-no-checkpoint-admin');
+    const session = await f.session(admin);
+    okOutput(
+      await call(admin, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'off',
+        expected_version: 2,
+      }),
+    );
+    expect(
+      await f.count('SELECT count(*) AS n FROM conversation_engine_state WHERE session_id = $1', [
+        session.id,
+      ]),
+    ).toBe(0);
+    okOutput(
+      await call(admin, 'chorus.set_session_policy', {
+        session_id: session.id,
+        coordination_mode: 'observe',
+        expected_version: 3,
+      }),
+    );
+    const [state] = await f.owner<{ cursor: string }>(
+      'SELECT cursor FROM conversation_engine_state WHERE session_id = $1',
+      [session.id],
+    );
+    expect(Number(state?.cursor)).toBe(0);
+    const connect = vi.spyOn(f.pool, 'connect');
+    try {
+      await expect(
+        setCoordinationMode(admin.ctx(), {
+          session_id: 'not-a-uuid',
+          mode: 'observe',
+          expected_version: 4,
+        }),
+      ).rejects.toMatchObject({ code: 'invalid_request' });
+      expect(connect).not.toHaveBeenCalled();
+    } finally {
+      connect.mockRestore();
+    }
   });
 
   it('K2 sharedos.enforcement.cross_session: another session is denied by SharedOS before any domain call', async () => {

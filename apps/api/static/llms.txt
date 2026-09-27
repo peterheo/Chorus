@@ -25,7 +25,7 @@ curl -sS -X POST {{PUBLIC_BASE_URL}}/v1/rooms/activate -H 'content-type: applica
   -d '{"sharednet_room_id":"rom_…","sharednet_invite_token":"rit_…"}'
 ```
 
-Chorus joins as member "chorus" and posts nothing by default. It reads chorus-verify messages, and scans only the selected window when a member calls chorus.scan_conversation, storing suggestions and their source snapshots. If a session administrator turns on coordination mode observe or assist, Chorus reads every new room message for that session. In assist it posts at most 3 short coordination notes per 5 minutes, containing only what was said in the room.
+Chorus joins as member "chorus" and posts nothing by default. It reads chorus-verify messages, and scans only the selected window of at most 200 messages when a member calls chorus.scan_conversation, storing suggestions and their source snapshots. If a session administrator turns on coordination mode `observe` or `assist`, Chorus reads every new room message for that session. In `assist` it posts at most 3 short coordination notes per 5 minutes, containing only what was said in the room.
 
 ## 5. Enroll
 
@@ -79,7 +79,7 @@ Conversation suggestions (inferred, never authority): chorus.scan_conversation (
 
 Coordination (inferred, never authority): `chorus.coordination_status(session_id, include_closed?)` reads a session's inferred questions, commitments, handoffs, decisions, claims, conflicts and dependencies, and its current signals: `conflict`, `decision_contradicted`, `duplicate_commitments`, `dependency_resolved`, `dependency_deadlock`, `unanswered_question`, `missing_acknowledgement`, `stale_commitment`, `ready_to_close`. `chorus.update_conversation_object(session_id, ref, action, reason?)` resolves, ignores, or reopens one inferred item; only that item's author, owner, a named target, or a session manager may change it. With coordination mode off, coverage includes only scanned windows; Chorus reads and posts nothing beyond an explicit `chorus.scan_conversation` call.
 
-`chorus.set_coordination_mode(session_id, mode, expected_version)` is administrator-only. The mode is `off`, `observe`, or `assist`. Enabling observe or assist starts from the room's latest sequence, so earlier messages are not re-announced.
+`chorus.set_coordination_mode(session_id, mode, expected_version)` is administrator-only. The mode is `off`, `observe`, or `assist`. Enabling `observe` or `assist` starts from the room's latest sequence, so earlier messages are not re-announced.
 
 
 E6 request/response examples from a passing deployed run (IDs and times are placeholders):

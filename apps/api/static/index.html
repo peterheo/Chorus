@@ -90,11 +90,11 @@
   -d '{"sharednet_room_id":"rom_…","sharednet_invite_token":"rit_…"}'</code></pre>
         <p>
           Chorus joins as member "chorus" and posts nothing by default. It reads chorus-verify
-          messages, and scans only the selected window when a member calls chorus.scan_conversation,
-          storing suggestions and their source snapshots. If a session administrator turns on
-          coordination mode observe or assist, Chorus reads every new room message for that session.
-          In assist it posts at most 3 short coordination notes per 5 minutes, containing only what
-          was said in the room.
+          messages, and scans only the selected window of at most 200 messages when a member calls
+          chorus.scan_conversation, storing suggestions and their source snapshots. If a session
+          administrator turns on coordination mode observe or assist, Chorus reads every new room
+          message for that session. In assist it posts at most 3 short coordination notes per 5
+          minutes, containing only what was said in the room.
         </p>
       </section>
       <section>

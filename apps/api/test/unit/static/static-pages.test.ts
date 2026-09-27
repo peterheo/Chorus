@@ -94,13 +94,15 @@ describe('static entry pages', () => {
   it('documents on-demand conversation scans and suggestion review', async () => {
     const pages = await fetchPages(true);
     for (const page of [pages.html, pages.llms]) {
-      expect(page).not.toContain('reads only chorus-verify messages');
-      expect(page).toContain('chorus.scan_conversation');
-      expect(page).toContain('source snapshots');
-      expect(page).toContain('chorus.list_suggestions');
-      expect(page).toContain('chorus.set_coordination_mode');
-      expect(page).toContain('reads every new room message');
-      expect(page).toContain('3 short coordination notes per 5 minutes');
+      const text = page.replace(/<[^>]*>/gu, ' ').replace(/\s+/gu, ' ');
+      expect(text).not.toContain('reads only chorus-verify messages');
+      expect(text).toContain('chorus.scan_conversation');
+      expect(text).toContain('selected window of at most 200 messages');
+      expect(text).toContain('source snapshots');
+      expect(text).toContain('chorus.list_suggestions');
+      expect(text).toContain('chorus.set_coordination_mode');
+      expect(text).toContain('reads every new room message');
+      expect(text).toContain('3 short coordination notes per 5 minutes');
     }
   });
 
