@@ -64,7 +64,12 @@ let counter = 0;
 
 /** A complete in-process Chorus: real PostgreSQL, the HTTP/MCP app on an ephemeral port, a fake SharedNet, and the watcher. */
 export async function startStack(
-  options: { limits?: Partial<AppLimits>; watch?: boolean; activateViaApi?: boolean } = {},
+  options: {
+    limits?: Partial<AppLimits>;
+    watch?: boolean;
+    activateViaApi?: boolean;
+    gitCommit?: string;
+  } = {},
 ): Promise<Stack> {
   const db = await createMigratedEphemeralDatabase();
   const pool = new pg.Pool({ connectionString: db.appUrl, max: 10 });
@@ -133,7 +138,7 @@ export async function startStack(
     config: {
       publicBaseUrl: 'http://127.0.0.1:0',
       leaseDurationSeconds: 900,
-      gitCommit: 'abc1234',
+      gitCommit: options.gitCommit ?? 'abc1234',
     },
     pool,
     logStream,

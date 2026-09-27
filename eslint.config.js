@@ -27,8 +27,20 @@ export default tseslint.config(
     },
   },
   {
-    files: ['**/*.js'],
+    files: ['**/*.js', '**/*.mjs', '**/*.d.mts'],
     extends: [tseslint.configs.disableTypeChecked],
+  },
+  {
+    files: ['**/*.mjs'],
+    languageOptions: {
+      globals: {
+        Buffer: 'readonly',
+        fetch: 'readonly',
+        process: 'readonly',
+        setTimeout: 'readonly',
+        URL: 'readonly',
+      },
+    },
   },
   {
     files: ['vitest.config.ts', 'eslint.config.js'],

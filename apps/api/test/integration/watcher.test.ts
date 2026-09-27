@@ -58,6 +58,9 @@ describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
       async () => (await enrollmentState(started.enrollmentId)) === 'verified',
     );
     expect(s.fake.polls(SHAREDNET_ROOM)[pollsBefore]).toBe(persisted);
+    // The proof is verified (committed in handleMessage) BEFORE the cursor advance runs as its own statement,
+    // so wait for the cursor rather than reading it once right after `verified`.
+    await s.waitForCursor(head());
     expect(await cursor()).toBe(head());
 
     // The database refuses a regression outright.

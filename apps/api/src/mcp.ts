@@ -5,6 +5,7 @@ import { McpToolServer, kernelToolBridge } from '@aicoo/sharedos-mcp';
 import { extractBearer, resolveToken, type AuthContext } from './auth.ts';
 import { sendError } from './http.ts';
 import { MCP_INSTRUCTIONS } from './instructions.ts';
+import { keepFailureDetails } from './mcp-errors.ts';
 import type { RateLimiter } from './rate-limit.ts';
 import { buildAccessContext } from './sharedos/access-context.ts';
 import { runInRequestScope, type ChorusRequestScope } from './sharedos/request-scope.ts';
@@ -92,18 +93,22 @@ export function registerMcpRoutes(app: FastifyInstance, deps: McpDeps): void {
       };
       reply.raw.once('close', onClose);
       try {
-        const response = await runInRequestScope(scope, () => {
+        const details = keepFailureDetails(
+          kernelToolBridge({
+            kernel: deps.kernel,
+            context: buildAccessContext(scope, request.id, new Date()),
+            executionId: request.id,
+          }),
+        );
+        const handled = await runInRequestScope(scope, () => {
           const server = new McpToolServer({
-            invoker: kernelToolBridge({
-              kernel: deps.kernel,
-              context: buildAccessContext(scope, request.id, new Date()),
-              executionId: request.id,
-            }),
+            invoker: details.invoker,
             serverInfo: { name: 'chorus', version: deps.version },
             instructions: MCP_INSTRUCTIONS,
           });
           return server.handle(body, abort.signal);
         });
+        const response = details.enrich(handled);
         if (response === undefined) return await reply.code(202).send();
         return await reply.code(200).type('application/json; charset=utf-8').send(response);
       } finally {
