@@ -60,7 +60,7 @@ function parsePage(value: unknown): readonly [PageItem[], boolean, string | numb
       !member.startsWith('i_') ||
       typeof principal !== 'string' ||
       !principal.startsWith('p_') ||
-      typeof name !== 'string' ||
+      !(name === null || typeof name === 'string') ||
       typeof content !== 'string' ||
       !(reply === null || typeof reply === 'string') ||
       typeof raw['type'] !== 'string'
@@ -72,7 +72,7 @@ function parsePage(value: unknown): readonly [PageItem[], boolean, string | numb
       sequence,
       sender_member_id: member,
       sender_principal_id: principal,
-      sender_name: name,
+      sender_name: name === null ? member : name,
       content,
       reply_to_message_id: reply,
       type: raw['type'],

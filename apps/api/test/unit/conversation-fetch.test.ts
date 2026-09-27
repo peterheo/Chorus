@@ -48,6 +48,15 @@ const failureOf = (promise: Promise<unknown>): Promise<unknown> =>
   );
 
 describe('fetchConversationWindow', () => {
+  it('accepts unnamed SharedNet seats and uses their member ID as the source name', async () => {
+    const unnamed = { ...message(10), sender: { member_id: 'i_ABCDEF12', name: null } };
+    const result = await fetchConversationWindow(
+      args(answering(() => response({ items: [unnamed], has_more: false, next_cursor: null }))),
+    );
+
+    expect(result.messages).toMatchObject([{ sender_name: 'i_ABCDEF12', sequence: 10 }]);
+  });
+
   it('CC6: requests ascending pages and returns only in-window messages', async () => {
     const calls: { url: string; init: RequestInit | undefined }[] = [];
     const fetchImpl = vi.fn<typeof fetch>((input, init) => {
