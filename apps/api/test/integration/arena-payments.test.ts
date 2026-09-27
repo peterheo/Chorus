@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -13,14 +13,19 @@ import {
   type Uuid,
 } from '@chorus/domain';
 import type { CreditTransfer, LedgerClient } from '@chorus/sharednet-ledger';
-import { createFakeLedgerClient, sampleTransfer } from '@chorus/sharednet-ledger/testing';
+import {
+  createFakeLedgerClient,
+  sampleTransfer,
+  startFakeLedgerServer,
+} from '@chorus/sharednet-ledger/testing';
 import {
   createFixture,
   type Actor,
   type Fixture,
   type SessionSeed,
 } from '../../../../packages/domain/test/helpers/fixture.ts';
-import { purchase, type ArenaDeps } from '../../src/arena/payments.ts';
+import { createLedgerFor, purchase, type ArenaDeps } from '../../src/arena/payments.ts';
+import { sealSecret } from '../../src/secrets.ts';
 
 const BASE = 'https://www.sharednet.ai';
 
@@ -486,40 +491,132 @@ describe('arena purchases: quote, verify outside the transaction, deliver atomic
     ).toBe(1);
   });
 
-  it('P8 arena.pay.crash_window: a failure after the effect and before commit rolls everything back; a retry delivers once', async () => {
+  it('P7b arena.pay.concurrent_txns: two different valid txns for ONE purchase deliver once; the loser replays the stored response and its txn stays unclaimed', async () => {
+    const w = await world('p7b');
+    const quote = await quoteOf({ w, requestId: 'r-p7b', count: 1 });
+    const t1 = transferFor(w, quote);
+    const t2 = transferFor(w, quote);
+    const ledger = ledgerReturning(t1, t2);
+    const counter = { runs: 0 };
+    const [a, b] = await Promise.all([
+      buy({ w, requestId: 'r-p7b', txn: t1.id, ledger, counter }),
+      buy({ w, requestId: 'r-p7b', txn: t2.id, ledger, counter }),
+    ]);
+    expect(counter.runs).toBe(1);
+    expect(a).toEqual(b); // never an idempotency_conflict: the buyer gets the one stored DELIVERED response
+    expect(await tasksIn(w.session)).toBe(1);
+    const claimed = await f.owner<{ txn_id: string }>(
+      `SELECT txn_id FROM purchases WHERE txn_id IN ($1, $2)`,
+      [t1.id, t2.id],
+    );
+    expect(claimed).toHaveLength(1); // only one txn is ever claimed; the other stays free
+    expect([t1.id, t2.id]).toContain(claimed[0]?.txn_id);
+  });
+
+  it('P7c arena.pay.two_buyers_one_txn: one txn presented for two different purchases at once delivers one and refuses the other', async () => {
+    const w = await world('p7c');
+    const other = await buyerIn(w.ws, 'second');
+    await f.join(w.session, other);
+    const otherSeat = await seatOf(other);
+    const qa = await quoteOf({ w, requestId: 'r-p7c-a', count: 1 });
+    const qb = await quoteOf({ w, requestId: 'r-p7c-b', count: 1, actor: other });
+    const shared = `txn_${tag()}`;
+    // A ledger that (wrongly) shows the SAME txn as paying each buyer's purchase: only the UNIQUE claim stops it.
+    const forA = transferFor(w, qa, { id: shared });
+    const forB = transferFor(w, qb, { id: shared }, otherSeat);
+    const deps = (): ArenaDeps => ({
+      pool: f.pool,
+      sharednetBaseUrl: BASE,
+      ledgerFor: (room) =>
+        room.actorId === other.id ? ledgerReturning(forB) : ledgerReturning(forA),
+    });
+    const attempt = (actor: Actor, requestId: string) =>
+      purchase(
+        deps(),
+        ctxOf(w, actor),
+        'create_tasks',
+        {
+          requestId,
+          paymentTxnId: shared,
+          target: { sessionId: w.session.id, boardId: w.session.boardId },
+          input: { tasks: [{ title: 'task 0' }] },
+          amount: 1,
+        },
+        tasksEffect(1, w.session.boardId),
+      ).then(
+        (value) => ({ ok: value }) as const,
+        (error: unknown) => ({ error: error as ChorusError }) as const,
+      );
+    const results = await Promise.all([attempt(w.buyer, 'r-p7c-a'), attempt(other, 'r-p7c-b')]);
+    expect(results.filter((r) => 'ok' in r)).toHaveLength(1);
+    const refused = results.find((r) => 'error' in r);
+    expect(refused && 'error' in refused ? refused.error.code : undefined).toBe(
+      'payment_already_used',
+    );
+    expect(await tasksIn(w.session)).toBe(1);
+    expect(await f.count(`SELECT count(*) AS n FROM purchases WHERE txn_id = $1`, [shared])).toBe(
+      1,
+    );
+  });
+
+  it('P8 arena.pay.crash_window: a failure AFTER the claiming UPDATE rolls back the claim, the effect and the events; a retry delivers once', async () => {
     const w = await world('p8');
     const quote = await quoteOf({ w, requestId: 'r-p8', count: 2 });
     const transfer = transferFor(w, quote);
+    const eventsBefore = await f.count(
+      `SELECT count(*) AS n FROM domain_events WHERE session_id = $1`,
+      [w.session.id],
+    );
+    // The effect succeeds, and returns an event journaled in the WRONG room: runCommand refuses it while
+    // journaling, which happens after the effect AND after the single UPDATE that claims the txn.
     const crashing: PurchaseEffect = async (tx) => {
-      await tasksEffect(2, w.session.boardId)(tx);
-      throw new Error('crash before commit');
+      const done = await tasksEffect(2, w.session.boardId)(tx);
+      const first = done.events[0];
+      if (first === undefined) throw new Error('the effect journals events');
+      return {
+        result: done.result,
+        events: [...done.events, { ...first, roomId: randomUUID() as Uuid, aggregateVersion: 2 }],
+      };
     };
-    await expect(
-      buy({
-        w,
-        requestId: 'r-p8',
-        count: 2,
-        txn: transfer.id,
-        ledger: ledgerReturning(transfer),
-        effect: crashing,
-      }),
-    ).rejects.toThrow('crash before commit');
+    const error = await buy({
+      w,
+      requestId: 'r-p8',
+      count: 2,
+      txn: transfer.id,
+      ledger: ledgerReturning(transfer),
+      effect: crashing,
+    }).then(
+      () => undefined,
+      (e: unknown) => e as ChorusError,
+    );
+    expect(error?.code).toBe('internal_error');
+    expect(error?.message).toContain("aggregate's own room");
+    // Everything the transaction did is gone: the claim (the UPDATE that already ran), the tasks, the events.
     expect(await purchaseRow(quote['purchase_id'] as string)).toEqual({
       state: 'quoted',
       txn_id: null,
     });
-    expect(await tasksIn(w.session)).toBe(0);
     expect(
       await f.count(`SELECT count(*) AS n FROM purchases WHERE txn_id = $1`, [transfer.id]),
     ).toBe(0);
+    expect(await tasksIn(w.session)).toBe(0);
+    expect(
+      await f.count(`SELECT count(*) AS n FROM domain_events WHERE session_id = $1`, [
+        w.session.id,
+      ]),
+    ).toBe(eventsBefore);
+    // A retry with the same txn delivers exactly once.
+    const counter = { runs: 0 };
     const done = await buy({
       w,
       requestId: 'r-p8',
       count: 2,
       txn: transfer.id,
       ledger: ledgerReturning(transfer),
+      counter,
     });
     expect(done.state).toBe('DELIVERED');
+    expect(counter.runs).toBe(1);
     expect(await tasksIn(w.session)).toBe(2);
   });
 
@@ -676,6 +773,16 @@ describe('arena purchases: quote, verify outside the transaction, deliver atomic
     await expect(
       f.owner(`UPDATE purchases SET amount = 2, memo = 'x' WHERE id = $1`, [q2['purchase_id']]),
     ).rejects.toMatchObject({ code: 'CH010' });
+    // A verification failure must belong to a purchase of ITS OWN workspace (composite foreign key).
+    const foreign = await world('guards-foreign');
+    const foreignQuote = await quoteOf({ w: foreign, requestId: 'r-foreign', count: 1 });
+    await expect(
+      f.owner(
+        `INSERT INTO payment_verification_failures (workspace_id, actor_id, purchase_id, txn_id, reason, observed)
+         VALUES ($1, $2, $3, 'txn_CrossWs01', 'memo', '{}'::jsonb)`,
+        [w.ws.id, w.buyer.id, foreignQuote['purchase_id']],
+      ),
+    ).rejects.toMatchObject({ code: '23503' });
     // The runtime role may update only the delivery columns.
     const client = await f.pool.connect();
     try {
@@ -729,5 +836,58 @@ describe('arena purchases: quote, verify outside the transaction, deliver atomic
     );
     expect((await purchaseRow(q2.id))?.state).toBe('quoted');
     expect(await tasksIn(w.session)).toBe(1);
+  });
+
+  it('arena.ledger_for: the sealed payee token is opened in memory and sent as the bearer; a non-member gets room_not_available', async () => {
+    const key = randomBytes(32);
+    const token = `sni_payee${tag()}${tag()}`;
+    const ws = await f.workspace(`ledger-${tag()}`);
+    const external = `rom_${tag()}Room`;
+    await f.owner(`UPDATE rooms SET provider = 'sharednet', external_room_id = $2 WHERE id = $1`, [
+      ws.roomId,
+      external,
+    ]);
+    const sealed = sealSecret(key, token);
+    await f.owner(
+      `INSERT INTO sharednet_seats (workspace_id, room_id, member_id, principal_id, token_ciphertext, token_nonce, key_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        ws.id,
+        ws.roomId,
+        `i_Payee${tag()}`,
+        `p_Payee${tag()}`,
+        sealed.ciphertext,
+        sealed.nonce,
+        sealed.keyId,
+      ],
+    );
+    const member = await f.actor(ws, `member-${tag()}`);
+    const outsider = await f.actor(ws, `outsider-${tag()}`, { inRoom: false });
+    const server = await startFakeLedgerServer([sampleTransfer({ id: 'txn_LedgerFor01' })]);
+    try {
+      const ledgerFor = createLedgerFor(f.pool, key, server.url);
+      const room = (actor: Actor) => ({
+        workspaceId: ws.id,
+        actorId: actor.id,
+        roomId: ws.roomId,
+        externalRoomId: external,
+      });
+      const client = await ledgerFor(room(member));
+      const page = await client.listTransfers({ limit: 10 }, new AbortController().signal);
+      expect(page.items.map((t) => t.id)).toEqual(['txn_LedgerFor01']);
+      expect(server.requests[0]?.auth).toBe(`Bearer ${token}`);
+      // Not a live member of the room: no seat is returned at all.
+      await expectCode(Promise.resolve(ledgerFor(room(outsider))), 'room_not_available');
+      // A wrong key fails without ever putting the token in the error.
+      const wrongKey = createLedgerFor(f.pool, randomBytes(32), server.url);
+      const wrong = await Promise.resolve(wrongKey(room(member))).then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(wrong).toBeInstanceOf(Error);
+      expect(wrong?.message).not.toContain(token);
+    } finally {
+      await server.close();
+    }
   });
 });

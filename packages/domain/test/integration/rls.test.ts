@@ -1015,7 +1015,12 @@ describe('row-level security and definer functions, as the runtime role chorus_a
         // A non-member gets nothing, even with a forged membership in pg_temp.
         expect(await asActor(outsider.id, false)).toEqual([]);
         expect(await asActor(outsider.id, true)).toEqual([]);
-        // Removing the member closes it; a suspended room does too.
+        // A room that is not active yields no payee, even to a live member.
+        await f.owner(`UPDATE rooms SET activation_state = 'suspended' WHERE id = $1`, [w.roomId]);
+        expect(await asActor(member.id, false)).toEqual([]);
+        await f.owner(`UPDATE rooms SET activation_state = 'active' WHERE id = $1`, [w.roomId]);
+        expect((await asActor(member.id, false)).map((r) => r.member_id)).toEqual([seat.member]);
+        // Removing the member closes it too.
         await f.owner('UPDATE room_members SET removed_at = now() WHERE actor_id = $1', [
           member.id,
         ]);

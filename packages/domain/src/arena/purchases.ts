@@ -236,7 +236,11 @@ export async function deliverPurchase(
     { ...ctx, idempotencyKey: `arena:${purchase.id}` },
     {
       type: 'arena.deliver',
-      input: { purchase_id: purchase.id, txn_id: txnId },
+      // Only the purchase is hashed, not the txn: concurrent deliveries of one purchase with different txns
+      // are the same command, so the loser replays the stored DELIVERED response instead of an
+      // idempotency_conflict that means nothing to a buyer (paid tools have no idempotency key). Reuse of a
+      // txn is refused in the handler (pre-check + UNIQUE), not by the command hash.
+      input: { purchase_id: purchase.id },
       ...(sessionId === null ? {} : { session: { id: sessionId as Uuid } }),
       authorize: async (tx) => {
         await requireRoomMember(tx, ctx.roomId);

@@ -113,6 +113,7 @@ CREATE TABLE purchases (
   txn_id              text,
   response            jsonb,
   CHECK ((state = 'delivered') = (txn_id IS NOT NULL AND response IS NOT NULL AND delivered_at IS NOT NULL)),
+  UNIQUE (workspace_id, id),
   FOREIGN KEY (workspace_id, room_id) REFERENCES rooms (workspace_id, id),
   FOREIGN KEY (workspace_id, session_id) REFERENCES sessions (workspace_id, id),
   FOREIGN KEY (workspace_id, board_id) REFERENCES projects (workspace_id, id),
@@ -126,13 +127,14 @@ CREATE TABLE payment_verification_failures (
   id           uuid        PRIMARY KEY DEFAULT uuidv7(),
   workspace_id uuid        NOT NULL,
   actor_id     uuid        NOT NULL,
-  purchase_id  uuid        NOT NULL REFERENCES purchases (id),
+  purchase_id  uuid        NOT NULL,
   txn_id       text        NOT NULL,
   reason       text        NOT NULL CHECK (reason IN ('payee', 'payer_seat', 'room', 'amount', 'memo', 'age')),
   -- Exactly the ten CreditTransfer fields the ledger returned; never a token.
   observed     jsonb       NOT NULL,
   created_at   timestamptz NOT NULL DEFAULT now(),
-  FOREIGN KEY (workspace_id, actor_id) REFERENCES actors (workspace_id, id)
+  FOREIGN KEY (workspace_id, actor_id) REFERENCES actors (workspace_id, id),
+  FOREIGN KEY (workspace_id, purchase_id) REFERENCES purchases (workspace_id, id)
 );
 CREATE INDEX payment_verification_failures_purchase_idx
   ON payment_verification_failures (workspace_id, purchase_id);
