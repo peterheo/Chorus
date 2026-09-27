@@ -1,7 +1,9 @@
 import { requireAction } from '../authz.ts';
 import {
   runCommand,
+  withReadTx,
   type CommandContext,
+  type ReadContext,
   type CommandTx,
   type DomainEventDraft,
   type SessionRole,
@@ -483,51 +485,135 @@ async function changeSessionPolicy(
       requireAction(tx, 'administer');
       return Promise.resolve();
     },
-    handle: async (tx) => {
-      const session = requireSession(tx);
-      // The administrator role is re-verified inside the definer, which also bumps the session version.
-      const changed = await tx.db.query<{ version: number }>(
-        'SELECT chorus_session_set_policy($1, $2::jsonb) AS version',
-        [sessionId, JSON.stringify(changes)],
-      );
-      if (changes['coordination_mode'] === 'observe' || changes['coordination_mode'] === 'assist') {
-        // Project only the checkpoint: the watcher function also exposes sealed seat credentials.
-        const checkpoint = await tx.db.query<{ last_sequence: string | null }>(
-          `SELECT watcher.last_sequence
-             FROM public.sessions s
-             LEFT JOIN public.chorus_watcher_rooms() watcher
-               ON watcher.workspace_id = s.workspace_id AND watcher.room_id = s.room_id
-            WHERE s.workspace_id = $1 AND s.id = $2`,
-          [tx.workspaceId, sessionId],
-        );
-        const coordinationCursor = Number(checkpoint.rows[0]?.last_sequence ?? 0);
-        if (!Number.isSafeInteger(coordinationCursor) || coordinationCursor < 0) {
-          throw new ChorusError('internal_error', 'The room cursor is invalid.');
-        }
-        await tx.db.query(
-          `INSERT INTO conversation_engine_state (workspace_id, session_id, cursor)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (workspace_id, session_id) DO UPDATE
-             SET cursor = GREATEST(conversation_engine_state.cursor, EXCLUDED.cursor), updated_at = now()`,
-          [tx.workspaceId, sessionId, coordinationCursor],
-        );
-      }
-      const version = tx.recordSessionVersion(changed.rows[0]?.version ?? 0);
-      return {
-        result: { session_id: sessionId, version, changed: fields },
-        events: [
-          {
-            roomId: session.roomId,
-            aggregateId: sessionId,
-            aggregateType: 'session',
-            aggregateVersion: version,
-            eventType: 'session.policy_changed',
-            payload: { changed: fields },
-          },
-        ],
-      };
-    },
+    handle: (tx) => applyPolicyChangesInTx(tx, sessionId, changes),
   });
+}
+
+/**
+ * The body of a policy change, inside a command whose session is locked and whose caller administers it:
+ * the definer update (which bumps the version), the monotonic engine-cursor jump when the mode turns on
+ * (spec §10, GREATEST so it never moves back), and the `session.policy_changed` event.
+ */
+async function applyPolicyChangesInTx(
+  tx: CommandTx,
+  sessionId: Uuid,
+  changes: Readonly<Record<string, unknown>>,
+): Promise<{ result: PolicyChanged; events: DomainEventDraft[] }> {
+  const fields = Object.keys(changes);
+  const session = requireSession(tx);
+  // The administrator role is re-verified inside the definer, which also bumps the session version.
+  const changed = await tx.db.query<{ version: number }>(
+    'SELECT chorus_session_set_policy($1, $2::jsonb) AS version',
+    [sessionId, JSON.stringify(changes)],
+  );
+  if (changes['coordination_mode'] === 'observe' || changes['coordination_mode'] === 'assist') {
+    // Project only the checkpoint: the watcher function also exposes sealed seat credentials.
+    const checkpoint = await tx.db.query<{ last_sequence: string | null }>(
+      `SELECT watcher.last_sequence
+         FROM public.sessions s
+         LEFT JOIN public.chorus_watcher_rooms() watcher
+           ON watcher.workspace_id = s.workspace_id AND watcher.room_id = s.room_id
+        WHERE s.workspace_id = $1 AND s.id = $2`,
+      [tx.workspaceId, sessionId],
+    );
+    const coordinationCursor = Number(checkpoint.rows[0]?.last_sequence ?? 0);
+    if (!Number.isSafeInteger(coordinationCursor) || coordinationCursor < 0) {
+      throw new ChorusError('internal_error', 'The room cursor is invalid.');
+    }
+    await tx.db.query(
+      `INSERT INTO conversation_engine_state (workspace_id, session_id, cursor)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (workspace_id, session_id) DO UPDATE
+         SET cursor = GREATEST(conversation_engine_state.cursor, EXCLUDED.cursor), updated_at = now()`,
+      [tx.workspaceId, sessionId, coordinationCursor],
+    );
+  }
+  const version = tx.recordSessionVersion(changed.rows[0]?.version ?? 0);
+  return {
+    result: { session_id: sessionId, version, changed: fields },
+    events: [
+      {
+        roomId: session.roomId,
+        aggregateId: sessionId,
+        aggregateType: 'session',
+        aggregateVersion: version,
+        eventType: 'session.policy_changed',
+        payload: { changed: fields },
+      },
+    ],
+  };
+}
+
+export type CoordinationMode = 'off' | 'observe' | 'assist';
+
+/** Validates `chorus.set_coordination_mode` input without touching the database. */
+export function parseCoordinationModeChange(input: unknown): {
+  readonly sessionId: Uuid;
+  readonly expectedVersion: number;
+  readonly mode: CoordinationMode;
+} {
+  const raw = requireObject(input, ['session_id', 'expected_version', 'mode']);
+  return {
+    sessionId: requireUuid(raw['session_id'], 'session_id'),
+    expectedVersion: requireInteger(raw['expected_version'], 'expected_version', 1),
+    mode: requireEnum(raw['mode'], 'mode', ['off', 'observe', 'assist']),
+  };
+}
+
+/**
+ * A session's current coordination mode and version, for pricing a mode change. Only its administrator may
+ * ask: a non-member gets `not_found`, and a member who does not administer it `action_forbidden`, before
+ * anything is quoted.
+ */
+export async function coordinationModeOf(
+  read: ReadContext,
+  sessionId: Uuid,
+): Promise<{ readonly mode: CoordinationMode; readonly version: number }> {
+  return withReadTx(read, async (db) => {
+    const { rows } = await db.query<{
+      roles: string[] | null;
+      mode: CoordinationMode | null;
+      version: number | null;
+    }>(
+      `SELECT chorus_session_roles($2) AS roles, s.coordination_mode AS mode, s.version
+         FROM (SELECT 1) one
+         LEFT JOIN sessions s ON s.workspace_id = $1 AND s.id = $2`,
+      [read.workspaceId, sessionId],
+    );
+    const row = rows[0];
+    if (
+      row?.roles === null ||
+      row?.roles === undefined ||
+      row.mode === null ||
+      row.version === null
+    )
+      throw new ChorusError('not_found', 'Not found.');
+    requireAction({ roles: row.roles as SessionRole[] }, 'administer');
+    return { mode: row.mode, version: row.version };
+  });
+}
+
+/**
+ * Sets the coordination mode inside an existing command transaction whose session is locked at the caller's
+ * expected version (a paid delivery). `guard` sees the mode as it is NOW, under the lock, and may refuse.
+ */
+export async function setCoordinationModeInTx(
+  tx: CommandTx,
+  args: {
+    readonly sessionId: Uuid;
+    readonly mode: CoordinationMode;
+    readonly guard: (current: CoordinationMode) => void;
+  },
+): Promise<{ result: PolicyChanged; events: DomainEventDraft[] }> {
+  requireAction(tx, 'administer');
+  const { rows } = await tx.db.query<{ mode: CoordinationMode }>(
+    'SELECT coordination_mode AS mode FROM sessions WHERE workspace_id = $1 AND id = $2',
+    [tx.workspaceId, args.sessionId],
+  );
+  const current = rows[0]?.mode;
+  if (current === undefined) throw new ChorusError('not_found', 'Not found.');
+  args.guard(current);
+  return applyPolicyChangesInTx(tx, args.sessionId, { coordination_mode: args.mode });
 }
 
 /** Live administrators, by the one definition of "live" (session member + room member + active room). */

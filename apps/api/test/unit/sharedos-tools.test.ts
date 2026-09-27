@@ -86,6 +86,32 @@ describe('chorus tool definitions', () => {
     ]);
   });
 
+  it('paid coordination: with billing on, set_coordination_mode is the paid variant (request_id, payment_txn_id)', () => {
+    const modeTool = (billing: 'enabled' | 'disabled') =>
+      chorusTools({ ...deps, billing }).find(
+        (t) => t.definition.name === 'chorus.set_coordination_mode',
+      )?.definition;
+    const free = modeTool('disabled');
+    const paid = modeTool('enabled');
+    expect(Object.keys(free?.inputSchema.properties ?? {}).sort()).toEqual([
+      'expected_version',
+      'idempotency_key',
+      'mode',
+      'session_id',
+    ]);
+    expect(free?.description).not.toContain('Paid');
+    expect(paid).toMatchSnapshot();
+    expect(paid?.inputSchema.required).toEqual([
+      'request_id',
+      'session_id',
+      'mode',
+      'expected_version',
+    ]);
+    expect(paid?.description).toContain(
+      'off → observe 2 credits, off → assist 3, observe → assist 1',
+    );
+  });
+
   it('K8 sharedos.arguments: missing, wrongly typed and unknown arguments are rejected by the parser', () => {
     const claim = tools.find((t) => t.definition.name === 'chorus.claim');
     const good = { session_id: 's', task_id: 't', expected_version: 1, idempotency_key: 'k' };

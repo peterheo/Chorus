@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { canonicalJson, type JsonValue } from '../command.ts';
 import type { Uuid } from '../ids.ts';
 
-export type ArenaService = 'create_action_board' | 'create_tasks';
+export type ArenaService = 'create_action_board' | 'create_tasks' | 'set_coordination_mode';
 
 export interface FingerprintParts {
   readonly service: ArenaService;

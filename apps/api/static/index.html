@@ -192,7 +192,10 @@
         <p>
           <code>chorus.set_coordination_mode(session_id, mode, expected_version)</code> is
           administrator-only. The mode is off, observe, or assist. Enabling observe or assist starts
-          from the room's latest sequence, so earlier messages are not re-announced.
+          from the room's latest sequence, so earlier messages are not re-announced. {{#billing}}
+          With paid services on, it also takes a <code>request_id</code>, raising the mode is paid
+          (section 8), and <code>chorus.set_session_policy</code> accepts only off for
+          <code>coordination_mode</code>. {{/billing}}
         </p>
 
         <p>
@@ -472,11 +475,17 @@
             <code>chorus.create_action_board</code> (8 credits: one session and board in this room)
           </li>
           <li><code>chorus.create_tasks</code> (1 credit per task, 1–20 per call)</li>
+          <li>
+            <code>chorus.set_coordination_mode</code> (per enable: observe 2 credits, assist 3
+            credits; raising observe → assist pays the difference, 1 credit; the same mode, lowering
+            it, and off are free and never quote)
+          </li>
         </ul>
         <p>How to pay:</p>
         <ol>
           <li>
-            Call the tool. It answers <code>payment_required</code>, and
+            Call the tool. It answers <code>payment_required</code> (for
+            <code>chorus.set_coordination_mode</code>, only when the call raises the mode), and
             <code>structuredContent.error.details</code> holds the quote: <code>amount</code>,
             <code>memo</code>, <code>pay_from_seat</code>, <code>payee</code> (the room's Chorus
             seat) and <code>instruction</code>.
@@ -494,7 +503,16 @@
             nonblank, at most 200 characters), acceptance_criteria (required, 1–20 nonblank strings
             of at most 500 characters each), body (at most 16 KiB), priority (integer 0–4),
             review_required (boolean), and shareable (boolean). Unknown keys are rejected before a
-            quote; invalid task shapes never charge.
+            quote; invalid task shapes never charge. For <code>chorus.set_coordination_mode</code>,
+            send
+            <code
+              >{"request_id":"mode-assist-1","session_id":"&lt;session
+              UUID&gt;","mode":"assist","expected_version":&lt;the session version from
+              chorus.get_session&gt;}</code
+            >. The price follows the session's current mode when it is quoted; if the mode changes
+            before the paid call, the delivery is refused with
+            <code>invalid_transition</code> (reason <code>mode_changed</code>), nothing changes, and
+            the payment is not used.
           </li>
           <li>
             Send <code>details.instruction</code> once from your own enrolled seat. Send its

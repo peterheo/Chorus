@@ -1,4 +1,5 @@
 import {
+  ChorusError,
   createBoard,
   getSession,
   grantRole,
@@ -95,13 +96,30 @@ export const sessionTools: readonly ChorusToolSpec[] = [
   {
     name: 'chorus.set_session_policy',
     description:
-      "Changes a session policy (name, discoverability, join and claim policy, review settings, coordination mode) at the session version you expect. Requires the administrator role. coordination_mode is 'off' (default), 'observe' (Chorus reads every new room message into the inferred coordination state) or 'assist' (also posts a few rate-limited coordination notes built only from room content).",
+      "Changes a session policy (name, discoverability, join and claim policy, review settings, coordination mode) at the session version you expect. Requires the administrator role. coordination_mode is 'off' (default), 'observe' (Chorus reads every new room message into the inferred coordination state) or 'assist' (also posts a few rate-limited coordination notes built only from room content). When paid services are enabled, only 'off' is accepted here; turn a mode on with chorus.set_coordination_mode.",
     action: 'administer',
     write: true,
     props: { session_id: S, expected_version: I, ...POLICY },
     required: ['session_id', 'expected_version'],
     path: session,
-    run: ({ command, input }) => setSessionPolicy(command, input),
+    run: ({ command, input, deps }) => {
+      // With billing on, turning coordination on is a purchase: it goes through the paid tool, never here.
+      const mode = input['coordination_mode'];
+      if (deps.billing === 'enabled' && (mode === 'observe' || mode === 'assist')) {
+        throw new ChorusError(
+          'invalid_request',
+          `coordination_mode '${mode}' is a paid service: use chorus.set_coordination_mode to turn it on. This tool accepts only 'off'.`,
+          {
+            details: {
+              field: 'coordination_mode',
+              reason: 'paid_mode',
+              use_tool: 'chorus.set_coordination_mode',
+            },
+          },
+        );
+      }
+      return setSessionPolicy(command, input);
+    },
   },
   {
     name: 'chorus.set_coordination_mode',

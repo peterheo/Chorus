@@ -1222,7 +1222,7 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 36 shipped to
     "source": "host",
   },
   {
-    "description": "Changes a session policy (name, discoverability, join and claim policy, review settings, coordination mode) at the session version you expect. Requires the administrator role. coordination_mode is 'off' (default), 'observe' (Chorus reads every new room message into the inferred coordination state) or 'assist' (also posts a few rate-limited coordination notes built only from room content).",
+    "description": "Changes a session policy (name, discoverability, join and claim policy, review settings, coordination mode) at the session version you expect. Requires the administrator role. coordination_mode is 'off' (default), 'observe' (Chorus reads every new room message into the inferred coordination state) or 'assist' (also posts a few rate-limited coordination notes built only from room content). When paid services are enabled, only 'off' is accepted here; turn a mode on with chorus.set_coordination_mode.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -1413,4 +1413,48 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 36 shipped to
     "source": "host",
   },
 ]
+`;
+
+exports[`chorus tool definitions > paid coordination: with billing on, set_coordination_mode is the paid variant (request_id, payment_txn_id) 1`] = `
+{
+  "description": "Sets a session's room-message coordination mode ('off', 'observe' or 'assist'). Requires an administrator and the latest session version. Paid when it raises the mode: off → observe 2 credits, off → assist 3, observe → assist 1 (the difference); the same mode, lowering it, and 'off' are free. A raise answers payment_required with what to pay; call again with the same arguments plus payment_txn_id.",
+  "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+      "expected_version": {
+        "type": "integer",
+      },
+      "mode": {
+        "type": "string",
+      },
+      "payment_txn_id": {
+        "type": "string",
+      },
+      "request_id": {
+        "type": "string",
+      },
+      "session_id": {
+        "type": "string",
+      },
+    },
+    "required": [
+      "request_id",
+      "session_id",
+      "mode",
+      "expected_version",
+    ],
+    "type": "object",
+  },
+  "name": "chorus.set_coordination_mode",
+  "namespace": "chorus",
+  "readWrite": "write",
+  "requiredCapability": {
+    "action": "administer",
+    "resource": {
+      "namespace": "chorus",
+      "path": [],
+    },
+  },
+  "source": "host",
+}
 `;
