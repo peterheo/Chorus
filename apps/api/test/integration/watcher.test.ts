@@ -232,6 +232,43 @@ describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
     expect(s.logs.join('')).not.toContain(needle);
   });
 
+  it('watcher.stop_race: a scan in flight when stop() is called spawns nothing and never touches an ended pool', async () => {
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on('unhandledRejection', onRejection);
+    const logged: string[] = [];
+    const wpool = new pg.Pool({ connectionString: s.db.appUrl, max: 5 });
+    wpool.on('error', () => undefined);
+    const watcher = new RoomWatcher({
+      pool: wpool,
+      secretsKey: s.secretsKey,
+      client: new SharedNetClient({ baseUrl: s.fake.url, timeoutMs: 5000 }),
+      rescanMs: 60_000,
+      expireMs: 60_000,
+      minPollIntervalMs: 10,
+      logger: { info: (_o, msg) => logged.push(msg), warn: (_o, msg) => logged.push(msg) },
+    });
+    try {
+      // Start with no active room so the first scan spawns nothing, then make the room active: the next
+      // scan WOULD spawn a loop for it.
+      await s.owner(`UPDATE rooms SET activation_state = 'degraded' WHERE id = $1`, [s.roomId]);
+      await watcher.start();
+      await s.owner(`UPDATE rooms SET activation_state = 'active' WHERE id = $1`, [s.roomId]);
+
+      const scan = watcher.scan(); // deliberately not awaited: its query is in flight
+      await watcher.stop();
+      await wpool.end();
+      await scan;
+      await new Promise((r) => setTimeout(r, 100)); // flush any late rejection
+      expect(rejections).toEqual([]);
+      expect(watcher.consuming).toEqual([]);
+      expect(logged).not.toContain('consuming room');
+    } finally {
+      process.off('unhandledRejection', onRejection);
+      if (!wpool.ended) await wpool.end();
+    }
+  });
+
   it('watcher.consumer_lease: two processes, one consumer; failover when the lease connection dies; stale epochs are fenced out', async () => {
     const poolB = new pg.Pool({ connectionString: s.db.appUrl, max: 5 });
     poolB.on('error', () => undefined);

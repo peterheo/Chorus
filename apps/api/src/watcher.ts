@@ -63,6 +63,8 @@ const UNLOCK_SQL = `SELECT pg_advisory_unlock(hashtextextended('chorus:room-cons
 export class RoomWatcher {
   private readonly options: Required<Omit<WatcherOptions, 'logger'>> & { logger: WatcherLogger };
   private readonly running = new Map<string, Promise<void>>();
+  /** Scans and expiries in flight; `stop()` waits for them so none can act on a closed pool. */
+  private readonly inflight = new Set<Promise<unknown>>();
   private abort = new AbortController();
   private timers: NodeJS.Timeout[] = [];
   private started = false;
@@ -90,8 +92,12 @@ export class RoomWatcher {
     this.abort = new AbortController();
     await this.scan();
     this.timers.push(
-      setInterval(() => void this.scan().catch(() => undefined), this.options.rescanMs),
-      setInterval(() => void this.expire().catch(() => undefined), this.options.expireMs),
+      setInterval(() => {
+        if (this.started) void this.scan().catch(() => undefined);
+      }, this.options.rescanMs),
+      setInterval(() => {
+        if (this.started) void this.expire().catch(() => undefined);
+      }, this.options.expireMs),
     );
     for (const timer of this.timers) timer.unref();
   }
@@ -101,19 +107,37 @@ export class RoomWatcher {
     for (const timer of this.timers) clearInterval(timer);
     this.timers = [];
     this.abort.abort();
+    // A scan or expiry in flight finishes first (it will not spawn anything: the watcher is stopped), so the
+    // loops awaited next are the complete set and the pool is idle when this returns.
+    await Promise.allSettled([...this.inflight]);
     await Promise.allSettled([...this.running.values()]);
     this.running.clear();
   }
 
-  private async expire(): Promise<void> {
-    await this.options.pool.query('SELECT chorus_expire_enrollments()');
+  private track<T>(work: Promise<T>): Promise<T> {
+    this.inflight.add(work);
+    const forget = () => this.inflight.delete(work);
+    work.then(forget, forget);
+    return work;
+  }
+
+  private expire(): Promise<void> {
+    return this.track(
+      this.options.pool.query('SELECT chorus_expire_enrollments()').then(() => undefined),
+    );
   }
 
   /** Spawns a loop for every active room that does not have one yet. */
-  async scan(): Promise<void> {
+  scan(): Promise<void> {
+    return this.track(this.scanRooms());
+  }
+
+  private async scanRooms(): Promise<void> {
     const { rows } = await this.options.pool.query<WatchedRoom>(
       'SELECT * FROM chorus_watcher_rooms()',
     );
+    // Stopped while the query was in flight: spawn nothing (the pool may be about to close).
+    if (this.abort.signal.aborted || !this.started) return;
     for (const room of rows) {
       const key = `${room.workspace_id}/${room.room_id}`;
       if (this.running.has(key)) continue;
