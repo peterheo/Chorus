@@ -829,8 +829,8 @@ BEGIN
    WHERE i.workspace_id = v_ws AND i.actor_id = v_actor AND i.provider = 'sharednet';
 
   IF v_s.join_policy = 'open' THEN
-    -- A non-discoverable session is never joinable by knowing its id alone.
-    v_ok := v_s.discoverable;
+    -- Non-discoverable only hides the session from listings (A4.2); an open one is joinable by id.
+    v_ok := true;
   ELSIF v_s.join_policy = 'listed' THEN
     v_ok := v_principal IS NOT NULL AND v_principal = ANY (v_s.listed_principals);
   ELSIF v_s.join_policy = 'policy_matched' THEN

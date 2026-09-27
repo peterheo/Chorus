@@ -231,10 +231,17 @@ describe('sessions (real PostgreSQL, as chorus_app)', () => {
     );
     const insideHidden = await listSessions(rctx(wa.manager), {});
     expect(insideHidden.items.map((s) => s.id)).toContain(hidden.session.id);
+    // A4.2: non-discoverable only hides a session from listings. It is still joinable by id under an
+    // automated (open) policy, while an unknown id gets the identical not_found.
     await expectCode(
-      joinSession(wb.executor.ctx(), { session_id: hidden.session.id }),
+      joinSession(wb.executor.ctx(), { session_id: '00000000-0000-4000-8000-000000000000' }),
       'not_found',
     );
+    expect(await joinSession(wb.executor.ctx(), { session_id: hidden.session.id })).toMatchObject({
+      session_id: hidden.session.id,
+      roles: ['participant'],
+      joined: true,
+    });
   });
 
   it('sessions.roles.overlap: the same actor holds different roles in different sessions, evaluated independently', async () => {
@@ -449,9 +456,11 @@ describe('sessions (real PostgreSQL, as chorus_app)', () => {
       'not_supported_yet',
     );
 
-    // Open + non-discoverable is not joinable by knowing the id.
+    // Open + non-discoverable is joinable by presenting the id (A4.2); it is only hidden from listings.
     const hiddenOpen = await newSession(owner, { name: 'Hidden', discoverable: false });
-    await expectCode(joinSession(other.ctx(), { session_id: hiddenOpen.session.id }), 'not_found');
+    expect(await joinSession(other.ctx(), { session_id: hiddenOpen.session.id })).toMatchObject({
+      joined: true,
+    });
 
     // A removed member is re-evaluated by the policy on rejoin and gets participant only.
     const open = await newSession(owner, { name: 'Open' });
