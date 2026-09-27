@@ -181,7 +181,11 @@ ALTER TABLE review_details
   ADD COLUMN cancelled_at timestamptz,
   ADD COLUMN cancel_reason text CHECK (cancel_reason IS NULL OR char_length(cancel_reason) <= 2000),
   ADD CONSTRAINT review_details_cancel_ck CHECK ((cancelled_at IS NULL) = (cancel_reason IS NULL)),
-  ADD FOREIGN KEY (workspace_id, review_item_id, session_id) REFERENCES work_items (workspace_id, id, session_id);
+  ADD COLUMN verdict_reviewer_roles text[]
+    CHECK (verdict_reviewer_roles IS NULL OR verdict_reviewer_roles <@ ARRAY['participant', 'manager', 'administrator']::text[]),
+  ADD FOREIGN KEY (workspace_id, review_item_id, session_id) REFERENCES work_items (workspace_id, id, session_id),
+  -- A review and the task it judges live in the same session, enforced by the database itself.
+  ADD FOREIGN KEY (workspace_id, subject_task_id, session_id) REFERENCES work_items (workspace_id, id, session_id);
 -- One NON-cancelled review per (task, revision).
 DROP INDEX review_details_one_per_revision;
 CREATE UNIQUE INDEX review_details_one_live_per_revision
@@ -449,12 +453,10 @@ CREATE POLICY tenant ON rooms
 CREATE POLICY tenant ON room_members
   USING (workspace_id = chorus_ws()) WITH CHECK (workspace_id = chorus_ws());
 
--- A session is visible if it is discoverable or the actor is a live member; only members may change it.
+-- A session is visible if it is discoverable or the actor is a live member. It is never writable by
+-- chorus_app directly: every change goes through the chorus_session_* definers below.
 CREATE POLICY visible ON sessions FOR SELECT
   USING (workspace_id = chorus_ws() AND (discoverable OR id IN (SELECT chorus_my_sessions())));
-CREATE POLICY members_update ON sessions FOR UPDATE
-  USING (workspace_id = chorus_ws() AND id IN (SELECT chorus_my_sessions()))
-  WITH CHECK (workspace_id = chorus_ws() AND id IN (SELECT chorus_my_sessions()));
 
 -- An actor sees itself and the actors it shares a session with (session_members is itself session-scoped).
 CREATE POLICY tenant ON actors
@@ -514,12 +516,13 @@ CREATE POLICY tenant ON sharedos_audit_events
 --    external_identities, enrollments, session_join_credentials or admin_audit_log.
 -- ---------------------------------------------------------------------------------------------------
 GRANT SELECT ON room_members TO chorus_app;
-GRANT SELECT, UPDATE ON sessions, session_members TO chorus_app;
+GRANT SELECT ON sessions, session_members TO chorus_app;
 GRANT SELECT, INSERT ON task_criteria_revisions, comments, message_links, sharedos_audit_events TO chorus_app;
 GRANT SELECT, INSERT, UPDATE ON claim_requests, proposal_details, projects TO chorus_app;
 GRANT UPDATE ON task_details TO chorus_app;
--- sessions and session_members are NOT insertable by chorus_app: creation and joining go through the
--- SECURITY DEFINER functions below, so membership can never be self-granted.
+-- sessions and session_members are read-only for chorus_app: creation, joining, role and policy changes,
+-- removal and version bumps all go through the SECURITY DEFINER functions below, each of which
+-- re-verifies the caller's CURRENT session role, so membership and roles can never be self-granted.
 
 -- ---------------------------------------------------------------------------------------------------
 -- 8. SECURITY DEFINER functions. Standard hardening on every one: search_path pg_catalog, public,
@@ -880,6 +883,151 @@ CREATE FUNCTION chorus_room_health()
    WHERE r.provider = 'sharednet'
 $$;
 
+-- ---------------------------------------------------------------------------------------------------
+-- Session writes (A4.3). chorus_app cannot UPDATE sessions or session_members; these definers are the
+-- only writers. Each derives the caller from chorus.actor_id and re-checks the CURRENT role.
+-- ---------------------------------------------------------------------------------------------------
+
+-- The caller's roles in a session, or NULL unless the caller is a live session member of a live room
+-- membership in an active room (the single definition of "live member": chorus_my_sessions()).
+CREATE FUNCTION chorus_session_roles(p_session_id uuid) RETURNS text[]
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+  SELECT m.roles FROM public.session_members m
+   WHERE m.workspace_id = public.chorus_ws() AND m.session_id = p_session_id
+     AND m.actor_id = public.chorus_actor()
+     AND m.session_id IN (SELECT public.chorus_my_sessions())
+$$;
+
+-- Locks the session row (mode 'none' | 'share' | 'update') and only THEN reads the caller's roles, so a
+-- command that waited on the lock authorizes against the roles that are current when it proceeds.
+CREATE FUNCTION chorus_session_lock(p_session_id uuid, p_mode text)
+  RETURNS TABLE (id uuid, room_id uuid, version integer, join_policy text, default_claim_policy text,
+                 manager_review_allowed boolean, default_review_required boolean, state text, roles text[])
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+DECLARE
+  v_ws uuid := public.chorus_ws();
+  v_roles text[];
+BEGIN
+  IF p_mode NOT IN ('none', 'share', 'update') THEN
+    RAISE EXCEPTION 'invalid lock mode' USING ERRCODE = '22023';
+  END IF;
+  IF v_ws IS NULL OR public.chorus_actor() IS NULL THEN RETURN; END IF;
+  -- Non-members never reach the lock, so they cannot stall anyone.
+  IF public.chorus_session_roles(p_session_id) IS NULL THEN RETURN; END IF;
+  IF p_mode = 'update' THEN
+    PERFORM 1 FROM public.sessions s WHERE s.workspace_id = v_ws AND s.id = p_session_id FOR UPDATE;
+  ELSIF p_mode = 'share' THEN
+    PERFORM 1 FROM public.sessions s WHERE s.workspace_id = v_ws AND s.id = p_session_id FOR SHARE;
+  END IF;
+  v_roles := public.chorus_session_roles(p_session_id);
+  IF v_roles IS NULL THEN RETURN; END IF;
+  RETURN QUERY
+    SELECT s.id, s.room_id, s.version, s.join_policy, s.default_claim_policy, s.manager_review_allowed,
+           s.default_review_required, s.state, v_roles
+      FROM public.sessions s WHERE s.workspace_id = v_ws AND s.id = p_session_id;
+END;
+$$;
+
+CREATE FUNCTION chorus_session_bump(p_session_id uuid) RETURNS integer
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+DECLARE
+  v_version integer;
+BEGIN
+  IF public.chorus_session_roles(p_session_id) IS NULL THEN
+    RAISE EXCEPTION 'not a live session member' USING ERRCODE = '42501';
+  END IF;
+  UPDATE public.sessions SET version = version + 1
+   WHERE workspace_id = public.chorus_ws() AND id = p_session_id
+   RETURNING version INTO v_version;
+  RETURN v_version;
+END;
+$$;
+
+CREATE FUNCTION chorus_session_set_policy(p_session_id uuid, p_changes jsonb) RETURNS void
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+DECLARE
+  v_roles text[] := public.chorus_session_roles(p_session_id);
+BEGIN
+  IF v_roles IS NULL OR NOT ('administrator' = ANY (v_roles)) THEN
+    RAISE EXCEPTION 'administrator role required' USING ERRCODE = '42501';
+  END IF;
+  UPDATE public.sessions s SET
+    name = CASE WHEN p_changes ? 'name' THEN p_changes ->> 'name' ELSE s.name END,
+    discoverable = CASE WHEN p_changes ? 'discoverable'
+      THEN (p_changes ->> 'discoverable')::boolean ELSE s.discoverable END,
+    join_policy = CASE WHEN p_changes ? 'join_policy' THEN p_changes ->> 'join_policy' ELSE s.join_policy END,
+    listed_principals = CASE WHEN p_changes ? 'listed_principals'
+      THEN ARRAY(SELECT jsonb_array_elements_text(p_changes -> 'listed_principals')) ELSE s.listed_principals END,
+    policy_agent_ids = CASE WHEN p_changes ? 'policy_agent_ids'
+      THEN ARRAY(SELECT jsonb_array_elements_text(p_changes -> 'policy_agent_ids')) ELSE s.policy_agent_ids END,
+    default_claim_policy = CASE WHEN p_changes ? 'default_claim_policy'
+      THEN p_changes ->> 'default_claim_policy' ELSE s.default_claim_policy END,
+    manager_review_allowed = CASE WHEN p_changes ? 'manager_review_allowed'
+      THEN (p_changes ->> 'manager_review_allowed')::boolean ELSE s.manager_review_allowed END,
+    default_review_required = CASE WHEN p_changes ? 'default_review_required'
+      THEN (p_changes ->> 'default_review_required')::boolean ELSE s.default_review_required END
+   WHERE s.workspace_id = public.chorus_ws() AND s.id = p_session_id;
+END;
+$$;
+
+-- Members that are live under the SAME definition as chorus_my_sessions(): a live session member who is
+-- also a live member of the session's active room. Empty unless the caller is itself a live member.
+CREATE FUNCTION chorus_session_live_members(p_session_id uuid)
+  RETURNS TABLE (actor_id uuid, roles text[], joined_at timestamptz)
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+  SELECT m.actor_id, m.roles, m.joined_at
+    FROM public.session_members m
+    JOIN public.sessions s ON s.workspace_id = m.workspace_id AND s.id = m.session_id
+    JOIN public.rooms r ON r.workspace_id = s.workspace_id AND r.id = s.room_id
+    JOIN public.room_members rm
+      ON rm.workspace_id = s.workspace_id AND rm.room_id = s.room_id AND rm.actor_id = m.actor_id
+   WHERE m.workspace_id = public.chorus_ws() AND m.session_id = p_session_id
+     AND m.removed_at IS NULL AND rm.removed_at IS NULL AND r.activation_state = 'active'
+     AND p_session_id IN (SELECT public.chorus_my_sessions())
+$$;
+
+-- Administrator-only: replace a LIVE member's roles. NULL when the target is not a live member.
+CREATE FUNCTION chorus_session_set_roles(p_session_id uuid, p_actor_id uuid, p_roles text[])
+  RETURNS text[]
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+DECLARE
+  v_roles text[] := public.chorus_session_roles(p_session_id);
+  v_new text[];
+BEGIN
+  IF v_roles IS NULL OR NOT ('administrator' = ANY (v_roles)) THEN
+    RAISE EXCEPTION 'administrator role required' USING ERRCODE = '42501';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.chorus_session_live_members(p_session_id) l
+                  WHERE l.actor_id = p_actor_id) THEN
+    RETURN NULL;
+  END IF;
+  UPDATE public.session_members m SET roles = p_roles, version = m.version + 1
+   WHERE m.workspace_id = public.chorus_ws() AND m.session_id = p_session_id AND m.actor_id = p_actor_id
+     AND m.removed_at IS NULL
+   RETURNING m.roles INTO v_new;
+  RETURN v_new;
+END;
+$$;
+
+-- Administrator removes a member, or any member removes themself (leave). Closes the membership row.
+CREATE FUNCTION chorus_session_remove_member(p_session_id uuid, p_actor_id uuid) RETURNS boolean
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+DECLARE
+  v_roles text[] := public.chorus_session_roles(p_session_id);
+BEGIN
+  IF v_roles IS NULL THEN
+    RAISE EXCEPTION 'not a live session member' USING ERRCODE = '42501';
+  END IF;
+  IF p_actor_id <> public.chorus_actor() AND NOT ('administrator' = ANY (v_roles)) THEN
+    RAISE EXCEPTION 'administrator role required' USING ERRCODE = '42501';
+  END IF;
+  UPDATE public.session_members m SET removed_at = now(), version = m.version + 1
+   WHERE m.workspace_id = public.chorus_ws() AND m.session_id = p_session_id AND m.actor_id = p_actor_id
+     AND m.removed_at IS NULL;
+  RETURN FOUND;
+END;
+$$;
+
 REVOKE ALL ON FUNCTION chorus_my_sessions() FROM PUBLIC;
 REVOKE ALL ON FUNCTION chorus_enroll_start(text, text, text, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION chorus_enroll_verify(uuid, uuid, text, text, bigint, text, text, text) FROM PUBLIC;
@@ -894,7 +1042,21 @@ REVOKE ALL ON FUNCTION chorus_create_session(uuid, text, text, boolean, text, te
 REVOKE ALL ON FUNCTION chorus_join_session(uuid, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION chorus_expire_enrollments() FROM PUBLIC;
 REVOKE ALL ON FUNCTION chorus_room_health() FROM PUBLIC;
+REVOKE ALL ON FUNCTION chorus_session_roles(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION chorus_session_lock(uuid, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION chorus_session_bump(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION chorus_session_set_policy(uuid, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION chorus_session_live_members(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION chorus_session_set_roles(uuid, uuid, text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION chorus_session_remove_member(uuid, uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION chorus_my_sessions() TO chorus_app;
+GRANT EXECUTE ON FUNCTION chorus_session_roles(uuid) TO chorus_app;
+GRANT EXECUTE ON FUNCTION chorus_session_lock(uuid, text) TO chorus_app;
+GRANT EXECUTE ON FUNCTION chorus_session_bump(uuid) TO chorus_app;
+GRANT EXECUTE ON FUNCTION chorus_session_set_policy(uuid, jsonb) TO chorus_app;
+GRANT EXECUTE ON FUNCTION chorus_session_live_members(uuid) TO chorus_app;
+GRANT EXECUTE ON FUNCTION chorus_session_set_roles(uuid, uuid, text[]) TO chorus_app;
+GRANT EXECUTE ON FUNCTION chorus_session_remove_member(uuid, uuid) TO chorus_app;
 GRANT EXECUTE ON FUNCTION chorus_enroll_start(text, text, text, text, text) TO chorus_app;
 GRANT EXECUTE ON FUNCTION chorus_enroll_verify(uuid, uuid, text, text, bigint, text, text, text) TO chorus_app;
 GRANT EXECUTE ON FUNCTION chorus_enroll_status(uuid, text) TO chorus_app;

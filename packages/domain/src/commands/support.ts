@@ -209,6 +209,30 @@ export async function evaluateCompletionGates(
       ),
     );
   }
+  if (details.reviewRequired && latest.reviewId !== null) {
+    // The approval must have come from an ELIGIBLE reviewer at verdict time. The roles held then were
+    // recorded on the review, so a later role change cannot launder (or void) an approval.
+    const recorded = await tx.db.query<{ verdict_reviewer_roles: string[] | null }>(
+      `SELECT verdict_reviewer_roles FROM review_details WHERE workspace_id = $1 AND review_item_id = $2`,
+      [tx.workspaceId, latest.reviewId],
+    );
+    const roles = recorded.rows[0]?.verdict_reviewer_roles ?? null;
+    if (roles?.includes('manager') === true && tx.session?.managerReviewAllowed !== true) {
+      return fail(
+        new ChorusError(
+          'review_required',
+          'The approval came from a manager, and this session does not allow manager reviews.',
+          {
+            details: {
+              revision: latest.revision,
+              review_id: latest.reviewId,
+              reason: 'reviewer_not_eligible',
+            },
+          },
+        ),
+      );
+    }
+  }
   return {
     ok: true,
     revision: latest.revision,

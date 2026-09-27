@@ -25,13 +25,13 @@ import {
 
 /** Session membership is the visibility rule: a non-member gets `not_found` from every session read. */
 async function assertMember(db: Queryable, ctx: ReadContext, sessionId: string): Promise<string[]> {
-  const { rows } = await db.query<{ roles: string[] }>(
-    `SELECT roles FROM session_members
-      WHERE workspace_id = $1 AND session_id = $2 AND actor_id = $3 AND removed_at IS NULL`,
-    [ctx.workspaceId, sessionId, ctx.actorId],
+  // The one definition of a live member: chorus_my_sessions() (session member + room member + active room).
+  const { rows } = await db.query<{ roles: string[] | null }>(
+    'SELECT chorus_session_roles($1) AS roles',
+    [sessionId],
   );
   const roles = rows[0]?.roles;
-  if (roles === undefined) throw new ChorusError('not_found', 'Not found.');
+  if (roles === null || roles === undefined) throw new ChorusError('not_found', 'Not found.');
   return roles;
 }
 
@@ -486,14 +486,11 @@ export async function listSessions(
       discoverable: boolean;
       roles: string[] | null;
     }>(
-      `SELECT s.id, s.name, s.join_policy, s.discoverable, m.roles
+      `SELECT s.id, s.name, s.join_policy, s.discoverable, chorus_session_roles(s.id) AS roles
          FROM sessions s
-         LEFT JOIN session_members m
-           ON m.workspace_id = s.workspace_id AND m.session_id = s.id AND m.actor_id = $3
-          AND m.removed_at IS NULL
         WHERE s.workspace_id = $1 AND s.room_id = $2 AND s.state = 'active'
         ORDER BY s.id DESC`,
-      [ctx.workspaceId, ctx.roomId, ctx.actorId],
+      [ctx.workspaceId, ctx.roomId],
     );
     return {
       items: rows.map((r) => ({
@@ -588,8 +585,8 @@ export async function listMembers(
       joined_at: Date;
     }>(
       `SELECT m.actor_id, a.display_name, m.roles, m.joined_at
-         FROM session_members m JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-        WHERE m.workspace_id = $1 AND m.session_id = $2 AND m.removed_at IS NULL
+         FROM chorus_session_live_members($2) m
+         JOIN actors a ON a.workspace_id = $1 AND a.id = m.actor_id
         ORDER BY m.joined_at, m.actor_id`,
       [ctx.workspaceId, sessionId],
     );

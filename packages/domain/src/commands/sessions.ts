@@ -153,6 +153,16 @@ export async function createSession(ctx: CommandContext, input: unknown): Promis
       );
       if (member.rowCount === 0) throw new ChorusError('not_found', 'Not found.');
     },
+    // A replay returns the stored body, which names the session, so it also requires the caller's CURRENT
+    // live membership in that session (a creator who was later removed gets not_found and no body).
+    replayAuthorize: async (tx, stored) => {
+      const roles = await tx.db.query<{ roles: string[] | null }>(
+        'SELECT chorus_session_roles($1) AS roles',
+        [stored.session.id],
+      );
+      if (roles.rows[0]?.roles === null || roles.rows[0]?.roles === undefined)
+        throw new ChorusError('not_found', 'Not found.');
+    },
     handle: async (tx) => {
       const { rows } = await tx.db.query<{ session_id: Uuid; board_id: Uuid }>(
         'SELECT * FROM chorus_create_session($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
@@ -173,10 +183,7 @@ export async function createSession(ctx: CommandContext, input: unknown): Promis
       if (created === undefined)
         throw new ChorusError('internal_error', 'Session creation returned no row.');
       // The first board is part of the creation: it is the session's second versioned change.
-      await tx.db.query('UPDATE sessions SET version = 2 WHERE workspace_id = $1 AND id = $2', [
-        tx.workspaceId,
-        created.session_id,
-      ]);
+      await tx.db.query('SELECT chorus_session_bump($1)', [created.session_id]);
       return {
         result: {
           session: {
@@ -231,12 +238,12 @@ export async function joinSession(ctx: CommandContext, input: unknown): Promise<
     authorize: () => Promise.resolve(),
     // A replay is honoured only while the caller is STILL a live member.
     replayAuthorize: async (tx) => {
-      const member = await tx.db.query(
-        `SELECT 1 FROM session_members
-          WHERE workspace_id = $1 AND session_id = $2 AND actor_id = $3 AND removed_at IS NULL`,
-        [tx.workspaceId, sessionId, tx.actorId],
+      const roles = await tx.db.query<{ roles: string[] | null }>(
+        'SELECT chorus_session_roles($1) AS roles',
+        [sessionId],
       );
-      if (member.rowCount === 0) throw new ChorusError('not_found', 'Not found.');
+      if (roles.rows[0]?.roles === null || roles.rows[0]?.roles === undefined)
+        throw new ChorusError('not_found', 'Not found.');
     },
     handle: async (tx) => {
       const { rows } = await tx.db.query<{
@@ -250,8 +257,8 @@ export async function joinSession(ctx: CommandContext, input: unknown): Promise<
       const result = { session_id: sessionId, roles: joined.roles, joined: joined.newly_joined };
       if (!joined.newly_joined) return { result, events: [], noop: true };
       const bumped = await tx.db.query<{ version: number; room_id: Uuid }>(
-        `UPDATE sessions SET version = version + 1 WHERE workspace_id = $1 AND id = $2
-         RETURNING version, room_id`,
+        `SELECT chorus_session_bump(s.id) AS version, s.room_id
+           FROM sessions s WHERE s.workspace_id = $1 AND s.id = $2`,
         [tx.workspaceId, sessionId],
       );
       const row = bumped.rows[0];
@@ -381,21 +388,11 @@ export async function setSessionPolicy(
     },
     handle: async (tx) => {
       const session = requireSession(tx);
-      const column: Record<string, string> = {
-        name: 'name',
-        discoverable: 'discoverable',
-        join_policy: 'join_policy',
-        listed_principals: 'listed_principals',
-        policy_agent_ids: 'policy_agent_ids',
-        default_claim_policy: 'default_claim_policy',
-        manager_review_allowed: 'manager_review_allowed',
-        default_review_required: 'default_review_required',
-      };
-      const sets = fields.map((f, i) => `${column[f] ?? ''} = $${String(i + 3)}`);
-      await tx.db.query(
-        `UPDATE sessions SET ${sets.join(', ')} WHERE workspace_id = $1 AND id = $2`,
-        [tx.workspaceId, sessionId, ...fields.map((f) => changes[f])],
-      );
+      // The administrator role is re-verified inside the definer; chorus_app cannot UPDATE sessions.
+      await tx.db.query('SELECT chorus_session_set_policy($1, $2::jsonb)', [
+        sessionId,
+        JSON.stringify(changes),
+      ]);
       const version = await tx.bumpSessionVersion();
       return {
         result: { session_id: sessionId, version, changed: fields },
@@ -414,13 +411,13 @@ export async function setSessionPolicy(
   });
 }
 
-async function liveAdministrators(tx: CommandTx): Promise<number> {
-  const { rows } = await tx.db.query<{ n: string }>(
-    `SELECT count(*) AS n FROM session_members
-      WHERE workspace_id = $1 AND session_id = $2 AND removed_at IS NULL AND 'administrator' = ANY (roles)`,
-    [tx.workspaceId, requireSession(tx).id],
+/** Live administrators, by the one definition of "live" (session member + room member + active room). */
+async function liveAdministrators(tx: CommandTx): Promise<Uuid[]> {
+  const { rows } = await tx.db.query<{ actor_id: Uuid }>(
+    `SELECT actor_id FROM chorus_session_live_members($1) WHERE 'administrator' = ANY (roles)`,
+    [requireSession(tx).id],
   );
-  return Number(rows[0]?.n ?? 0);
+  return rows.map((r) => r.actor_id);
 }
 
 function lastAdministrator(): ChorusError {
@@ -433,11 +430,22 @@ function lastAdministrator(): ChorusError {
   );
 }
 
-async function memberRow(tx: CommandTx, actorId: Uuid): Promise<{ roles: SessionRole[] }> {
+/**
+ * The target's membership. `live` requires the full live-member definition (grant/revoke targets); the
+ * loose form finds any open session membership so an administrator can still remove someone who has
+ * already left the room.
+ */
+async function memberRow(
+  tx: CommandTx,
+  actorId: Uuid,
+  live: boolean,
+): Promise<{ roles: SessionRole[] }> {
   const { rows } = await tx.db.query<{ roles: SessionRole[] }>(
-    `SELECT roles FROM session_members
-      WHERE workspace_id = $1 AND session_id = $2 AND actor_id = $3 AND removed_at IS NULL FOR UPDATE`,
-    [tx.workspaceId, requireSession(tx).id, actorId],
+    live
+      ? 'SELECT roles FROM chorus_session_live_members($1) WHERE actor_id = $2'
+      : `SELECT roles FROM session_members
+          WHERE workspace_id = $3 AND session_id = $1 AND actor_id = $2 AND removed_at IS NULL`,
+    live ? [requireSession(tx).id, actorId] : [requireSession(tx).id, actorId, tx.workspaceId],
   );
   const row = rows[0];
   if (row === undefined) throw new ChorusError('not_found', 'Not found.');
@@ -467,7 +475,7 @@ function roleCommand(kind: 'grant' | 'revoke') {
       },
       handle: async (tx) => {
         const session = requireSession(tx);
-        const member = await memberRow(tx, actorId);
+        const member = await memberRow(tx, actorId, true);
         const has = member.roles.includes(role);
         if (kind === 'grant' ? has : !has) {
           return {
@@ -481,16 +489,20 @@ function roleCommand(kind: 'grant' | 'revoke') {
             noop: true,
           };
         }
-        if (kind === 'revoke' && role === 'administrator' && (await liveAdministrators(tx)) <= 1) {
+        if (
+          kind === 'revoke' &&
+          role === 'administrator' &&
+          (await liveAdministrators(tx)).length <= 1
+        ) {
           throw lastAdministrator();
         }
         const roles =
           kind === 'grant' ? [...member.roles, role] : member.roles.filter((r) => r !== role);
-        await tx.db.query(
-          `UPDATE session_members SET roles = $4::text[], version = version + 1
-            WHERE workspace_id = $1 AND session_id = $2 AND actor_id = $3`,
-          [tx.workspaceId, sessionId, actorId, roles],
-        );
+        await tx.db.query('SELECT chorus_session_set_roles($1, $2, $3::text[])', [
+          sessionId,
+          actorId,
+          roles,
+        ]);
         const version = await tx.bumpSessionVersion();
         return {
           result: { session_id: sessionId, actor_id: actorId, roles, version },
@@ -604,17 +616,15 @@ function removalCommand(kind: 'remove' | 'leave') {
       // The member row is closed LAST (after events are journaled): a member leaving their own session
       // must still be able to journal it, and a removed member's own statements would no longer see it.
       finalize: async (tx) => {
-        await tx.db.query(
-          `UPDATE session_members SET removed_at = now(), version = version + 1
-            WHERE workspace_id = $1 AND session_id = $2 AND actor_id = $3`,
-          [tx.workspaceId, sessionId, target],
-        );
+        await tx.db.query('SELECT chorus_session_remove_member($1, $2)', [sessionId, target]);
       },
       handle: async (tx) => {
         const session = requireSession(tx);
-        const member = await memberRow(tx, target);
-        if (member.roles.includes('administrator') && (await liveAdministrators(tx)) <= 1) {
-          throw lastAdministrator();
+        const member = await memberRow(tx, target, false);
+        if (member.roles.includes('administrator')) {
+          const admins = await liveAdministrators(tx);
+          // Only a LIVE administrator counts toward, and can be, the last one.
+          if (admins.includes(target) && admins.length <= 1) throw lastAdministrator();
         }
         const effects = await removalEffects(tx, target);
         const version = await tx.bumpSessionVersion();

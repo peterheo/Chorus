@@ -1,5 +1,5 @@
 import { requireAction } from '../authz.ts';
-import { runCommand, withReadTx, type CommandContext } from '../command.ts';
+import { runCommand, withReadTx, type CommandContext, type CommandTx } from '../command.ts';
 import { ChorusError } from '../errors.ts';
 import type { Uuid } from '../ids.ts';
 import { assertReviewAcceptsVerdict, assertTaskTransition } from '../transitions.ts';
@@ -56,32 +56,18 @@ export async function requestReview(
     session: { id: sessionId },
     input: { task_id: taskId, revision, reviewer_actor_id: reviewerId },
     targets: [{ id: taskId, expectedVersion, kind: 'task' }],
-    authorize: (tx) => {
-      // The owner (or a manager) asks for the review. Reviewer checks run in `handle`, after the version
-      // and lifecycle checks, so a replay re-authorizes only the caller.
-      requireAction(tx, 'request_review');
-      const task = lockedItem(tx, taskId);
-      if (task.ownerActorId !== tx.actorId && !tx.roles.includes('manager')) {
-        throw new ChorusError(
-          'action_forbidden',
-          'Only the owner or a manager can request a review.',
-          {
-            details: { reason: 'not_owner' },
-          },
-        );
-      }
+    // A replay re-authorizes only the caller; the reviewer separation below is a fresh-call check.
+    replayAuthorize: (tx) => {
+      assertMayRequestReview(tx, taskId);
       return Promise.resolve();
     },
-    handle: async (tx) => {
+    authorize: async (tx) => {
+      // The owner (or a manager) asks for the review, and the identity rules (precedence 6) run here, before
+      // the version and lifecycle checks: the reviewer is never the submitter or the owner.
+      assertMayRequestReview(tx, taskId);
       const task = lockedItem(tx, taskId);
-      const session = requireSession(tx);
-      assertTaskTransition('request_review', task.state);
       const latest = await loadLatestRevision(tx.db, tx.workspaceId, taskId);
-      if (latest === null) {
-        throw new ChorusError('internal_error', 'A task in review has no result revision.');
-      }
-      // Separation (WP3 rev 4 section 5.6): the reviewer is never the submitter or the owner.
-      if (latest.submittedBy === reviewerId) {
+      if (latest !== null && latest.submittedBy === reviewerId) {
         throw new ChorusError(
           'action_forbidden',
           'A reviewer cannot review their own submission.',
@@ -95,11 +81,20 @@ export async function requestReview(
           details: { reason: 'reviewer_is_owner' },
         });
       }
-      // The reviewer must be a live member of THIS session; a manager reviews only if the session allows it.
+    },
+    handle: async (tx) => {
+      const task = lockedItem(tx, taskId);
+      const session = requireSession(tx);
+      assertTaskTransition('request_review', task.state);
+      const latest = await loadLatestRevision(tx.db, tx.workspaceId, taskId);
+      if (latest === null) {
+        throw new ChorusError('internal_error', 'A task in review has no result revision.');
+      }
+      // The reviewer must be a LIVE member of this session (the same definition as chorus_my_sessions());
+      // a manager reviews only if the session allows it. The submitter/owner separation ran in authorize.
       const reviewer = await tx.db.query<{ roles: string[] }>(
-        `SELECT roles FROM session_members
-          WHERE workspace_id = $1 AND session_id = $2 AND actor_id = $3 AND removed_at IS NULL`,
-        [tx.workspaceId, sessionId, reviewerId],
+        'SELECT roles FROM chorus_session_live_members($1) WHERE actor_id = $2',
+        [sessionId, reviewerId],
       );
       const reviewerRoles = reviewer.rows[0]?.roles;
       if (reviewerRoles === undefined) {
@@ -192,6 +187,16 @@ export async function requestReview(
   });
 }
 
+function assertMayRequestReview(tx: CommandTx, taskId: Uuid): void {
+  requireAction(tx, 'request_review');
+  const task = lockedItem(tx, taskId);
+  if (task.ownerActorId !== tx.actorId && !tx.roles.includes('manager')) {
+    throw new ChorusError('action_forbidden', 'Only the owner or a manager can request a review.', {
+      details: { reason: 'not_owner' },
+    });
+  }
+}
+
 /** `Review: <task title> (revision N)`, cut to 200 code points; the work_items title is NOT NULL. */
 async function reviewTitle(
   tx: Parameters<Parameters<typeof runCommand>[1]['handle']>[0],
@@ -261,9 +266,10 @@ export async function reviewVerdict(ctx: CommandContext, input: unknown): Promis
       // in which case the handler bumps its version; otherwise the task is untouched.
       { id: taskId, lockOnly: true, kind: 'task' },
     ],
-    authorize: (tx) => {
+    authorize: async (tx) => {
       requireAction(tx, 'review');
       const review = lockedItem(tx, reviewId);
+      const task = lockedItem(tx, taskId);
       const session = requireSession(tx);
       // The assigned reviewer, or (only if the session allows it) a manager.
       const assigned = review.ownerActorId === tx.actorId;
@@ -277,7 +283,29 @@ export async function reviewVerdict(ctx: CommandContext, input: unknown): Promis
           },
         );
       }
-      return Promise.resolve();
+      // Eligibility is judged against the CURRENT roles and flags, at verdict time: a reviewer who was
+      // assigned as a participant and has since become a manager needs `manager_review_allowed` too.
+      if (tx.roles.includes('manager') && !session.managerReviewAllowed) {
+        throw new ChorusError(
+          'action_forbidden',
+          'This session does not allow managers to review.',
+          {
+            details: { reason: 'reviewer_not_eligible' },
+          },
+        );
+      }
+      // Separation (precedence 6, before version and lifecycle): never the submitter or the owner.
+      const latest = await loadLatestRevision(tx.db, tx.workspaceId, taskId);
+      if (latest !== null && latest.submittedBy === tx.actorId) {
+        throw new ChorusError('action_forbidden', 'The submitter cannot review their own result.', {
+          details: { reason: 'reviewer_is_submitter' },
+        });
+      }
+      if (task.ownerActorId === tx.actorId) {
+        throw new ChorusError('action_forbidden', "A task's owner cannot review it.", {
+          details: { reason: 'reviewer_is_owner' },
+        });
+      }
     },
     handle: async (tx) => {
       const review = lockedItem(tx, reviewId);
@@ -301,17 +329,6 @@ export async function reviewVerdict(ctx: CommandContext, input: unknown): Promis
 
       assertReviewAcceptsVerdict(review.state);
       const latest = await loadLatestRevision(tx.db, tx.workspaceId, taskId);
-      // Separation holds at verdict time too, whoever is recording it.
-      if (latest !== null && latest.submittedBy === tx.actorId) {
-        throw new ChorusError('action_forbidden', 'The submitter cannot review their own result.', {
-          details: { reason: 'reviewer_is_submitter' },
-        });
-      }
-      if (task.ownerActorId === tx.actorId) {
-        throw new ChorusError('action_forbidden', "A task's owner cannot review it.", {
-          details: { reason: 'reviewer_is_owner' },
-        });
-      }
       // Review gates (precedence 11): stale first, then the digest.
       if (latest === null || stored.result_revision < latest.revision) {
         throw new ChorusError('review_stale', 'The reviewed revision has been superseded.', {
@@ -334,9 +351,10 @@ export async function reviewVerdict(ctx: CommandContext, input: unknown): Promis
         verdict,
       ]);
       await tx.db.query(
-        `UPDATE review_details SET verdict = $3, verdict_at = now(), verdict_notes = $4
+        `UPDATE review_details SET verdict = $3, verdict_at = now(), verdict_notes = $4,
+                verdict_reviewer_roles = $5::text[]
           WHERE workspace_id = $1 AND review_item_id = $2`,
-        [tx.workspaceId, reviewId, verdict, notes === '' ? null : notes],
+        [tx.workspaceId, reviewId, verdict, notes === '' ? null : notes, tx.roles],
       );
       const version = await tx.bumpVersion(reviewId);
       const [summary] = await loadReviewSummaries(tx.db, tx.workspaceId, [reviewId]);

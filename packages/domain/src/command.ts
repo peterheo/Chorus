@@ -143,8 +143,12 @@ export interface CommandSpec<TResult extends CommandResult> {
    * caller's own visibility (leaving a session): journaling must still happen while they can see it.
    */
   readonly finalize?: (tx: CommandTx) => Promise<void>;
-  /** Replay-only authorization, when a fresh call's `authorize` cannot apply to a replay (e.g. join). Default: `authorize`. */
-  readonly replayAuthorize?: (tx: CommandTx) => Promise<void>;
+  /**
+   * Replay-only authorization, when a fresh call's `authorize` cannot apply to a replay (e.g. join). It also
+   * receives the stored response, so a command whose result names a session can re-check membership of it.
+   * Default: `authorize`.
+   */
+  readonly replayAuthorize?: (tx: CommandTx, stored: TResult) => Promise<void>;
   readonly handle: (tx: CommandTx) => Promise<{
     readonly result: TResult;
     readonly events: readonly DomainEventDraft[];
@@ -284,7 +288,7 @@ async function executeInTransaction<TResult extends CommandResult>(
     {
       // Repeat-safe, but not authority-free: re-authorize against the CURRENT session membership and
       // roles, and fail exactly as a fresh call would, without returning the stored body.
-      const replaySession = await loadSession(client, workspaceId, actorId, spec.session, false);
+      const replaySession = await loadSession(client, spec.session, 'none');
       const replayItems = await loadTargets(
         client,
         workspaceId,
@@ -292,7 +296,7 @@ async function executeInTransaction<TResult extends CommandResult>(
         false,
         spec.session?.id,
       );
-      await (spec.replayAuthorize ?? spec.authorize)({
+      const replayTx: CommandTx = {
         db: client,
         workspaceId,
         actorId,
@@ -309,7 +313,12 @@ async function executeInTransaction<TResult extends CommandResult>(
         bumpSessionVersion: () => {
           throw new ChorusError('internal_error', 'authorize must not change versions.');
         },
-      });
+      };
+      if (spec.replayAuthorize !== undefined) {
+        await spec.replayAuthorize(replayTx, row.response as TResult);
+      } else {
+        await spec.authorize(replayTx);
+      }
       return row.response as TResult;
     }
   }
@@ -325,10 +334,8 @@ async function executeInTransaction<TResult extends CommandResult>(
   // Lock order: graph lock -> session row -> target items in sorted UUID order.
   const sessionInfo = await loadSession(
     client,
-    workspaceId,
-    actorId,
     spec.session,
-    spec.session?.lock === true,
+    spec.session?.lock === true ? 'update' : 'share',
   );
   if (spec.session !== undefined) {
     // Recorded only after the caller proved membership, so an unknown session is a plain not_found.
@@ -374,8 +381,8 @@ async function executeInTransaction<TResult extends CommandResult>(
         throw new ChorusError('internal_error', 'bumpSessionVersion requires a locked session.');
       }
       const updated = await client.query<{ version: number }>(
-        `UPDATE sessions SET version = version + 1 WHERE workspace_id = $1 AND id = $2 RETURNING version`,
-        [workspaceId, sessionInfo.session.id],
+        'SELECT chorus_session_bump($1) AS version',
+        [sessionInfo.session.id],
       );
       const version = updated.rows[0]?.version;
       if (version === undefined)
@@ -423,25 +430,19 @@ async function executeInTransaction<TResult extends CommandResult>(
 }
 
 /**
- * Loads the caller's live membership and the session for a session-scoped command. A caller that is not a
- * live member gets `not_found`: session membership is the visibility rule, and a discoverable session is
- * still invisible to non-members for every command except join.
+ * Locks the session row and only then reads the caller's roles (both inside `chorus_session_lock`), so a
+ * command that waited for the lock authorizes against the roles that are current once it proceeds. A
+ * caller that is not a live member of a live room membership gets `not_found`: session membership is the
+ * visibility rule, and a discoverable session is still invisible to non-members for every command except
+ * join. Modes: `update` for session administration, `share` for ordinary session-scoped commands, and
+ * `none` for a replay's read-only re-authorization.
  */
 async function loadSession(
   client: pg.PoolClient,
-  workspaceId: Uuid,
-  actorId: Uuid,
   target: CommandSpec<CommandResult>['session'],
-  lock: boolean,
+  mode: 'none' | 'share' | 'update',
 ): Promise<{ session: SessionFacts; roles: SessionRole[] } | undefined> {
   if (target === undefined) return undefined;
-  const member = await client.query<{ roles: SessionRole[] }>(
-    `SELECT roles FROM session_members
-      WHERE workspace_id = $1 AND session_id = $2 AND actor_id = $3 AND removed_at IS NULL`,
-    [workspaceId, target.id, actorId],
-  );
-  const roles = member.rows[0]?.roles;
-  if (roles === undefined) throw new ChorusError('not_found', 'Not found.');
   const { rows } = await client.query<{
     id: Uuid;
     room_id: Uuid;
@@ -451,16 +452,12 @@ async function loadSession(
     manager_review_allowed: boolean;
     default_review_required: boolean;
     state: string;
-  }>(
-    `SELECT id, room_id, version, join_policy, default_claim_policy, manager_review_allowed,
-            default_review_required, state
-       FROM sessions WHERE workspace_id = $1 AND id = $2${lock ? ' FOR UPDATE' : ''}`,
-    [workspaceId, target.id],
-  );
+    roles: SessionRole[];
+  }>('SELECT * FROM chorus_session_lock($1, $2)', [target.id, mode]);
   const row = rows[0];
   if (row === undefined) throw new ChorusError('not_found', 'Not found.');
   return {
-    roles,
+    roles: row.roles,
     session: {
       id: row.id,
       roomId: row.room_id,
