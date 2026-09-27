@@ -4,7 +4,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type pg from 'pg';
-import { SHAREDNET_ROOM, startStack, type Stack } from '../helpers/stack.ts';
+import { SHAREDNET_ROOM, startStack, type Agent, type Stack } from '../helpers/stack.ts';
 
 interface ToolCall {
   readonly isError: boolean;
@@ -45,6 +45,8 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
   let stack: Stack;
   let caller: Client;
   let worker: Client;
+  let callerAgent: Agent;
+  let workerAgent: Agent;
   let callerActorId: string;
   let sessionId: string;
   let boardId: string;
@@ -52,6 +54,7 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
   beforeAll(async () => {
     stack = await startStack();
     const c = stack.agent('C');
+    callerAgent = c;
     const cEnrolled = await stack.enroll(c);
     callerActorId = cEnrolled.actorId;
     caller = await connect(stack, cEnrolled.token);
@@ -65,6 +68,7 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
     boardId = (created.data['board'] as { id: string }).id;
 
     const b = stack.agent('B');
+    workerAgent = b;
     const bEnrolled = await stack.enroll(b);
     worker = await connect(stack, bEnrolled.token);
     const joined = await write(worker, 'chorus.join_session', { session_id: sessionId });
@@ -352,6 +356,99 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
       [sessionId],
     );
     expect(after).toEqual(before);
+  });
+
+  it('CC-2c wiring: coordination_status/update_conversation_object over a scanned conflict, and room_pulse surfaces it for an involved caller', async () => {
+    const claimA = stack.fake.post(SHAREDNET_ROOM, {
+      memberId: callerAgent.memberId,
+      principalId: callerAgent.principalId,
+      name: callerAgent.name,
+      content: 'The staging deploy works fine.',
+    });
+    const claimB = stack.fake.post(SHAREDNET_ROOM, {
+      memberId: workerAgent.memberId,
+      principalId: workerAgent.principalId,
+      name: workerAgent.name,
+      content: 'The staging deploy does not work fine.',
+    });
+    const scanned = await write(caller, 'chorus.scan_conversation', {
+      session_id: sessionId,
+      from_sequence: claimA.sequence,
+      to_sequence: claimB.sequence,
+    });
+    expect(scanned.isError, JSON.stringify(scanned.data)).toBe(false);
+    expect(scanned.data['coordination']).toMatchObject({
+      applied_messages: 2,
+      skipped_before_cursor: 0,
+      new_objects: 3, // two claims plus the detected conflict
+    });
+
+    const status = await call(caller, 'chorus.coordination_status', { session_id: sessionId });
+    expect(status.isError, JSON.stringify(status.data)).toBe(false);
+    const objects = status.data['objects'] as {
+      claims: Record<string, unknown>[];
+      conflicts: { ref: string; status: string }[];
+    };
+    expect(objects.claims).toHaveLength(2);
+    expect(objects.conflicts).toHaveLength(1);
+    const conflictRef = objects.conflicts[0]?.ref;
+    expect(status.data['signals']).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'conflict',
+          refs: expect.arrayContaining([conflictRef]) as unknown as string[],
+        }),
+      ]),
+    );
+    expect(status.data).toMatchObject({ inferred: true, coverage: 'scanned_windows_only' });
+
+    // The signal names both claim authors, including the caller, so it surfaces in their own pulse.
+    const pulse = await call(caller, 'chorus.room_pulse', { session_id: sessionId });
+    const pulseSession = (
+      pulse.data['sessions'] as { session_id: string; next_actions: Record<string, unknown>[] }[]
+    ).find((s) => s.session_id === sessionId);
+    expect(pulseSession?.next_actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'conversation_conflict', item_id: conflictRef }),
+      ]),
+    );
+
+    // update_conversation_object: the caller created the session (a manager), so they may resolve it even
+    // though they are not the conflict object's own recorded author.
+    const resolved = await write(caller, 'chorus.update_conversation_object', {
+      session_id: sessionId,
+      ref: conflictRef,
+      action: 'resolve',
+    });
+    expect(resolved.data).toMatchObject({ object: { ref: conflictRef, status: 'resolved' } });
+
+    // Resolving an already-resolved item is rejected.
+    const already = await write(caller, 'chorus.update_conversation_object', {
+      session_id: sessionId,
+      ref: conflictRef,
+      action: 'resolve',
+    });
+    expect(already.data).toMatchObject({ code: 'invalid_transition' });
+
+    // A non-manager, non-involved third party cannot act on it (it's already resolved, but a fresh open
+    // item on a different actor's behalf would hit the same authorization check first).
+    const outsider = stack.agent('outsider-update');
+    const outsiderEnrolled = await stack.enroll(outsider);
+    const outsiderClient = await connect(stack, outsiderEnrolled.token);
+    try {
+      const joinedOutsider = await write(outsiderClient, 'chorus.join_session', {
+        session_id: sessionId,
+      });
+      expect(joinedOutsider.isError, JSON.stringify(joinedOutsider.data)).toBe(false);
+      const forbidden = await write(outsiderClient, 'chorus.update_conversation_object', {
+        session_id: sessionId,
+        ref: conflictRef,
+        action: 'reopen',
+      });
+      expect(forbidden.data).toMatchObject({ code: 'action_forbidden' });
+    } finally {
+      await outsiderClient.close();
+    }
   });
 
   it('CC8: room text cannot invoke tools or decide suggestions', async () => {

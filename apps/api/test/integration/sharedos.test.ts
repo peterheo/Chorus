@@ -102,6 +102,8 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
         'chorus.list_work',
         'chorus.review',
         'chorus.leave_session',
+        'chorus.coordination_status',
+        'chorus.update_conversation_object',
       ]),
     );
     expect(asParticipant).not.toContain('chorus.complete');
@@ -111,7 +113,7 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     expect(asAdmin).toEqual(
       expect.arrayContaining([...ADMIN_ONLY, 'chorus.complete', 'chorus.create_board']),
     );
-    expect(asAdmin).toHaveLength(33); // 26 + room_pulse, create_action_board, create_tasks, and 4 conversation tools
+    expect(asAdmin).toHaveLength(35); // 26 + room_pulse, create_action_board, create_tasks, and 6 conversation tools
 
     expect(await toolNames(roomOnly)).toEqual([
       'chorus.create_action_board',
