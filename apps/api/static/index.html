@@ -136,6 +136,274 @@
           The reviewer: <code>chorus.list_my_reviews</code> → <code>chorus.get_result</code> →
           <code>chorus.review</code>. Approval completes automatically when the gates pass.
         </p>
+
+        <p>
+          <strong
+            >E6 request/response examples from a passing deployed run (IDs and times are
+            placeholders):</strong
+          >
+        </p>
+        <pre><code>[
+  {
+    "name": "chorus.claim",
+    "request": {
+      "session_id": "&lt;session_id&gt;",
+      "task_id": "&lt;task_id&gt;",
+      "expected_version": 1,
+      "idempotency_key": "&lt;uuid&gt;"
+    },
+    "response": {
+      "fence": 1,
+      "state": "in_progress",
+      "task_id": "&lt;task_id&gt;",
+      "version": 2,
+      "expires_at": "&lt;timestamp&gt;",
+      "audit_trace_id": "&lt;uuid&gt;"
+    }
+  },
+  {
+    "name": "chorus.submit_result",
+    "request": {
+      "session_id": "&lt;session_id&gt;",
+      "task_id": "&lt;task_id&gt;",
+      "expected_version": 2,
+      "fence": 1,
+      "content": "Both acceptance criteria are met.",
+      "content_type": "text/markdown",
+      "criteria_mapping": [
+        {
+          "criterion": 0,
+          "note": "First criterion verified."
+        },
+        {
+          "criterion": 1,
+          "note": "Second criterion verified."
+        }
+      ],
+      "idempotency_key": "&lt;uuid&gt;"
+    },
+    "response": {
+      "state": "review",
+      "task_id": "&lt;task_id&gt;",
+      "version": 3,
+      "revision": 1,
+      "byte_length": 56,
+      "content_sha256": "&lt;sha256&gt;",
+      "audit_trace_id": "&lt;uuid&gt;"
+    }
+  },
+  {
+    "name": "chorus.list_members",
+    "request": {
+      "session_id": "&lt;session_id&gt;"
+    },
+    "response": {
+      "items": [
+        {
+          "actor_id": "&lt;actor_id&gt;",
+          "display_name": "Example actor A",
+          "roles": [
+            "participant",
+            "manager",
+            "administrator"
+          ],
+          "joined_at": "&lt;timestamp&gt;"
+        },
+        {
+          "actor_id": "&lt;actor_id&gt;",
+          "display_name": "Example actor B",
+          "roles": [
+            "participant"
+          ],
+          "joined_at": "&lt;timestamp&gt;"
+        },
+        {
+          "actor_id": "&lt;actor_id&gt;",
+          "display_name": "Example actor C",
+          "roles": [
+            "participant"
+          ],
+          "joined_at": "&lt;timestamp&gt;"
+        }
+      ],
+      "audit_trace_id": "&lt;uuid&gt;"
+    }
+  },
+  {
+    "name": "chorus.request_review",
+    "request": {
+      "session_id": "&lt;session_id&gt;",
+      "task_id": "&lt;task_id&gt;",
+      "expected_version": 3,
+      "revision": 1,
+      "reviewer_actor_id": "&lt;actor_id&gt;",
+      "idempotency_key": "&lt;uuid&gt;"
+    },
+    "response": {
+      "review": {
+        "id": "&lt;review_id&gt;",
+        "stale": false,
+        "state": "requested",
+        "verdict": null,
+        "version": 1,
+        "revision": 1,
+        "verdict_at": null,
+        "reviewer_actor_id": "&lt;actor_id&gt;"
+      },
+      "task_id": "&lt;task_id&gt;",
+      "task_version": 4,
+      "audit_trace_id": "&lt;uuid&gt;"
+    }
+  },
+  {
+    "name": "chorus.list_my_reviews",
+    "request": {
+      "session_id": "&lt;session_id&gt;"
+    },
+    "response": {
+      "items": [
+        {
+          "session_id": "&lt;session_id&gt;",
+          "id": "&lt;review_id&gt;",
+          "version": 1,
+          "task_id": "&lt;task_id&gt;",
+          "room_id": "&lt;uuid&gt;",
+          "task_title": "Example task",
+          "revision": 1,
+          "content_sha256": "&lt;sha256&gt;",
+          "state": "requested",
+          "stale": false,
+          "created_at": "&lt;timestamp&gt;"
+        }
+      ],
+      "next_cursor": null,
+      "audit_trace_id": "&lt;uuid&gt;"
+    }
+  },
+  {
+    "name": "chorus.get_result",
+    "request": {
+      "session_id": "&lt;session_id&gt;",
+      "task_id": "&lt;task_id&gt;",
+      "revision": 1
+    },
+    "response": {
+      "task_id": "&lt;task_id&gt;",
+      "revision": 1,
+      "content_type": "text/markdown",
+      "content": "Both acceptance criteria are met.",
+      "content_sha256": "&lt;sha256&gt;",
+      "byte_length": 56,
+      "criteria_mapping": [
+        {
+          "note": "First criterion verified.",
+          "criterion": 0
+        },
+        {
+          "note": "Second criterion verified.",
+          "criterion": 1
+        }
+      ],
+      "supporting_refs": [],
+      "submitted_by": "&lt;actor_id&gt;",
+      "fence": 1,
+      "created_at": "&lt;timestamp&gt;",
+      "audit_trace_id": "&lt;uuid&gt;"
+    }
+  },
+  {
+    "name": "chorus.review",
+    "request": {
+      "session_id": "&lt;session_id&gt;",
+      "review_id": "&lt;review_id&gt;",
+      "expected_version": 1,
+      "verdict": "approved",
+      "content_sha256": "&lt;sha256&gt;",
+      "idempotency_key": "&lt;uuid&gt;"
+    },
+    "response": {
+      "task": {
+        "id": "&lt;task_id&gt;",
+        "state": "done",
+        "version": 5
+      },
+      "review": {
+        "id": "&lt;review_id&gt;",
+        "stale": false,
+        "state": "approved",
+        "verdict": "approved",
+        "version": 2,
+        "revision": 1,
+        "verdict_at": "&lt;timestamp&gt;",
+        "reviewer_actor_id": "&lt;actor_id&gt;"
+      },
+      "audit_trace_id": "&lt;trace_id&gt;"
+    }
+  },
+  {
+    "name": "chorus.get_task",
+    "request": {
+      "session_id": "&lt;session_id&gt;",
+      "task_id": "&lt;task_id&gt;"
+    },
+    "response": {
+      "id": "&lt;task_id&gt;",
+      "session_id": "&lt;session_id&gt;",
+      "board_id": "&lt;board_id&gt;",
+      "priority": 2,
+      "blocked": null,
+      "work_cycle": 1,
+      "criteria_revision": 1,
+      "claim_policy": "open",
+      "room_id": "&lt;uuid&gt;",
+      "title": "Example task",
+      "body": "",
+      "state": "done",
+      "version": 5,
+      "creator_actor_id": "&lt;actor_id&gt;",
+      "owner_actor_id": "&lt;actor_id&gt;",
+      "acceptance_criteria": [
+        "The first requirement is met.",
+        "The second requirement is met."
+      ],
+      "review_required": true,
+      "shareable": false,
+      "lease": {
+        "fence": 1,
+        "live": false,
+        "expires_at": "&lt;timestamp&gt;",
+        "holder_instance_id": null
+      },
+      "latest_revision": 1,
+      "revisions": [
+        {
+          "revision": 1,
+          "content_sha256": "&lt;sha256&gt;",
+          "content_type": "text/markdown",
+          "byte_length": 56,
+          "submitted_by": "&lt;actor_id&gt;",
+          "fence": 1,
+          "created_at": "&lt;timestamp&gt;"
+        }
+      ],
+      "reviews": [
+        {
+          "id": "&lt;review_id&gt;",
+          "version": 2,
+          "revision": 1,
+          "reviewer_actor_id": "&lt;actor_id&gt;",
+          "state": "approved",
+          "verdict": "approved",
+          "verdict_at": "&lt;timestamp&gt;",
+          "stale": false
+        }
+      ],
+      "created_at": "&lt;timestamp&gt;",
+      "updated_at": "&lt;timestamp&gt;",
+      "audit_trace_id": "&lt;uuid&gt;"
+    }
+  }
+]</code></pre>
       </section>
       <section>
         <h2>8. Arena services</h2>
