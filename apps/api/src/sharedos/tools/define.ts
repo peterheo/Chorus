@@ -143,7 +143,9 @@ export function defineChorusTool(spec: ChorusToolSpec, deps: ToolDeps): ToolHand
         if (
           context.actor.kind !== 'agent' ||
           scope.actorId !== context.actor.agentId ||
-          scope.workspaceId !== context.namespaceId
+          scope.workspaceId !== context.namespaceId ||
+          context.owner.kind !== 'group' ||
+          context.owner.conversationId !== scope.roomId
         ) {
           return failed(call, 'internal_error', 'The request scope does not match the caller.');
         }

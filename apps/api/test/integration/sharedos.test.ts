@@ -158,6 +158,90 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     okOutput(await call(a, 'chorus.get_session', { session_id: sa.id }));
   });
 
+  it('K2b sharedos.enforcement.cross_binding: a session the caller is authorized for cannot address an item of another session', async () => {
+    const owner = await f.actor(ws, 'k2b-owner');
+    const worker = await f.actor(ws, 'k2b-worker');
+    const reviewer = await f.actor(ws, 'k2b-reviewer');
+    const m = await f.actor(ws, 'k2b-m');
+    const sa = await f.session(m); // m manages session A
+    const sb = await f.session(owner);
+    await f.join(sb, worker);
+    await f.join(sb, reviewer);
+    await f.join(sb, m); // m is only a participant in B
+    const task = okOutput(
+      await call(owner, 'chorus.create_task', {
+        session_id: sb.id,
+        board_id: sb.boardId,
+        title: 'B task',
+        acceptance_criteria: ['c'],
+      }),
+    ) as { task: { id: string; version: number } };
+    const claimed = okOutput(
+      await call(worker, 'chorus.claim', {
+        session_id: sb.id,
+        task_id: task.task.id,
+        expected_version: task.task.version,
+      }),
+    ) as { version: number; fence: number };
+    const submitted = okOutput(
+      await call(worker, 'chorus.submit_result', {
+        session_id: sb.id,
+        task_id: task.task.id,
+        expected_version: claimed.version,
+        fence: claimed.fence,
+        content: 'done',
+        content_type: 'text/plain',
+        criteria_mapping: [{ criterion: 0, note: 'ok' }],
+      }),
+    ) as { version: number; content_sha256: string };
+    const requested = okOutput(
+      await call(worker, 'chorus.request_review', {
+        session_id: sb.id,
+        task_id: task.task.id,
+        expected_version: submitted.version,
+        revision: 1,
+        reviewer_actor_id: reviewer.id,
+      }),
+    ) as { review: { id: string; version: number } };
+    const snapshot = async () =>
+      JSON.stringify(
+        await f.owner(
+          `SELECT id, state, version, owner_actor_id FROM work_items WHERE session_id = $1 ORDER BY id`,
+          [sb.id],
+        ),
+      );
+    const before = await snapshot();
+    const commands = await commandCount();
+
+    // Every call is authorized (m holds the role in session A) but names session A with an item of session B.
+    const attempts: [string, Record<string, unknown>][] = [
+      [
+        'chorus.complete',
+        { session_id: sa.id, task_id: task.task.id, expected_version: submitted.version + 1 },
+      ],
+      ['chorus.get_task', { session_id: sa.id, task_id: task.task.id }],
+      ['chorus.get_result', { session_id: sa.id, task_id: task.task.id, revision: 1 }],
+      [
+        'chorus.review',
+        {
+          session_id: sa.id,
+          review_id: requested.review.id,
+          expected_version: requested.review.version,
+          verdict: 'approved',
+          content_sha256: submitted.content_sha256,
+        },
+      ],
+    ];
+    for (const [tool, args] of attempts) {
+      expect(await call(m, tool, args), tool).toMatchObject({
+        status: 'failed',
+        error: { code: 'not_found' },
+      });
+    }
+    expect(await commandCount()).toBe(commands);
+    expect(await snapshot()).toBe(before);
+  });
+
   it('K3 sharedos.enforcement.revocation: role, session and room changes take effect on the next call', async () => {
     const admin = await f.actor(ws, 'k3-admin');
     const session = await f.session(admin);
@@ -403,6 +487,15 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     ).toMatchObject({ status: 'failed', error: { code: 'internal_error' } });
     expect(
       await call(admin, 'chorus.get_session', { session_id: session.id }, { scope: null }),
+    ).toMatchObject({ status: 'failed', error: { code: 'internal_error' } });
+    // A scope whose room is not the authorized context's room also fails closed.
+    expect(
+      await call(
+        admin,
+        'chorus.get_session',
+        { session_id: session.id },
+        { scope: { ...scopeOf(admin), roomId: randomUUID() } },
+      ),
     ).toMatchObject({ status: 'failed', error: { code: 'internal_error' } });
     expect(await commandCount()).toBe(before);
   });
