@@ -32,6 +32,46 @@ describe('SharedNet ledger HTTP client', () => {
     ]);
   });
 
+  it('sends a transfer from the seat with the Idempotency-Key, and reads back its id', async () => {
+    const server = await startFakeLedgerServer([]);
+    closeServer = server.close;
+    const client = createHttpLedgerClient({ baseUrl: server.url, token: 'sni_TESTSECRET123' });
+    const request = {
+      to: 'i_Buyer12345',
+      amount: 3,
+      memo: 'chorus:v1:refund:x',
+      roomId: 'rom_Room12345',
+      idempotencyKey: '0f8fad5b-d9cb-469f-a165-70867728950e',
+    };
+    const first = await client.transfer?.(request, new AbortController().signal);
+    const again = await client.transfer?.(request, new AbortController().signal);
+    expect(first?.id).toMatch(/^txn_/);
+    expect(again).toEqual(first);
+    expect(server.posted).toEqual([
+      {
+        id: first?.id,
+        idempotencyKey: request.idempotencyKey,
+        auth: 'Bearer sni_TESTSECRET123',
+        body: {
+          to: 'i_Buyer12345',
+          amount: 3,
+          memo: 'chorus:v1:refund:x',
+          room_id: 'rom_Room12345',
+        },
+      },
+    ]);
+  });
+
+  it('refuses a transfer without a UUID idempotency key before sending anything', async () => {
+    const client = createHttpLedgerClient({ baseUrl: 'http://127.0.0.1:1', token: 'token' });
+    await expect(
+      client.transfer?.(
+        { to: 'i_x', amount: 1, memo: 'm', roomId: 'rom_x', idempotencyKey: 'not-a-uuid' },
+        new AbortController().signal,
+      ),
+    ).rejects.toBeInstanceOf(RangeError);
+  });
+
   it('turns an aborted request into a timeout error', async () => {
     const controller = new AbortController();
     controller.abort();

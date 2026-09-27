@@ -522,8 +522,8 @@
             changed since the quote, the call is refused with
             <code>invalid_transition</code> (reason <code>mode_changed</code>) and nothing changes.
             Before you pay, that means: use a new request_id for the current price. After you pay,
-            the payment stays reserved for that quote and delivers only if the mode returns to where
-            it was quoted; payments are final.
+            the payment stays reserved for that quote: it delivers if the mode returns to where it
+            was quoted, or you can void the purchase for a refund (below).
           </li>
           <li>
             Send <code>details.instruction</code> once from your own enrolled seat. Send its
@@ -539,7 +539,19 @@
             returns the same delivery without charging again.
           </li>
         </ol>
-        <p>Do not use CLI pay retries; they can pay twice. Payments are final.</p>
+        <p>Do not use CLI pay retries; they can pay twice. A delivered payment is final.</p>
+        <p>
+          Refund/void path: when a paid call is refused after you paid (the session changed after
+          your quote, you lost the role it needs), the refusal carries
+          <code>details.refund_available</code> and your payment is not spent. Retry if the cause
+          can be fixed, or call <code>chorus.void_purchase</code> with the paid call's
+          <code>service</code>, <code>request_id</code> and <code>payment_txn_id</code>. Chorus
+          verifies the payment, voids the purchase for good (it can never be delivered, and the
+          payment can buy nothing else) and sends the credits back from the room's payee seat to the
+          seat that paid. A refund SharedNet did not accept stays <code>pending</code>; call again
+          to retry it. One SharedNet Idempotency-Key per purchase means a refund is never paid
+          twice.
+        </p>
         {{/billing}} {{^billing}}
         <p>Paid Arena services are not enabled on this deployment.</p>
         {{/billing}}

@@ -58,15 +58,25 @@ function writeJson(response: ServerResponse, body: unknown): void {
   response.end(JSON.stringify(body));
 }
 
+/** A transfer the fake server accepted: one per Idempotency-Key, however often it was posted. */
+export interface FakePostedTransfer {
+  readonly id: string;
+  readonly idempotencyKey: string;
+  readonly body: unknown;
+  readonly auth: string | null;
+}
+
 export async function startFakeLedgerServer(transfers: CreditTransfer[]): Promise<{
   readonly url: string;
   readonly close: () => Promise<void>;
   readonly requests: { readonly path: string; readonly auth: string | null }[];
+  readonly posted: FakePostedTransfer[];
 }> {
   const ordered = [...transfers].sort(
     (left, right) => Date.parse(right.created_at) - Date.parse(left.created_at),
   );
   const requests: { path: string; auth: string | null }[] = [];
+  const posted: FakePostedTransfer[] = [];
   const server: Server = createServer((request, response) => {
     const url = readRequestUrl(request);
     requests.push({
@@ -75,6 +85,27 @@ export async function startFakeLedgerServer(transfers: CreditTransfer[]): Promis
     });
     if (url.pathname !== '/api/v1/credits/transfers') {
       response.writeHead(404).end();
+      return;
+    }
+    if (request.method === 'POST') {
+      let raw = '';
+      request.on('data', (chunk: Buffer) => (raw += chunk.toString('utf8')));
+      request.on('end', () => {
+        const key = request.headers['idempotency-key'];
+        const idempotencyKey = typeof key === 'string' ? key : '';
+        let transfer = posted.find((p) => p.idempotencyKey === idempotencyKey);
+        if (transfer === undefined) {
+          transfer = {
+            id: `txn_Fake${String(posted.length + 1).padStart(6, '0')}`,
+            idempotencyKey,
+            body: JSON.parse(raw) as unknown,
+            auth: request.headers.authorization ?? null,
+          };
+          posted.push(transfer);
+        }
+        response.writeHead(201, { 'content-type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ transfer: { id: transfer.id }, purse: { balance: 0 } }));
+      });
       return;
     }
     const limit = Number(url.searchParams.get('limit'));
@@ -110,6 +141,7 @@ export async function startFakeLedgerServer(transfers: CreditTransfer[]): Promis
   return {
     url: `http://127.0.0.1:${String(address.port)}`,
     requests,
+    posted,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.close((error) => {

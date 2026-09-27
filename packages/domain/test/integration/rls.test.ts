@@ -31,6 +31,7 @@ const READABLE = [
   'sharedos_audit_events',
   'purchases',
   'payment_verification_failures',
+  'purchase_refunds',
   'conversation_scans',
   'conversation_suggestions',
   'conversation_engine_state',
@@ -134,6 +135,27 @@ describe('row-level security and definer functions, as the runtime role chorus_a
       `INSERT INTO payment_verification_failures (workspace_id, actor_id, purchase_id, txn_id, reason, observed)
        VALUES ($1, $2, $3, 'txn_RlsSeed01', 'memo', '{}'::jsonb)`,
       [w.ws.id, w.manager.id, purchaseId],
+    );
+    const voidedId = await first(
+      `INSERT INTO purchases (workspace_id, room_id, session_id, board_id, actor_id, requester_member_id, service,
+                              request_id, fingerprint, amount, payee_member_id, payee_principal_id, memo, state, txn_id)
+       VALUES ($1, $2, $3, $4, $5, 'i_BuyerSeat01', 'create_tasks', 'rls-seed-void', $6, 1, 'i_PayeeSeat01',
+               'p_PayeeSeat01', 'chorus:v1:create_tasks:seed-void', 'voided', $7) RETURNING id`,
+      [
+        w.ws.id,
+        w.ws.roomId,
+        w.session.id,
+        w.session.boardId,
+        w.manager.id,
+        sha256('rls-seed-void'),
+        `txn_Void${w.ws.id.replaceAll('-', '').slice(0, 12)}`,
+      ],
+    );
+    await f.owner(
+      `INSERT INTO purchase_refunds (workspace_id, purchase_id, actor_id, txn_id, amount, to_member_id, reason)
+       SELECT workspace_id, id, actor_id, txn_id, amount, requester_member_id, 'buyer_voided'
+         FROM purchases WHERE id = $1`,
+      [voidedId],
     );
     await f.owner(
       `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, instance_id, room_id) VALUES ($1, $2, $3, $4, $5)`,

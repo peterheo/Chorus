@@ -13,10 +13,11 @@ import {
   setCoordinationModeInTx,
   type CreateTaskParams,
   type JsonValue,
+  type ArenaService,
   type TaskSummary,
   type Uuid,
 } from '@chorus/domain';
-import { purchase, type ArenaDeps } from '../../arena/payments.ts';
+import { purchase, voidAndRefund, type ArenaDeps } from '../../arena/payments.ts';
 import { PRICES, coordinationModePrice } from '../../arena/prices.ts';
 import { B, I, S, SA, objectArray, type ChorusToolSpec, type ToolDeps } from './define.ts';
 
@@ -100,8 +101,44 @@ const txnOf = (input: Record<string, unknown>): string | undefined => {
   return typeof value === 'string' ? value : undefined;
 };
 
-/** The three Arena tools (WP5-min section 6, Arena rev 2). Paid tools take a `request_id`, never an `idempotency_key`. */
+const VOIDABLE: ReadonlySet<string> = new Set<ArenaService>([
+  'create_action_board',
+  'create_tasks',
+  'set_coordination_mode',
+]);
+
+/** The Arena tools (WP5-min section 6, Arena rev 2). Paid tools take a `request_id`, never an `idempotency_key`. */
 export const arenaTools: readonly ChorusToolSpec[] = [
+  {
+    name: 'chorus.void_purchase',
+    description:
+      'Refund path for a paid call you paid for but that was never delivered (for example, refused because the session changed after your quote). Voids the purchase and sends its credits back to the seat that paid. Final: the purchase can no longer be delivered. Safe to call again; if the refund is pending, calling again retries it without ever paying twice.',
+    action: 'void_purchase',
+    write: true,
+    idempotency: 'request_id',
+    rateLimit: 'paid',
+    props: { service: S, request_id: S, payment_txn_id: S },
+    required: ['service', 'request_id', 'payment_txn_id'],
+    path: room,
+    run: ({ command, input, deps }) => {
+      const service = input['service'];
+      if (typeof service !== 'string' || !VOIDABLE.has(service)) {
+        throw invalid(
+          'service must be create_action_board, create_tasks or set_coordination_mode.',
+          'service',
+        );
+      }
+      const txn = txnOf(input);
+      if (txn === undefined) throw invalid('payment_txn_id is required.', 'payment_txn_id');
+      return voidAndRefund(
+        arenaOf(deps),
+        command,
+        service as ArenaService,
+        requestIdOf(input),
+        txn,
+      );
+    },
+  },
   {
     name: 'chorus.room_pulse',
     description:

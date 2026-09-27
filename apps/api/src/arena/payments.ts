@@ -3,9 +3,12 @@ import {
   ChorusError,
   deliverPurchase,
   findPurchase,
+  findRefund,
   purchaseFingerprint,
   quotePurchase,
+  recordRefundSent,
   recordVerificationFailure,
+  voidPurchase,
   withReadTx,
   type ArenaService,
   type CommandContext,
@@ -13,10 +16,16 @@ import {
   type JsonValue,
   type Purchase,
   type PurchaseEffect,
+  type PurchaseRefund,
   type ReadContext,
   type Uuid,
 } from '@chorus/domain';
-import { createHttpLedgerClient, verifyPayment, type LedgerClient } from '@chorus/sharednet-ledger';
+import {
+  createHttpLedgerClient,
+  LedgerUnavailableError,
+  verifyPayment,
+  type LedgerClient,
+} from '@chorus/sharednet-ledger';
 import { openSecret } from '../secrets.ts';
 
 /** The room a purchase is made in, as a ledger factory needs to know it. */
@@ -158,7 +167,22 @@ export async function purchase(
         effect: neverRun,
       });
     }
-    request.checkQuoted?.(existing);
+    if (existing.state === 'voided') {
+      throw new ChorusError(
+        'invalid_transition',
+        'This purchase was voided and its payment refunded.',
+        {
+          details: { reason: 'purchase_voided' },
+        },
+      );
+    }
+    try {
+      request.checkQuoted?.(existing);
+    } catch (error) {
+      throw request.paymentTxnId === undefined
+        ? error
+        : withVoidHint(error, existing, request.paymentTxnId);
+    }
     return settle(deps, cmd, read, existing, request.paymentTxnId, effect, request.sessionLock);
   }
 
@@ -192,13 +216,33 @@ async function settle(
   const externalRoomId = await externalRoomIdOf(read, quoted.room_id as Uuid);
   if (txnId === undefined) throw paymentRequired(deps, quoted, externalRoomId);
 
-  // Verification talks to the network: no transaction and no pooled connection is held while it runs.
-  const ledger = await deps.ledgerFor({
-    workspaceId: read.workspaceId,
-    actorId: read.actorId,
-    roomId: quoted.room_id as Uuid,
-    externalRoomId,
-  });
+  await verifyFor(deps, cmd, read, quoted, txnId, externalRoomId);
+  try {
+    return await deliverPurchase(cmd, {
+      purchase: quoted,
+      txn_id: txnId,
+      effect,
+      ...(sessionLock === undefined ? {} : { sessionLock }),
+    });
+  } catch (error) {
+    throw withVoidHint(error, quoted, txnId);
+  }
+}
+
+/**
+ * Verifies that `txnId` pays exactly for `quoted`, against the ledger and OUTSIDE any transaction (no pooled
+ * connection is held while it runs). Returns when verified; otherwise throws the buyer-facing payment error,
+ * recording why a present-but-wrong payment was refused.
+ */
+async function verifyFor(
+  deps: ArenaDeps,
+  cmd: CommandContext,
+  read: ReadContext,
+  quoted: Purchase,
+  txnId: string,
+  externalRoomId: string,
+): Promise<void> {
+  const ledger = await ledgerOf(deps, read, quoted, externalRoomId);
   const verdict = await verifyPayment(
     ledger,
     {
@@ -216,12 +260,7 @@ async function settle(
   );
   switch (verdict.status) {
     case 'verified':
-      return deliverPurchase(cmd, {
-        purchase: quoted,
-        txn_id: txnId,
-        effect,
-        ...(sessionLock === undefined ? {} : { sessionLock }),
-      });
+      return;
     case 'not_found':
       throw new ChorusError('payment_not_found', 'The payment is not visible in the ledger yet.', {
         details: {
@@ -245,6 +284,164 @@ async function settle(
       });
   }
 }
+
+const ledgerOf = async (
+  deps: ArenaDeps,
+  read: ReadContext,
+  purchase: Purchase,
+  externalRoomId: string,
+): Promise<LedgerClient> =>
+  deps.ledgerFor({
+    workspaceId: read.workspaceId,
+    actorId: read.actorId,
+    roomId: purchase.room_id as Uuid,
+    externalRoomId,
+  });
+
+/**
+ * A paid delivery that was refused for good (not a transient error, not a payment another purchase holds)
+ * keeps its payment unspent, so the refusal tells the buyer both ways out: retry, or void for a refund.
+ */
+function withVoidHint(error: unknown, quoted: Purchase, txnId: string): unknown {
+  if (
+    !(error instanceof ChorusError) ||
+    error.retryable ||
+    error.code === 'internal_error' ||
+    error.code === 'payment_already_used' ||
+    (error.code === 'invalid_transition' && error.details['reason'] === 'purchase_voided')
+  )
+    return error;
+  return new ChorusError(error.code, error.message, {
+    cause: error,
+    details: {
+      ...error.details,
+      refund_available: {
+        tool: 'chorus.void_purchase',
+        arguments: {
+          service: quoted.service,
+          request_id: quoted.request_id,
+          payment_txn_id: txnId,
+        },
+        note: 'Your payment is not spent. Retry if the refusal can be fixed, or void the purchase to get the credits back.',
+      },
+    },
+  });
+}
+
+/** What `chorus.void_purchase` returns: the voided purchase and where its refund stands. */
+export type VoidedResponse = {
+  state: 'VOIDED';
+  service: ArenaService;
+  request_id: string;
+  purchase_id: string;
+  amount: number;
+  txn_id: string;
+  refund: {
+    state: 'sent' | 'pending';
+    amount: number;
+    to_member_id: string;
+    refund_txn_id: string | null;
+    sent_at: string | null;
+    /** Why a pending refund was not sent yet; calling void_purchase again retries it. */
+    pending_cause?: string;
+  };
+};
+
+const REFUND_BUDGET_MS = 10_000;
+
+/**
+ * Voids a paid purchase that was never delivered, and refunds it (the refund/void path). The purchase must be
+ * the caller's own and `payment_txn_id` must verify as its payment, exactly as for a delivery. Voiding is
+ * final: the purchase can no longer be delivered and the payment can buy nothing else. The refund is sent
+ * from the room's payee seat to the seat that paid, with one SharedNet Idempotency-Key per purchase, so
+ * calling this again (for example after a network failure left the refund pending) never pays twice.
+ */
+export async function voidAndRefund(
+  deps: ArenaDeps,
+  ctx: CommandContext,
+  service: ArenaService,
+  requestId: string,
+  paymentTxnId: string,
+): Promise<VoidedResponse> {
+  if (!REQUEST_ID.test(requestId)) {
+    throw new ChorusError('invalid_request', 'request_id must match ^[A-Za-z0-9._:-]{1,100}$.');
+  }
+  if (!TXN_ID.test(paymentTxnId)) {
+    throw new ChorusError('invalid_request', 'payment_txn_id must match ^txn_[A-Za-z0-9]{6,64}$.');
+  }
+  const read: ReadContext = { pool: deps.pool, workspaceId: ctx.workspaceId, actorId: ctx.actorId };
+  const cmd: CommandContext = { ...ctx, pool: deps.pool };
+  const existing = await findPurchase(read, service, requestId);
+  if (existing === undefined) throw new ChorusError('not_found', 'Not found.');
+  if (existing.state === 'delivered') {
+    throw new ChorusError('invalid_transition', 'A delivered purchase cannot be voided.', {
+      details: { reason: 'delivered' },
+    });
+  }
+  const externalRoomId = await externalRoomIdOf(read, existing.room_id as Uuid);
+  let refund: PurchaseRefund;
+  if (existing.state === 'voided') {
+    if (existing.txn_id !== paymentTxnId) throw alreadyVoided();
+    const stored = await findRefund(read, existing.id);
+    if (stored === undefined)
+      throw new ChorusError('internal_error', 'A voided purchase has no refund.');
+    refund = stored;
+  } else {
+    await verifyFor(deps, cmd, read, existing, paymentTxnId, externalRoomId);
+    refund = await voidPurchase(cmd, {
+      purchase: existing,
+      txn_id: paymentTxnId,
+      reason: 'buyer_voided',
+    });
+  }
+
+  let pendingCause: string | undefined;
+  if (refund.refund_txn_id === null) {
+    // Sending talks to the network: outside any transaction, and recorded only after SharedNet accepted it.
+    try {
+      const ledger = await ledgerOf(deps, read, existing, externalRoomId);
+      if (ledger.transfer === undefined) {
+        pendingCause = 'refunds_unsupported';
+      } else {
+        const sent = await ledger.transfer(
+          {
+            to: refund.to_member_id,
+            amount: refund.amount,
+            memo: `chorus:v1:refund:${existing.id}`,
+            roomId: externalRoomId,
+            idempotencyKey: refund.transfer_key,
+          },
+          AbortSignal.timeout(REFUND_BUDGET_MS),
+        );
+        refund = await recordRefundSent(cmd, { purchase_id: existing.id, refund_txn_id: sent.id });
+      }
+    } catch (error) {
+      if (error instanceof LedgerUnavailableError) pendingCause = error.cause_code;
+      else if (error instanceof ChorusError && error.code === 'room_not_available')
+        pendingCause = 'room_not_available';
+      else throw error;
+    }
+  }
+  return {
+    state: 'VOIDED',
+    service: existing.service,
+    request_id: existing.request_id,
+    purchase_id: existing.id,
+    amount: existing.amount,
+    txn_id: refund.txn_id,
+    refund: {
+      state: refund.refund_txn_id === null ? 'pending' : 'sent',
+      amount: refund.amount,
+      to_member_id: refund.to_member_id,
+      refund_txn_id: refund.refund_txn_id,
+      sent_at: refund.sent_at,
+      ...(pendingCause === undefined ? {} : { pending_cause: pendingCause }),
+    },
+  };
+}
+
+const alreadyVoided = (): ChorusError =>
+  new ChorusError('payment_already_used', 'This purchase was voided with a different payment.');
 
 const neverRun: PurchaseEffect = () => {
   throw new ChorusError('internal_error', 'A delivered purchase must never re-run its effect.');
@@ -281,7 +478,7 @@ function paymentRequired(deps: ArenaDeps, quoted: Purchase, externalRoomId: stri
       },
       then: 'call this tool again with the same arguments plus payment_txn_id = transfer.id from the 201 response',
       warning:
-        "Do not use a CLI 'pay' retry; it generates a new idempotency key per call and can pay twice. Payments are final.",
+        "Do not use a CLI 'pay' retry; it generates a new idempotency key per call and can pay twice. Payments are final once delivered; a paid purchase that cannot be delivered can be voided with chorus.void_purchase for a refund.",
     },
   });
 }

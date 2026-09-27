@@ -40,13 +40,15 @@ export type SessionAction =
   | 'administer';
 
 /** Room-level actions of a verified room member (SharedOS grant mapping); they need no session membership. */
-export type RoomAction = 'read_sessions' | 'create_session' | 'join_session' | 'pulse';
+export type RoomAction =
+  'read_sessions' | 'create_session' | 'join_session' | 'pulse' | 'void_purchase';
 
 export const ROOM_ACTIONS: readonly RoomAction[] = [
   'read_sessions',
   'create_session',
   'join_session',
   'pulse',
+  'void_purchase',
 ];
 
 export const ROLE_ACTIONS: Readonly<Record<SessionRole, readonly SessionAction[]>> = {

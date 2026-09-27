@@ -17,11 +17,27 @@ export interface LedgerPage {
   readonly has_more: boolean;
 }
 
+export interface TransferRequest {
+  /** The receiving seat (`i_…`). */
+  readonly to: string;
+  readonly amount: number;
+  readonly memo: string;
+  /** The SharedNet room (`rom_…`) the transfer is made in. */
+  readonly roomId: string;
+  /** SharedNet's Idempotency-Key (a UUID): every retry of one transfer must reuse it. */
+  readonly idempotencyKey: string;
+}
+
 export interface LedgerClient {
   listTransfers(
     args: { readonly limit: number; readonly before?: string },
     signal: AbortSignal,
   ): Promise<LedgerPage>;
+  /**
+   * Sends credits from the client's own seat (Chorus uses it only for refunds). Optional so a read-only
+   * ledger (tests, fakes) needs no stub; a client without it cannot refund, and the refund stays pending.
+   */
+  transfer?(request: TransferRequest, signal: AbortSignal): Promise<{ readonly id: string }>;
 }
 
 export interface HttpLedgerClientOptions {
@@ -100,11 +116,74 @@ function parsePage(value: unknown): LedgerPage {
   };
 }
 
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function createHttpLedgerClient(options: HttpLedgerClientOptions): LedgerClient {
   const fetchImpl = options.fetchImpl ?? fetch;
   const timeoutMs = options.timeoutMs ?? 10_000;
 
+  /** One request with the shared timeout, error mapping and JSON parsing. */
+  async function call(url: URL, init: RequestInit, signal: AbortSignal): Promise<unknown> {
+    const combinedSignal = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
+    let response: Response;
+    try {
+      response = await fetchImpl(url, { ...init, signal: combinedSignal });
+    } catch (error) {
+      if (combinedSignal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+        throw new LedgerUnavailableError('timeout');
+      }
+      throw new LedgerUnavailableError('network');
+    }
+    if (!response.ok) {
+      if (response.status === 429) throw new LedgerUnavailableError('rate_limited');
+      throw new LedgerUnavailableError('http_status', response.status);
+    }
+    try {
+      return await response.json();
+    } catch (error) {
+      if (combinedSignal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+        throw new LedgerUnavailableError('timeout');
+      }
+      throw new LedgerUnavailableError('contract_mismatch');
+    }
+  }
+
   return {
+    async transfer(request, signal): Promise<{ readonly id: string }> {
+      if (!Number.isInteger(request.amount) || request.amount < 1) {
+        throw new RangeError('amount must be a positive integer.');
+      }
+      if (!uuidPattern.test(request.idempotencyKey)) {
+        throw new RangeError('idempotencyKey must be a UUID.');
+      }
+      const body = await call(
+        new URL('/api/v1/credits/transfers', options.baseUrl),
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${options.token}`,
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'Idempotency-Key': request.idempotencyKey,
+          },
+          body: JSON.stringify({
+            to: request.to,
+            amount: request.amount,
+            memo: request.memo,
+            room_id: request.roomId,
+          }),
+        },
+        signal,
+      );
+      // 201: `{ transfer, purse }`; only the transfer's id is needed.
+      const transfer = isRecord(body) ? body['transfer'] : undefined;
+      const id = isRecord(transfer) ? transfer['id'] : undefined;
+      if (typeof id !== 'string' || !beforePattern.test(id)) {
+        throw new LedgerUnavailableError('contract_mismatch');
+      }
+      return { id };
+    },
+
     async listTransfers(args, signal): Promise<LedgerPage> {
       if (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100) {
         throw new RangeError('limit must be an integer from 1 through 100.');
@@ -116,35 +195,11 @@ export function createHttpLedgerClient(options: HttpLedgerClientOptions): Ledger
       const url = new URL('/api/v1/credits/transfers', options.baseUrl);
       url.searchParams.set('limit', String(args.limit));
       if (args.before !== undefined) url.searchParams.set('before', args.before);
-      const timeoutSignal = AbortSignal.timeout(timeoutMs);
-      const combinedSignal = AbortSignal.any([signal, timeoutSignal]);
-
-      let response: Response;
-      try {
-        response = await fetchImpl(url, {
-          headers: { Authorization: `Bearer ${options.token}`, Accept: 'application/json' },
-          signal: combinedSignal,
-        });
-      } catch (error) {
-        if (combinedSignal.aborted || (error instanceof Error && error.name === 'AbortError')) {
-          throw new LedgerUnavailableError('timeout');
-        }
-        throw new LedgerUnavailableError('network');
-      }
-      if (!response.ok) {
-        if (response.status === 429) throw new LedgerUnavailableError('rate_limited');
-        throw new LedgerUnavailableError('http_status', response.status);
-      }
-
-      let body: unknown;
-      try {
-        body = await response.json();
-      } catch (error) {
-        if (combinedSignal.aborted || (error instanceof Error && error.name === 'AbortError')) {
-          throw new LedgerUnavailableError('timeout');
-        }
-        throw new LedgerUnavailableError('contract_mismatch');
-      }
+      const body = await call(
+        url,
+        { headers: { Authorization: `Bearer ${options.token}`, Accept: 'application/json' } },
+        signal,
+      );
       return parsePage(body);
     },
   };
