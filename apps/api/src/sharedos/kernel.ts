@@ -28,6 +28,7 @@ export function createChorusKernel(deps: ChorusKernelDeps): {
   for (const tool of chorusTools({
     pool: deps.pool,
     leaseDurationSeconds: deps.leaseDurationSeconds,
+    gitCommit: deps.gitCommit,
     logger: deps.logger,
   })) {
     kernel.registerTool(tool);

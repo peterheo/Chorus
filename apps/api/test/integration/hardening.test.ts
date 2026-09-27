@@ -6,6 +6,7 @@ import { buildApp } from '../../src/app.ts';
 import { ConfigError } from '../../src/config.ts';
 import { assertRuntimeRole } from '../../src/runtime-role.ts';
 import { openSecret } from '../../src/secrets.ts';
+import { SharedNetClient } from '../../src/sharednet/client.ts';
 import { startStack, SHAREDNET_ROOM, type Stack } from '../helpers/stack.ts';
 
 describe('rate limits, startup guards, health and logging', () => {
@@ -64,12 +65,17 @@ describe('rate limits, startup guards, health and logging', () => {
   it('http.healthz: reports commit, database and room watcher state; 503 when the database is down', async () => {
     const health = await fetch(`${s.baseUrl}/healthz`);
     expect(health.status).toBe(200);
-    expect(await health.json()).toMatchObject({
+    const text = await health.text();
+    expect(JSON.parse(text)).toEqual({
       status: 'ok',
       commit: 'abc1234',
       db: 'ok',
-      rooms: [{ sharednet_room_id: SHAREDNET_ROOM, activation_state: 'active', watcher_ok: true }],
+      audit_write_failures: 0,
+      rooms_active: 1,
+      watcher_ok_rooms: 1,
     });
+    // Counts only: a public health check never names a room.
+    expect(text).not.toContain(SHAREDNET_ROOM);
 
     // A pool that cannot reach any database.
     const dead = new pg.Pool({
@@ -85,6 +91,10 @@ describe('rate limits, startup guards, health and logging', () => {
         gitCommit: 'deadbee',
       },
       pool: dead,
+      sharednet: {
+        client: new SharedNetClient({ baseUrl: 'http://127.0.0.1:1' }),
+        secretsKey: s.secretsKey,
+      },
       logStream: new Writable({
         write: (_c, _e, cb) => {
           cb();

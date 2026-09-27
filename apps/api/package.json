@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@aicoo/sharedos": "0.1.0-alpha.5",
+    "@aicoo/sharedos-mcp": "0.1.0-alpha.5",
     "@chorus/database": "workspace:*",
     "@chorus/domain": "workspace:*",
     "fastify": "5.12.5",

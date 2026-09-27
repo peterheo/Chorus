@@ -19,6 +19,19 @@ export interface WaitPage {
   readonly hasMore: boolean;
 }
 
+export interface JoinResult {
+  /** The seat's `sni_` token. Sensitive: sealed at rest, never logged. */
+  readonly memberToken: string;
+  /** The highest sequence in the join's history, or 0 when it is empty. */
+  readonly lastSequence: number;
+}
+
+export interface SeatIdentity {
+  /** `instance.id` (`i_…`): what the watcher matches `sender.member_id` against. */
+  readonly memberId: string;
+  readonly principalId: string;
+}
+
 export class SharedNetAuthError extends Error {
   override readonly name = 'SharedNetAuthError';
 }
@@ -45,6 +58,57 @@ export class SharedNetClient {
     this.baseUrl = options.baseUrl.replace(/\/$/, '');
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = options.timeoutMs ?? 35_000;
+  }
+
+  /**
+   * Joins an existing room with an invite and returns the seat's member token plus the highest history
+   * sequence (0 when empty). Only the documented fields are used; anything missing or mistyped is a contract
+   * violation. 401/403/404 are `SharedNetAuthError` (the invite was refused); the invite is never echoed.
+   */
+  async join(roomId: string, inviteToken: string, signal?: AbortSignal): Promise<JoinResult> {
+    const url = `${this.baseUrl}/api/v1/rooms/${encodeURIComponent(roomId)}/join`;
+    const body = await this.request(url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${inviteToken}`,
+        accept: 'application/json',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ name: 'chorus', runtime: { kind: 'chorus-service' } }),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    return parseJoin(body);
+  }
+
+  /** The identity of the seat that owns `memberToken` (`GET /api/v1/instances/current`). */
+  async currentInstance(memberToken: string, signal?: AbortSignal): Promise<SeatIdentity> {
+    const url = `${this.baseUrl}/api/v1/instances/current`;
+    const body = await this.request(url, {
+      headers: { authorization: `Bearer ${memberToken}`, accept: 'application/json' },
+      ...(signal === undefined ? {} : { signal }),
+    });
+    return parseInstance(body);
+  }
+
+  private async request(url: string, init: RequestInit): Promise<unknown> {
+    const timeout = AbortSignal.timeout(this.timeoutMs);
+    const response = await this.fetchImpl(url, {
+      ...init,
+      signal: init.signal == null ? timeout : AbortSignal.any([init.signal, timeout]),
+    });
+    if (response.status === 401 || response.status === 403 || response.status === 404) {
+      throw new SharedNetAuthError(
+        `SharedNet refused the request (HTTP ${String(response.status)}).`,
+      );
+    }
+    if (!response.ok) {
+      throw new SharedNetHttpError(`SharedNet returned HTTP ${String(response.status)}.`);
+    }
+    try {
+      return await response.json();
+    } catch {
+      throw new SharedNetContractError('SharedNet returned a non-JSON body.');
+    }
   }
 
   async wait(
@@ -121,4 +185,45 @@ export function parsePage(body: unknown, after: number): WaitPage {
     });
   }
   return { messages, hasMore: page['has_more'] === true };
+}
+
+const MEMBER_TOKEN = /^sni_[A-Za-z0-9_-]{16,256}$/;
+const MEMBER_ID = /^i_[A-Za-z0-9]{6,64}$/;
+const PRINCIPAL_ID = /^p_[A-Za-z0-9]{6,64}$/;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+export function parseJoin(body: unknown): JoinResult {
+  if (!isRecord(body)) fail('join body is not an object');
+  const token = body['member_token'];
+  if (typeof token !== 'string' || !MEMBER_TOKEN.test(token)) fail('join member_token is invalid');
+  const history = body['history'];
+  if (!isRecord(history) || !Array.isArray(history['items'])) fail('join history.items is missing');
+  let lastSequence = 0;
+  for (const item of history['items'] as unknown[]) {
+    const sequence = isRecord(item) ? item['sequence'] : undefined;
+    if (typeof sequence !== 'number' || !Number.isSafeInteger(sequence) || sequence < 0) {
+      fail('a join history item has an invalid sequence');
+    }
+    lastSequence = Math.max(lastSequence, sequence);
+  }
+  return { memberToken: token, lastSequence };
+}
+
+export function parseInstance(body: unknown): SeatIdentity {
+  if (!isRecord(body)) fail('instances/current body is not an object');
+  const principal = body['principal'];
+  const instance = body['instance'];
+  if (!isRecord(principal) || !isRecord(instance))
+    fail('instances/current lacks principal or instance');
+  const memberId = instance['id'];
+  const principalId = instance['principal_id'];
+  if (typeof memberId !== 'string' || !MEMBER_ID.test(memberId)) fail('instance.id is invalid');
+  if (typeof principalId !== 'string' || !PRINCIPAL_ID.test(principalId)) {
+    fail('instance.principal_id is invalid');
+  }
+  if (principal['id'] !== principalId) fail('principal.id does not match instance.principal_id');
+  if (instance['revoked_at'] !== null) fail('the instance is revoked or revoked_at is missing');
+  return { memberId, principalId };
 }

@@ -111,12 +111,13 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     expect(asAdmin).toEqual(
       expect.arrayContaining([...ADMIN_ONLY, 'chorus.complete', 'chorus.create_board']),
     );
-    expect(asAdmin).toHaveLength(23);
+    expect(asAdmin).toHaveLength(24);
 
     expect(await toolNames(roomOnly)).toEqual([
       'chorus.create_session',
       'chorus.join_session',
       'chorus.list_sessions',
+      'chorus.whoami',
     ]);
     // A stranger to the room sees nothing at all.
     const stranger = await f.actor(ws, 'k1-stranger', { inRoom: false });
