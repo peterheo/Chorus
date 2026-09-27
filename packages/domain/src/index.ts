@@ -121,3 +121,11 @@ export {
   type PurchaseEffectResult,
   type QuoteArgs,
 } from './arena/purchases.ts';
+export {
+  rulesV1,
+  type ExtractOptions,
+  type ExtractedSuggestion,
+  type Extractor,
+  type SourceMessage,
+  type SuggestionKind,
+} from './conversation/extract.ts';
