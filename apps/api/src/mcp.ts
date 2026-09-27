@@ -4,7 +4,7 @@ import type { SharedOSKernel } from '@aicoo/sharedos';
 import { McpToolServer, kernelToolBridge } from '@aicoo/sharedos-mcp';
 import { extractBearer, resolveToken, type AuthContext } from './auth.ts';
 import { sendError } from './http.ts';
-import { MCP_INSTRUCTIONS } from './instructions.ts';
+import { mcpInstructions } from './instructions.ts';
 import { keepFailureDetails } from './mcp-errors.ts';
 import type { RateLimiter } from './rate-limit.ts';
 import { buildAccessContext } from './sharedos/access-context.ts';
@@ -14,6 +14,8 @@ export interface McpDeps {
   readonly pool: pg.Pool;
   readonly kernel: SharedOSKernel;
   readonly version: string;
+  /** Selects the MCP instructions text: with billing on, the free create tools are not registered. */
+  readonly billing: 'enabled' | 'disabled';
   readonly perToken: RateLimiter;
   /** Records the caller (and the tool, for `tools/call`) for the access-log line. */
   readonly note: (request: FastifyRequest, fields: { actorId?: string; tool?: string }) => void;
@@ -104,7 +106,7 @@ export function registerMcpRoutes(app: FastifyInstance, deps: McpDeps): void {
           const server = new McpToolServer({
             invoker: details.invoker,
             serverInfo: { name: 'chorus', version: deps.version },
-            instructions: MCP_INSTRUCTIONS,
+            instructions: mcpInstructions(deps.billing),
           });
           return server.handle(body, abort.signal);
         });

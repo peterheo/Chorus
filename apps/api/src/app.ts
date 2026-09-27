@@ -194,6 +194,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     pool,
     kernel,
     version: options.version ?? '0.0.0',
+    billing,
     perToken: new RateLimiter({ limit: limits.mcpPerTokenPerMinute, windowMs: 60_000 }),
     note,
   });
