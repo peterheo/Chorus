@@ -77,6 +77,32 @@ describe('fetchConversationWindow', () => {
     expect(result.cutoffSequence).toBe(16);
   });
 
+  it('accepts a null or missing sender name and shows the member id instead', async () => {
+    const unnamed = { ...message(11), sender: { member_id: 'i_UNNAMED1', name: null } };
+    const nameless = { ...message(12), sender: { member_id: 'i_NONAME12' } };
+    const fetchImpl = answering(() =>
+      response({ items: [message(10), unnamed, nameless], has_more: false, next_cursor: 12 }),
+    );
+
+    const result = await fetchConversationWindow(args(fetchImpl));
+
+    expect(result.messages.map((item) => item.sender_name)).toEqual([
+      'Member',
+      'i_UNNAMED1',
+      'i_NONAME12',
+    ]);
+  });
+
+  it('still rejects a sender name that is neither a string nor null', async () => {
+    const bad = { ...message(10), sender: { member_id: 'i_ABCDEF12', name: 42 } };
+    const fetchImpl = answering(() => response({ items: [bad], has_more: false, next_cursor: 10 }));
+
+    const error = await failureOf(fetchConversationWindow(args(fetchImpl)));
+
+    expect(error).toBeInstanceOf(ChorusError);
+    expect((error as ChorusError).details).toMatchObject({ cause: 'contract_mismatch' });
+  });
+
   it('never reports a cutoff beyond the window, and from - 1 when nothing in it was examined', async () => {
     const busy = await fetchConversationWindow(
       args(

@@ -60,7 +60,7 @@ function parsePage(value: unknown): readonly [PageItem[], boolean, string | numb
       !member.startsWith('i_') ||
       typeof principal !== 'string' ||
       !principal.startsWith('p_') ||
-      typeof name !== 'string' ||
+      !(name === null || name === undefined || typeof name === 'string') ||
       typeof content !== 'string' ||
       !(reply === null || typeof reply === 'string') ||
       typeof raw['type'] !== 'string'
@@ -72,7 +72,8 @@ function parsePage(value: unknown): readonly [PageItem[], boolean, string | numb
       sequence,
       sender_member_id: member,
       sender_principal_id: principal,
-      sender_name: name,
+      // SharedNet's sender.name is nullable (an unnamed seat); show the member id in its place.
+      sender_name: typeof name === 'string' ? name : member,
       content,
       reply_to_message_id: reply,
       type: raw['type'],
