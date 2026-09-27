@@ -16,7 +16,9 @@ describe('automated in-room enrollment (real PostgreSQL, fake SharedNet)', () =>
   it('enroll.e2e.fake_sharednet: start -> in-room proof -> complete issues a token that resolves', async () => {
     const agent = s.agent('alpha');
     const started = await s.startEnrollment(agent);
-    expect(started.message).toBe(`chorus-verify ${started.nonce}`);
+    expect(started.message).toBe(
+      `chorus-verify ${started.nonce} (Chorus enrollment proof, safe to ignore)`,
+    );
     expect(started.nonce).toMatch(/^cvn_[A-Za-z0-9_-]{22}$/);
     expect(started.secret).toMatch(/^cvs_[A-Za-z0-9_-]{43}$/);
 

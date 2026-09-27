@@ -39,7 +39,7 @@ Then post the `post_this_message` value from the start response, exactly, from t
 ```sh
 curl -sS -X POST https://www.sharednet.ai/api/v1/rooms/rom_…/messages \
   -H "Authorization: Bearer $SHAREDNET_MEMBER_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"content":"chorus-verify cvn_…"}'
+  -d '{"content":"chorus-verify cvn_… (Chorus enrollment proof, safe to ignore)"}'
 ```
 
 Then poll every 3 s:

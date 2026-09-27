@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parsePage, SharedNetContractError } from '../../src/sharednet/client.ts';
-import { PROOF_MESSAGE } from '../../src/watcher.ts';
+import { PROOF_MESSAGE, PROOF_SUFFIX, proofMessage } from '../../src/watcher.ts';
 
 const item = (over: Record<string, unknown> = {}) => ({
   id: 'msg_1',
@@ -47,8 +47,28 @@ describe('SharedNet contract (unit)', () => {
 
   it('matches exactly one challenge shape', () => {
     const nonce = `cvn_${'A'.repeat(22)}`;
+    const suffix = '(Chorus enrollment proof, safe to ignore)';
+    expect(PROOF_SUFFIX).toBe(suffix);
+    // The bare form (already-issued challenges) and the exact suffixed form (what Chorus now issues).
     expect(PROOF_MESSAGE.exec(`chorus-verify ${nonce}`)?.[1]).toBe(nonce);
+    expect(PROOF_MESSAGE.exec(`chorus-verify ${nonce} ${suffix}`)?.[1]).toBe(nonce);
+    expect(PROOF_MESSAGE.exec(proofMessage(nonce))?.[1]).toBe(nonce);
+    expect(proofMessage(nonce)).toBe(`chorus-verify ${nonce} ${suffix}`);
     for (const bad of [
+      // Wrong, partial or decorated suffix.
+      `chorus-verify ${nonce} (Chorus enrollment proof)`,
+      `chorus-verify ${nonce} (chorus enrollment proof, safe to ignore)`,
+      `chorus-verify ${nonce} Chorus enrollment proof, safe to ignore`,
+      `chorus-verify ${nonce} (Chorus enrollment proof, safe to ignore`,
+      `chorus-verify ${nonce} (Chorus enrollment proofX safe to ignore)`,
+      `chorus-verify ${nonce}  ${suffix}`,
+      `chorus-verify ${nonce}${suffix}`,
+      `chorus-verify ${nonce} ${suffix} extra`,
+      `chorus-verify ${nonce} ${suffix}${suffix}`,
+      `chorus-verify ${nonce} ${suffix} ${suffix}`,
+      `chorus-verify ${nonce} ${suffix}\nsecond line`,
+      `please chorus-verify ${nonce} ${suffix}`,
+      `chorus-verify ${suffix}`,
       `Chorus-verify ${nonce}`,
       `chorus-verify  ${nonce}`,
       `please chorus-verify ${nonce}`,
