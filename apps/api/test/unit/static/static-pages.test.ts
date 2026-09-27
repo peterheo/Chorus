@@ -111,27 +111,47 @@ describe('static entry pages', () => {
   });
 
   it('contains none of the forbidden strings in either billing variant', async () => {
+    const evidenceLinkPattern = /evidence link/iu;
+    const secretPattern = /sni_/u;
     const forbidden = [
       /cht_[^…]/u,
       /cvs_[^…]/u,
       /rit_[^…]/u,
-      /sni_/u,
+      secretPattern,
       /snk_/u,
       /ev1\./u,
       /trycloudflare/iu,
       /operator/iu,
       /invite code/iu,
       /request access/iu,
-      /evidence link/iu,
+      evidenceLinkPattern,
       /Chorus creates/iu,
     ];
+    const forbiddenMatches = (content: string) =>
+      forbidden.filter((pattern) => {
+        const scanned =
+          pattern === evidenceLinkPattern
+            ? content.replace(/Not yet available:[^\n]*/gu, '')
+            : content;
+        return pattern.test(scanned);
+      });
+    expect(forbiddenMatches('Not yet available: evidence links and sni_x')).toContain(
+      secretPattern,
+    );
+    expect(forbiddenMatches('Not yet available: evidence links')).toEqual([]);
     for (const billingEnabled of [true, false]) {
       const pages = await fetchPages(billingEnabled);
       for (const content of [pages.html, pages.llms]) {
-        const scannable = content.replace(/Not yet available:[^\n]*/gu, '');
-        for (const pattern of forbidden) expect(scannable).not.toMatch(pattern);
+        expect(forbiddenMatches(content)).toEqual([]);
       }
     }
+  });
+
+  it('renders the connect command as one exact curl friendly line', async () => {
+    const pages = await fetchPages(true);
+    expect(pages.html).toContain(
+      'claude mcp add --transport http chorus https://chorus.example.test/mcp --header "Authorization: Bearer $CHORUS_TOKEN"',
+    );
   });
 
   it('documents only the exact JSON keys in each curl body', async () => {

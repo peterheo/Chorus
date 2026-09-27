@@ -41,7 +41,7 @@ function renderTemplate(template: string, publicBaseUrl: string, billingEnabled:
     .replace(/{{\^billing}}([\s\S]*?){{\/billing}}/g, (_block, content: string) =>
       billingEnabled ? '' : content,
     )
-    .replaceAll('{{PUBLIC_BASE_URL}}', publicBaseUrl);
+    .replaceAll('{{PUBLIC_BASE_URL}}', () => publicBaseUrl);
   if (withBilling.includes('{{')) {
     throw new Error('Static page template contains an unsupported token.');
   }
