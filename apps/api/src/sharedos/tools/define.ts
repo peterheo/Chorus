@@ -33,9 +33,27 @@ export interface ToolDeps {
 
 type Args = Record<string, unknown>;
 type PropType = 'string' | 'integer' | 'boolean' | 'array' | 'object';
+/** An array's items: either bare strings, or objects with their own published (but not enforced) schema. */
+type PropItems =
+  | { readonly type: 'string' }
+  | { readonly type: 'object' }
+  | {
+      readonly type: 'object';
+      readonly properties: Readonly<Record<string, Prop>>;
+      readonly required: readonly string[];
+      readonly additionalProperties: false;
+    };
 export interface Prop {
   readonly type: PropType;
-  readonly items?: { readonly type: 'string' | 'object' };
+  readonly items?: PropItems;
+  // Published for the caller's benefit only; valueMatches() below checks types, never these bounds. The
+  // domain re-validates everything, so a schema that under- or over-states a bound is a docs bug, not a hole.
+  readonly minLength?: number;
+  readonly maxLength?: number;
+  readonly minItems?: number;
+  readonly maxItems?: number;
+  readonly minimum?: number;
+  readonly maximum?: number;
 }
 
 export const S: Prop = { type: 'string' };
@@ -43,6 +61,17 @@ export const I: Prop = { type: 'integer' };
 export const B: Prop = { type: 'boolean' };
 export const SA: Prop = { type: 'array', items: { type: 'string' } };
 export const OA: Prop = { type: 'array', items: { type: 'object' } };
+
+/** An array of objects, each with its own published shape: exactly `properties`/`required`, nothing else. */
+export function objectArray(
+  properties: Readonly<Record<string, Prop>>,
+  required: readonly string[],
+): Prop {
+  return {
+    type: 'array',
+    items: { type: 'object', properties, required, additionalProperties: false },
+  };
+}
 
 /** What a handler's `run` receives: the domain contexts for the authenticated caller, and the tool's arguments. */
 export interface ToolRun {
@@ -152,7 +181,9 @@ export function defineChorusTool(spec: ChorusToolSpec, deps: ToolDeps): ToolHand
       inputSchema: {
         type: 'object',
         additionalProperties: false,
-        properties: Object.fromEntries(Object.entries(props).map(([k, p]) => [k, { ...p }])),
+        properties: Object.fromEntries(
+          Object.entries(props).map(([k, p]) => [k, { ...p }]),
+        ) as JsonObject,
         required,
       },
       requiredCapability: { resource: { namespace: 'chorus', path: [] }, action: spec.action },
