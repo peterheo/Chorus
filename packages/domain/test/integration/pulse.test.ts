@@ -1,33 +1,31 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createFixture, type Fixture } from '../helpers/fixture.ts';
+import { createFixture, type Fixture, type SessionSeed } from '../helpers/fixture.ts';
 import { makeWorld, newTask, requestReviewAs, taskInReview, type World } from '../helpers/world.ts';
-import { isChorusError, roomPulse, type Uuid } from '../../src/index.ts';
+import { createTask, roomPulse, type Uuid } from '../../src/index.ts';
+
+interface PulseSeed {
+  readonly blocked: Uuid;
+  readonly noLease: Uuid;
+  readonly staleLease: Uuid;
+  readonly ready: Uuid;
+  readonly claimTask: Uuid;
+  readonly currentReview: Uuid;
+  readonly question: Uuid;
+  readonly ownerReady: Uuid;
+  readonly blockedReady: Uuid;
+}
 
 describe('roomPulse (real PostgreSQL, chorus_app read context)', () => {
   let f: Fixture;
   let w: World;
+  let seed: PulseSeed;
+  let actionCapSession: SessionSeed;
+  let isolationSession: SessionSeed;
 
   beforeAll(async () => {
     f = await createFixture();
     w = await makeWorld(f, await f.workspace('pulse'));
-  });
 
-  afterAll(async () => {
-    await f.close();
-  });
-
-  const seedNonTask = async (kind: 'question' | 'proposal', title: string) => {
-    const [row] = await f.owner<{ id: Uuid }>(
-      `INSERT INTO work_items (workspace_id, session_id, board_id, kind, home_room_id, title,
-                               state, creator_actor_id)
-       VALUES ($1, $2, $3, $4, $5, $6, 'open', $7) RETURNING id`,
-      [w.ws.id, w.session.id, w.session.boardId, kind, w.session.roomId, title, w.manager.id],
-    );
-    if (row === undefined) throw new Error('expected inserted item');
-    return row.id;
-  };
-
-  it('returns session scoped counts and ordered, de-duplicated actions with role-gated claim actions', async () => {
     const blocked = await newTask(w);
     await f.owner(
       `UPDATE work_items SET state = 'in_progress', owner_actor_id = $2,
@@ -57,7 +55,6 @@ describe('roomPulse (real PostgreSQL, chorus_app read context)', () => {
       `UPDATE work_items SET state = 'in_progress', owner_actor_id = $2 WHERE id = $1`,
       [noLease.id, w.reviewer.id],
     );
-
     const liveLease = await newTask(w);
     await f.owner(
       `UPDATE work_items SET state = 'in_progress', owner_actor_id = $2 WHERE id = $1`,
@@ -71,6 +68,16 @@ describe('roomPulse (real PostgreSQL, chorus_app read context)', () => {
 
     const ready = await newTask(w);
     await f.owner('UPDATE work_items SET priority = 0 WHERE id = $1', [ready.id]);
+    const blockedReady = await newTask(w);
+    await f.owner(
+      `UPDATE work_items SET blocked_reason = 'waiting', blocked_at = now() WHERE id = $1`,
+      [blockedReady.id],
+    );
+    const ownerReady = await newTask(w);
+    await f.owner('UPDATE work_items SET owner_actor_id = $2 WHERE id = $1', [
+      ownerReady.id,
+      w.reviewer.id,
+    ]);
     const claimTask = await newTask(w);
     await f.owner("UPDATE work_items SET state = 'review' WHERE id = $1", [claimTask.id]);
     await f.owner(
@@ -79,35 +86,29 @@ describe('roomPulse (real PostgreSQL, chorus_app read context)', () => {
       [w.ws.id, w.session.id, claimTask.id, w.executor.id],
     );
 
-    const inReview = await taskInReview(w);
-    const requestedReview = await requestReviewAs(
+    const currentTask = await taskInReview(w);
+    const currentReview = await requestReviewAs(
       w,
-      inReview.taskId,
-      inReview.version,
-      inReview.revision,
+      currentTask.taskId,
+      currentTask.version,
+      currentTask.revision,
       w.reviewer,
     );
-    const staleReviewTask = await taskInReview(w);
-    await requestReviewAs(
-      w,
-      staleReviewTask.taskId,
-      staleReviewTask.version,
-      staleReviewTask.revision,
-      w.reviewer,
-    );
+    const staleTask = await taskInReview(w);
+    await requestReviewAs(w, staleTask.taskId, staleTask.version, staleTask.revision, w.reviewer);
     await f.owner(
       `INSERT INTO task_result_revisions (workspace_id, session_id, task_id, revision, content,
                                           byte_length, content_sha256, submitted_by, fence)
        VALUES ($1, $2, $3, 2, 'new revision', 12,
                encode(digest(convert_to('new revision', 'UTF8'), 'sha256'), 'hex'), $4, 1)`,
-      [w.ws.id, w.session.id, staleReviewTask.taskId, w.executor.id],
+      [w.ws.id, w.session.id, staleTask.taskId, w.executor.id],
     );
-    const cancelledReviewTask = await taskInReview(w);
+    const cancelledTask = await taskInReview(w);
     const cancelledReview = await requestReviewAs(
       w,
-      cancelledReviewTask.taskId,
-      cancelledReviewTask.version,
-      cancelledReviewTask.revision,
+      cancelledTask.taskId,
+      cancelledTask.version,
+      cancelledTask.revision,
       w.reviewer,
     );
     await f.owner(
@@ -115,8 +116,9 @@ describe('roomPulse (real PostgreSQL, chorus_app read context)', () => {
         WHERE review_item_id = $1`,
       [cancelledReview.review.id],
     );
-    const question = await seedNonTask('question', 'Old question');
-    const proposal = await seedNonTask('proposal', 'Proposal');
+
+    const question = await seedNonTask(f, w, 'question', 'Old question');
+    await seedNonTask(f, w, 'proposal', 'Proposal');
     await f.owner(`UPDATE work_items SET created_at = now() - interval '25 hours' WHERE id = $1`, [
       question,
     ]);
@@ -128,33 +130,31 @@ describe('roomPulse (real PostgreSQL, chorus_app read context)', () => {
       [w.ws.id, w.session.id, ready.id, 'a'.repeat(64), w.manager.id],
     );
 
-    const before = await f.owner<{ commands: string; events: string; versions: string }>(
-      `SELECT (SELECT count(*) FROM commands WHERE session_id = $1)::text AS commands,
-              (SELECT count(*) FROM domain_events WHERE session_id = $1)::text AS events,
-              (SELECT coalesce(sum(version), 0) FROM work_items WHERE session_id = $1)::text AS versions`,
-      [w.session.id],
-    );
-    const memberPulse = await roomPulse(f.readCtx(w.reviewer), {});
-    const managerPulse = await roomPulse(f.readCtx(w.manager), { session_id: w.session.id });
-    const repeated = await roomPulse(f.readCtx(w.reviewer), {});
-    const after = await f.owner<{ commands: string; events: string; versions: string }>(
-      `SELECT (SELECT count(*) FROM commands WHERE session_id = $1)::text AS commands,
-              (SELECT count(*) FROM domain_events WHERE session_id = $1)::text AS events,
-              (SELECT coalesce(sum(version), 0) FROM work_items WHERE session_id = $1)::text AS versions`,
-      [w.session.id],
-    );
+    seed = {
+      blocked: blocked.id as Uuid,
+      noLease: noLease.id as Uuid,
+      staleLease: staleLease.id as Uuid,
+      ready: ready.id as Uuid,
+      claimTask: claimTask.id as Uuid,
+      currentReview: currentReview.review.id as Uuid,
+      question,
+      ownerReady: ownerReady.id as Uuid,
+      blockedReady: blockedReady.id as Uuid,
+    };
+  });
 
-    const member = memberPulse.sessions[0];
-    const manager = managerPulse.sessions[0];
-    if (member === undefined || manager === undefined) throw new Error('expected session pulse');
-    expect(memberPulse.coverage).toBe('chorus_state_only');
-    expect(Number.isNaN(Date.parse(memberPulse.generated_at))).toBe(false);
-    expect(member.session_id).toBe(w.session.id);
-    expect(member.name.startsWith('session')).toBe(true);
-    expect(member.counts).toMatchObject({
-      ready_unowned: 1,
+  afterAll(async () => {
+    await f.close();
+  });
+
+  it('PQ1: counts current state and excludes cancelled reviews while retaining near-miss semantics', async () => {
+    const pulse = await roomPulse(f.readCtx(w.reviewer), { session_id: w.session.id });
+    const session = pulse.sessions[0];
+    if (session === undefined) throw new Error('expected session pulse');
+    expect(session.counts).toEqual({
+      ready_unowned: 2,
       in_progress: 4,
-      blocked: 1,
+      blocked: 2,
       stale_leases: 3,
       pending_reviews: 1,
       stale_reviews: 1,
@@ -163,91 +163,173 @@ describe('roomPulse (real PostgreSQL, chorus_app read context)', () => {
       pending_claim_requests: 1,
       linked_messages: 1,
     });
-    expect(member.next_actions.slice(0, 5).map(({ kind, item_id }) => [kind, item_id])).toEqual([
-      ['blocked_task', blocked.id],
-      ['review_assigned', requestedReview.review.id],
-      ['stale_lease', noLease.id],
-      ['stale_lease', staleLease.id],
-      ['ready_task', ready.id],
-    ]);
-    expect(member.next_actions[0]?.reason).toBe('You own this task and it is blocked.');
-    expect(member.next_actions[1]?.reason).toBe(
-      'A review of the latest result is assigned to you.',
-    );
-    expect(member.next_actions[2]?.reason).toBe('Your lease expired; claim again to continue.');
-    expect(member.next_actions.some((action) => action.kind === 'claim_request')).toBe(false);
-    expect(manager.counts.pending_claim_requests).toBe(1);
-    expect(manager.next_actions).toContainEqual(
-      expect.objectContaining({ kind: 'claim_request', item_id: claimTask.id }),
-    );
-    expect(Date.parse(repeated.generated_at)).toBeGreaterThanOrEqual(
-      Date.parse(memberPulse.generated_at),
-    );
-    expect(repeated.sessions).toEqual(memberPulse.sessions);
-    expect(after).toEqual(before);
-    expect(member.next_actions.filter((action) => action.item_id === blocked.id)).toHaveLength(1);
-    expect(question).toBeTruthy();
-    expect(proposal).toBeTruthy();
+    const actionIds = session.next_actions.map((action) => action.item_id);
+    expect(actionIds).not.toContain(seed.ownerReady);
+    expect(actionIds).not.toContain(seed.blockedReady);
+    expect(seed.ownerReady).not.toBe(seed.ready);
+    expect(seed.blockedReady).not.toBe(seed.ready);
   });
 
-  it('filters to one live session and conceals unknown or non-member sessions', async () => {
-    const only = await roomPulse(f.readCtx(w.reviewer), { session_id: w.session.id });
-    expect(only.sessions).toHaveLength(1);
+  it('PQ2: orders actions by rule, deduplicates earlier rules, and caps at ten', async () => {
+    actionCapSession = await f.session(w.manager, { name: 'pulse-action-cap' });
+    const blockedIds: Uuid[] = [];
+    for (let index = 0; index < 12; index++) {
+      const { task } = await createTask(w.manager.ctx(), {
+        session_id: actionCapSession.id,
+        board_id: actionCapSession.boardId,
+        title: `cap task ${String(index)}`,
+        body: '',
+        acceptance_criteria: ['criterion'],
+        shareable: false,
+      });
+      blockedIds.push(task.id as Uuid);
+      await f.owner(
+        `UPDATE work_items SET state = $2, owner_actor_id = $3,
+                                blocked_reason = 'waiting', blocked_at = now()
+          WHERE id = $1`,
+        [task.id, index === 0 ? 'in_progress' : 'ready', w.manager.id],
+      );
+    }
+    const expected = await f.owner<{ id: Uuid }>(
+      `SELECT id FROM work_items WHERE session_id = $1 AND kind = 'task'
+          AND owner_actor_id = $2 AND blocked_reason IS NOT NULL
+          AND state NOT IN ('done', 'cancelled')
+        ORDER BY blocked_at ASC, id ASC LIMIT 10`,
+      [actionCapSession.id, w.manager.id],
+    );
+    const pulse = await roomPulse(f.readCtx(w.reviewer), { session_id: w.session.id });
+    const session = pulse.sessions[0];
+    if (session === undefined) throw new Error('expected session pulse');
+    expect(session.next_actions.slice(0, 6).map(({ kind, item_id }) => [kind, item_id])).toEqual([
+      ['blocked_task', seed.blocked],
+      ['review_assigned', seed.currentReview],
+      ['stale_lease', seed.noLease],
+      ['stale_lease', seed.staleLease],
+      ['ready_task', seed.ready],
+      ['open_question', seed.question],
+    ]);
+    const capped = await roomPulse(f.readCtx(w.manager), { session_id: actionCapSession.id });
+    const cappedActions = capped.sessions[0]?.next_actions ?? [];
+    expect(cappedActions).toHaveLength(10);
+    expect(cappedActions.map((action) => action.item_id)).toEqual(expected.map((row) => row.id));
+    expect(cappedActions.every((action) => action.kind === 'blocked_task')).toBe(true);
+    expect(cappedActions.some((action) => action.item_id === blockedIds[0])).toBe(true);
+    expect(cappedActions.filter((action) => action.item_id === blockedIds[0])).toHaveLength(1);
+  });
+
+  it('PQ3: shows claim counts to members but claim actions only to managers', async () => {
+    const memberPulse = await roomPulse(f.readCtx(w.reviewer), { session_id: w.session.id });
+    const managerPulse = await roomPulse(f.readCtx(w.manager), { session_id: w.session.id });
+    expect(memberPulse.sessions[0]?.counts.pending_claim_requests).toBe(1);
+    expect(
+      memberPulse.sessions[0]?.next_actions.some((action) => action.kind === 'claim_request'),
+    ).toBe(false);
+    const manager = managerPulse.sessions[0];
+    if (manager === undefined) throw new Error('expected manager pulse');
+    expect(manager.counts.pending_claim_requests).toBe(1);
+    const claimAction = manager.next_actions.find((action) => action.kind === 'claim_request');
+    if (claimAction === undefined) throw new Error('expected manager claim action');
+    expect(claimAction.kind).toBe('claim_request');
+    expect(claimAction.item_id).toBe(seed.claimTask);
+    expect(typeof claimAction.title).toBe('string');
+    expect(claimAction.reason).toBe('A claim request awaits a manager decision.');
+  });
+
+  it('PQ4: three pulse calls do not change commands, events, or work item versions', async () => {
+    const before = await mutationSnapshot(f, w.session.id);
+    await roomPulse(f.readCtx(w.reviewer), {});
+    await roomPulse(f.readCtx(w.reviewer), { session_id: w.session.id });
+    await roomPulse(f.readCtx(w.manager), { session_id: w.session.id });
+    const after = await mutationSnapshot(f, w.session.id);
+    expect(after).toEqual(before);
+  });
+
+  it('PQ5: keeps same-room sessions isolated and conceals cross-session or unknown sessions', async () => {
+    isolationSession = await f.session(w.manager, { name: 'pulse-isolation' });
+    await f.join(isolationSession, w.reviewer);
+    await createTask(w.manager.ctx(), {
+      session_id: isolationSession.id,
+      board_id: isolationSession.boardId,
+      title: 'only in second session',
+      body: '',
+      acceptance_criteria: ['criterion'],
+      shareable: false,
+    });
+    const pulse = await roomPulse(f.readCtx(w.reviewer), {});
+    const original = pulse.sessions.find((session) => session.session_id === w.session.id);
+    const isolated = pulse.sessions.find((session) => session.session_id === isolationSession.id);
+    expect(pulse.sessions.map((session) => session.session_id)).toContain(w.session.id);
+    expect(original?.counts.ready_unowned).toBe(2);
+    expect(isolated?.counts.ready_unowned).toBe(1);
+    await expect(
+      roomPulse(f.readCtx(w.executor), { session_id: isolationSession.id }),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    await expect(
+      roomPulse(f.readCtx(w.reviewer), {
+        session_id: '00000000-0000-7000-8000-000000000001' as Uuid,
+      }),
+    ).rejects.toMatchObject({ code: 'not_found' });
+  });
+
+  it('PQ6: selects exactly one session and reports malformed session ids', async () => {
+    const pulse = await roomPulse(f.readCtx(w.reviewer), { session_id: w.session.id });
+    expect(pulse.sessions.map((session) => session.session_id)).toEqual([w.session.id]);
     await expect(
       roomPulse(f.readCtx(w.reviewer), { session_id: 'bad-id' as Uuid }),
     ).rejects.toMatchObject({
       code: 'invalid_request',
       details: { field: 'session_id' },
     });
-    await expect(
-      roomPulse(f.readCtx(w.reviewer), {
-        session_id: '00000000-0000-7000-8000-000000000001' as Uuid,
-      }),
-    ).rejects.toMatchObject({ code: 'not_found' });
-    await expect(
-      roomPulse(f.readCtx(w.outsider), { session_id: w.session.id }),
-    ).rejects.toMatchObject({
-      code: 'not_found',
-    });
-    const error = await roomPulse(f.readCtx(w.outsider), {}).then(
-      () => undefined,
-      (e: unknown) => e,
-    );
-    expect(error === undefined || isChorusError(error, 'not_found')).toBe(true);
   });
 
-  it('caps each session at ten actions', async () => {
-    for (let index = 0; index < 12; index++) {
-      const task = await newTask(w);
-      await f.owner(
-        `UPDATE work_items SET owner_actor_id = $2, blocked_reason = 'waiting', blocked_at = now()
-          WHERE id = $1`,
-        [task.id, w.reviewer.id],
-      );
-    }
-    const pulse = await roomPulse(f.readCtx(w.reviewer), { session_id: w.session.id });
-    const session = pulse.sessions[0];
-    if (session === undefined) throw new Error('expected session pulse');
-    expect(session.next_actions).toHaveLength(10);
-    expect(session.next_actions.every((action) => action.kind === 'blocked_task')).toBe(true);
-  });
-
-  it('returns at most 50 sessions in created_at and id order', async () => {
+  it('PQ7: returns the stable shape, exact reasons, ISO timestamp, and 50-session limit', async () => {
     for (let index = 0; index < 51; index++) {
-      await f.session(w.manager, { name: `pulse-cap-${String(index)}` });
+      await f.session(w.manager, { name: `pulse-list-${String(index)}` });
     }
     const expected = await f.owner<{ id: Uuid }>(
       `SELECT id FROM sessions WHERE workspace_id = $1 AND created_by = $2
         ORDER BY created_at ASC, id ASC LIMIT 50`,
       [w.ws.id, w.manager.id],
     );
-    const pulse = await roomPulse(f.readCtx(w.manager), {});
-    expect(pulse.sessions.map((session) => session.session_id)).toEqual(
+    const listed = await roomPulse(f.readCtx(w.manager), {});
+    expect(listed.sessions).toHaveLength(50);
+    expect(listed.sessions.map((session) => session.session_id)).toEqual(
       expected.map((row) => row.id),
+    );
+    expect(listed.coverage).toBe('chorus_state_only');
+    expect(new Date(listed.generated_at).toISOString()).toBe(listed.generated_at);
+
+    const memberPulse = await roomPulse(f.readCtx(w.reviewer), { session_id: w.session.id });
+    const session = memberPulse.sessions[0];
+    if (session === undefined) throw new Error('expected session pulse');
+    expect(Object.keys(session).sort()).toEqual(['counts', 'name', 'next_actions', 'session_id']);
+    expect(Object.keys(session.counts).sort()).toEqual([
+      'blocked',
+      'in_progress',
+      'linked_messages',
+      'open_proposals',
+      'open_questions',
+      'pending_claim_requests',
+      'pending_reviews',
+      'ready_unowned',
+      'stale_leases',
+      'stale_reviews',
+    ]);
+    expect(session.next_actions.map((action) => action.reason)).toEqual([
+      'You own this task and it is blocked.',
+      'A review of the latest result is assigned to you.',
+      'Your lease expired; claim again to continue.',
+      'Your lease expired; claim again to continue.',
+      'Ready and unowned.',
+      'Open for more than 24 hours.',
+    ]);
+    const managerPulse = await roomPulse(f.readCtx(w.manager), { session_id: w.session.id });
+    expect(managerPulse.sessions[0]?.next_actions.map((action) => action.reason)).toContain(
+      'A claim request awaits a manager decision.',
     );
   });
 
-  it('excludes a member after session removal or room removal', async () => {
+  it('PQ8: excludes members after session removal and room removal', async () => {
     const sessionRemoved = await w.participant('pulse-session-removed');
     const roomRemoved = await w.participant('pulse-room-removed');
     await f.owner(
@@ -270,3 +352,38 @@ describe('roomPulse (real PostgreSQL, chorus_app read context)', () => {
     ).rejects.toMatchObject({ code: 'not_found' });
   });
 });
+
+async function seedNonTask(
+  fixture: Fixture,
+  world: World,
+  kind: 'question' | 'proposal',
+  title: string,
+): Promise<Uuid> {
+  const [row] = await fixture.owner<{ id: Uuid }>(
+    `INSERT INTO work_items (workspace_id, session_id, board_id, kind, home_room_id, title,
+                             state, creator_actor_id)
+     VALUES ($1, $2, $3, $4, $5, $6, 'open', $7) RETURNING id`,
+    [
+      world.ws.id,
+      world.session.id,
+      world.session.boardId,
+      kind,
+      world.session.roomId,
+      title,
+      world.manager.id,
+    ],
+  );
+  if (row === undefined) throw new Error('expected inserted item');
+  return row.id;
+}
+
+async function mutationSnapshot(fixture: Fixture, sessionId: Uuid) {
+  const [row] = await fixture.owner<{ commands: string; events: string; versions: string }>(
+    `SELECT (SELECT count(*) FROM commands WHERE session_id = $1)::text AS commands,
+            (SELECT count(*) FROM domain_events WHERE session_id = $1)::text AS events,
+            (SELECT coalesce(sum(version), 0) FROM work_items WHERE session_id = $1)::text AS versions`,
+    [sessionId],
+  );
+  if (row === undefined) throw new Error('expected mutation snapshot');
+  return row;
+}
