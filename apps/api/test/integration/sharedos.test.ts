@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type pg from 'pg';
 import type { SharedOSKernel, ToolResult } from '@aicoo/sharedos';
-import { removeMember, revokeRole } from '@chorus/domain';
+import { removeMember, revokeRole, type Uuid } from '@chorus/domain';
 import {
   createFixture,
   type Actor,
@@ -494,7 +494,7 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
         admin,
         'chorus.get_session',
         { session_id: session.id },
-        { scope: { ...scopeOf(admin), roomId: randomUUID() } },
+        { scope: { ...scopeOf(admin), roomId: randomUUID() as Uuid } },
       ),
     ).toMatchObject({ status: 'failed', error: { code: 'internal_error' } });
     expect(await commandCount()).toBe(before);
