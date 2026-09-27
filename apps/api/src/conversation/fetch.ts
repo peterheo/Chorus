@@ -17,29 +17,27 @@ export interface FetchedWindow {
 
 const ERROR_MESSAGE = 'SharedNet conversation fetch failed.';
 const invalid = () => new ChorusError('invalid_request', 'Invalid conversation fetch window.');
-const unavailable = (cause: string): never => {
+
+/** A function declaration (not an arrow const) so that TypeScript narrows after every call. */
+function unavailable(cause: string): never {
   throw new ChorusError('temporarily_unavailable', ERROR_MESSAGE, { details: { cause } });
-};
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 type PageItem = SourceMessage & { readonly type: string };
 
 function parsePage(value: unknown): readonly [PageItem[], boolean, string | number | null] {
-  if (
-    !isRecord(value) ||
-    !Array.isArray(value['items']) ||
-    typeof value['has_more'] !== 'boolean'
-  ) {
-    unavailable('contract_mismatch');
-  }
-  const page = value as Record<string, unknown>;
-  const pageItems = page['items'] as unknown[];
-  const cursor = page['next_cursor'];
+  if (!isRecord(value)) unavailable('contract_mismatch');
+  const pageItems: unknown = value['items'];
+  const hasMore: unknown = value['has_more'];
+  if (!Array.isArray(pageItems) || typeof hasMore !== 'boolean') unavailable('contract_mismatch');
+  const cursor = value['next_cursor'];
   if (!(cursor === null || typeof cursor === 'string' || typeof cursor === 'number'))
     unavailable('contract_mismatch');
   const items: PageItem[] = [];
   let previous = 0;
-  for (const raw of pageItems) {
+  for (const raw of pageItems as unknown[]) {
     if (!isRecord(raw)) unavailable('contract_mismatch');
     const sender = raw['sender'];
     if (!isRecord(sender)) unavailable('contract_mismatch');
@@ -70,17 +68,17 @@ function parsePage(value: unknown): readonly [PageItem[], boolean, string | numb
       unavailable('contract_mismatch');
     previous = sequence;
     items.push({
-      message_id: id as string,
-      sequence: sequence as number,
-      sender_member_id: member as string,
-      sender_principal_id: principal as string,
-      sender_name: name as string,
-      content: content as string,
-      reply_to_message_id: reply as string | null,
-      type: raw['type'] as string,
+      message_id: id,
+      sequence,
+      sender_member_id: member,
+      sender_principal_id: principal,
+      sender_name: name,
+      content,
+      reply_to_message_id: reply,
+      type: raw['type'],
     });
   }
-  return [items, page['has_more'] as boolean, cursor as string | number | null];
+  return [items, hasMore, cursor];
 }
 
 export async function fetchConversationWindow(args: FetchWindowArgs): Promise<FetchedWindow> {
@@ -102,50 +100,51 @@ export async function fetchConversationWindow(args: FetchWindowArgs): Promise<Fe
 
   const fetchImpl = args.fetchImpl ?? globalThis.fetch;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), args.timeoutMs ?? 10_000);
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, args.timeoutMs ?? 10_000);
+  // A function, not a property read, so the compiler doesn't assume it stays false across awaits.
+  const aborted = (): boolean => controller.signal.aborted;
   const messages: SourceMessage[] = [];
   let cutoffSequence = args.fromSequence - 1;
   let after: string | number = args.fromSequence - 1;
   try {
     for (let pageNumber = 0; pageNumber < 3; pageNumber += 1) {
-      if (controller.signal.aborted) unavailable('timeout');
+      if (aborted()) unavailable('timeout');
       const query = new URLSearchParams({ after: String(after), limit: '100', order: 'asc' });
-      const url = `${args.sharednetBaseUrl}/api/v1/rooms/${encodeURIComponent(args.externalRoomId)}/messages?${query}`;
+      const url = `${args.sharednetBaseUrl}/api/v1/rooms/${encodeURIComponent(args.externalRoomId)}/messages?${query.toString()}`;
       const init: RequestInit = {
         method: 'GET',
         headers: { authorization: `Bearer ${args.seatToken}`, accept: 'application/json' },
         signal: controller.signal,
       };
-      const response = await fetchImpl(url, init).catch(() =>
-        unavailable(controller.signal.aborted ? 'timeout' : 'network'),
-      );
-      if (!response.ok) unavailable(`http_${response.status}`);
+      const response = await fetchImpl(url, init).catch((): never => {
+        unavailable(aborted() ? 'timeout' : 'network');
+      });
+      if (!response.ok) unavailable(`http_${String(response.status)}`);
       let body: unknown;
       try {
         body = await response.json();
       } catch {
-        unavailable(controller.signal.aborted ? 'timeout' : 'contract_mismatch');
+        unavailable(aborted() ? 'timeout' : 'contract_mismatch');
       }
-      if (controller.signal.aborted) unavailable('timeout');
+      if (aborted()) unavailable('timeout');
       const [items, hasMore, nextCursor] = parsePage(body);
       for (const item of items) {
+        // Only the selected window is examined: anything past toSequence on this page is ignored, and the
+        // cutoff is the highest sequence examined (message or not) inside the window.
+        if (item.sequence < args.fromSequence || item.sequence > args.toSequence) continue;
         cutoffSequence = Math.max(cutoffSequence, item.sequence);
-        if (
-          item.type === 'message' &&
-          item.sequence >= args.fromSequence &&
-          item.sequence <= args.toSequence
-        ) {
+        if (item.type === 'message') {
           const { type: _type, ...message } = item;
           messages.push(message);
         }
       }
       const lastSequence = items.at(-1)?.sequence;
       if (!hasMore || lastSequence === undefined || lastSequence >= args.toSequence) break;
-      if (nextCursor === null || nextCursor === after || nextCursor === undefined) {
-        unavailable('contract_mismatch');
-      }
+      if (nextCursor === null || nextCursor === after) unavailable('contract_mismatch');
       if (pageNumber === 2) unavailable('window_too_sparse');
-      after = nextCursor as string | number;
+      after = nextCursor;
     }
   } finally {
     clearTimeout(timer);
