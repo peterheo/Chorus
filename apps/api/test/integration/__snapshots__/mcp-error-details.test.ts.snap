@@ -1,0 +1,28 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`MCP failures keep their details: text body and structuredContent.error (over /mcp, real SDK client) > (c) a failed CallToolResult keeps its exact shape (snapshot) 1`] = `
+{
+  "_meta": {
+    "sharedos/code": "version_conflict",
+    "sharedos/status": "failed",
+  },
+  "content": [
+    {
+      "text": "{"status":"failed","code":"version_conflict","message":"The item changed after the supplied version.","details":{"item_id":"<uuid>","current_version":1}}",
+      "type": "text",
+    },
+  ],
+  "isError": true,
+  "structuredContent": {
+    "error": {
+      "code": "version_conflict",
+      "details": {
+        "current_version": 1,
+        "item_id": "<uuid>",
+      },
+      "message": "The item changed after the supplied version.",
+    },
+    "status": "failed",
+  },
+}
+`;
