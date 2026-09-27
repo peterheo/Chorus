@@ -153,3 +153,23 @@ export {
   type ConversationDigestSource,
   type ConversationDigestTopSuggestion,
 } from './conversation/digest.ts';
+export {
+  EMPTY_STATE,
+  OBJECT_STATUSES,
+  REF_PREFIX,
+  RESOLVED_STATUS,
+  UNSETTLED_STATUSES,
+  type ApplyContext,
+  type ApplyMessages,
+  type ApplyResult,
+  type CoordObject,
+  type CoordState,
+  type Evaluate,
+  type Member,
+  type MessageSource,
+  type ObjectKind,
+  type RefPrefix,
+  type Signal,
+  type SignalKind,
+  type Transition,
+} from './coordination/types.ts';
