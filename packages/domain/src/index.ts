@@ -129,3 +129,27 @@ export {
   type SourceMessage,
   type SuggestionKind,
 } from './conversation/extract.ts';
+export { loadConversationSeat, type ConversationSeat } from './conversation/seat.ts';
+export {
+  dismissSuggestion,
+  linkSuggestion,
+  listSuggestions,
+  recordScan,
+  type DismissSuggestionArgs,
+  type DismissSuggestionResult,
+  type LinkSuggestionArgs,
+  type LinkSuggestionResult,
+  type ListSuggestionsArgs,
+  type ListSuggestionsResult,
+  type RecordScanArgs,
+  type ScanRecorded,
+  type Suggestion,
+  type SuggestionSource,
+} from './conversation/suggestions.ts';
+export {
+  conversationDigest,
+  type ConversationDigestEntry,
+  type ConversationDigestLastScan,
+  type ConversationDigestSource,
+  type ConversationDigestTopSuggestion,
+} from './conversation/digest.ts';
