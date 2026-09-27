@@ -205,28 +205,22 @@ export async function recordScan(ctx: CommandContext, args: RecordScanArgs): Pro
         const snapshot = truncateUtf8(source.content, SNAPSHOT_MAX_BYTES);
         const snapshotSha256 = sha256Hex(snapshot);
 
-        // Update first: an existing suggestion has its identity and decision left untouched.
-        const updated = await tx.db.query<SuggestionRow>(
-          `UPDATE conversation_suggestions
-              SET last_scan_id = $4, replied_by_other = $5, updated_at = now()
-            WHERE workspace_id = $1 AND session_id = $2 AND fingerprint = $3
-            RETURNING ${COLUMNS}`,
-          [tx.workspaceId, args.session_id, fingerprint, scanId, found.replied_by_other],
-        );
-        const existing = updated.rows[0];
-        if (existing !== undefined) {
-          suggestions.push({ ...toSuggestion(existing), is_new: false });
-          continue;
-        }
-
-        const inserted = await tx.db.query<SuggestionRow>(
+        // One statement: a two-step UPDATE-then-INSERT lets two concurrent scans of the same window both
+        // miss the UPDATE and race the INSERT, so the loser hits the unique index as a raw 23505. The
+        // DO UPDATE list is exactly last_scan_id/replied_by_other/updated_at: an existing suggestion's
+        // identity and decision are never touched by a rescan. `xmax = 0` is true only for a tuple this
+        // statement inserted (never true after an UPDATE), which is how `is_new` is told apart safely.
+        const upserted = await tx.db.query<SuggestionRow & { is_new: boolean }>(
           `INSERT INTO conversation_suggestions
              (workspace_id, session_id, kind, fingerprint, excerpt, confidence, source_message_id,
               source_sequence, source_member_id, source_principal_id, source_name,
               source_content_snapshot, source_content_sha256, replied_by_other, suggested_next_action,
               first_scan_id, last_scan_id)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)
-           RETURNING ${COLUMNS}`,
+           ON CONFLICT (workspace_id, session_id, fingerprint) DO UPDATE
+             SET last_scan_id = EXCLUDED.last_scan_id, replied_by_other = EXCLUDED.replied_by_other,
+                 updated_at = now()
+           RETURNING ${COLUMNS}, (xmax = 0) AS is_new`,
           [
             tx.workspaceId,
             args.session_id,
@@ -246,10 +240,10 @@ export async function recordScan(ctx: CommandContext, args: RecordScanArgs): Pro
             scanId,
           ],
         );
-        const row = inserted.rows[0];
+        const row = upserted.rows[0];
         if (row === undefined)
           throw new ChorusError('internal_error', 'The suggestion was not stored.');
-        suggestions.push({ ...toSuggestion(row), is_new: true });
+        suggestions.push({ ...toSuggestion(row), is_new: row.is_new });
       }
 
       return {

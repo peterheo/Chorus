@@ -103,6 +103,27 @@ describe('conversation suggestions (CC-1b domain; real PostgreSQL as chorus_app)
     expect(dismissed?.last_scan_id).toBe(third.scan.id);
   });
 
+  it('CC2b conversation.rescan_concurrent: two concurrent scans of the same window never collide, and exactly one reports is_new', async () => {
+    const { owner, session } = await world('cc2b');
+    const msgs = [message('Can someone check why the deploy fails?')];
+    const [a, b] = await Promise.all([
+      scan(owner, session, { msgs }),
+      scan(owner, session, { msgs }),
+    ]);
+    expect(a.suggestions).toHaveLength(1);
+    expect(b.suggestions).toHaveLength(1);
+    expect(a.suggestions[0]?.suggestion_id).toBe(b.suggestions[0]?.suggestion_id);
+    // Exactly one of the two concurrent scans inserted the row; the other found it already there.
+    const flags = [a.suggestions[0]?.is_new, b.suggestions[0]?.is_new];
+    expect(flags.filter(Boolean)).toHaveLength(1);
+    expect(
+      await f.count(
+        `SELECT count(*) AS n FROM conversation_suggestions WHERE workspace_id = $1 AND session_id = $2`,
+        [session.ws.id, session.id],
+      ),
+    ).toBe(1);
+  });
+
   it('CC3 conversation.no_silent_authority: scanning and linking sets nothing but the explicit link, and nothing extra is journaled', async () => {
     const { owner, session } = await world('cc3');
     const created = await createTask(owner.ctx(), {
