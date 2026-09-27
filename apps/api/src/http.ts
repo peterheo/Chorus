@@ -6,7 +6,7 @@ export function sendError(
   request: FastifyRequest,
   reply: FastifyReply,
   status: number,
-  code: ErrorCode | 'not_found',
+  code: ErrorCode | 'not_found' | 'activation_failed',
   message: string,
   headers: Record<string, string> = {},
 ): FastifyReply {

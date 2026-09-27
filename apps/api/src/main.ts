@@ -18,11 +18,17 @@ async function main(): Promise<void> {
   pool.on('error', () => undefined);
   await assertRuntimeRole(pool);
 
-  const app = await buildApp({ config, pool, version });
+  const sharednetClient = new SharedNetClient({ baseUrl: config.sharednetBaseUrl });
+  const app = await buildApp({
+    config,
+    pool,
+    version,
+    sharednet: { client: sharednetClient, secretsKey: config.secretsKey },
+  });
   const watcher = new RoomWatcher({
     pool,
     secretsKey: config.secretsKey,
-    client: new SharedNetClient({ baseUrl: config.sharednetBaseUrl }),
+    client: sharednetClient,
     logger: {
       info: (obj, msg) => {
         app.log.info(obj, msg);
@@ -38,10 +44,18 @@ async function main(): Promise<void> {
     if (closing) return;
     closing = true;
     app.log.info({ signal }, 'shutting down');
-    const force = setTimeout(() => process.exit(1), 10_000);
+    // Stop accepting, let in-flight requests finish (at most 10 s, then cut them), then `app.close()` runs the
+    // onClose hook that writes buffered audit events (at most 5 s), and only then does the pool close.
+    const cutInflight = setTimeout(() => {
+      app.server.closeAllConnections();
+    }, 10_000);
+    cutInflight.unref();
+    const force = setTimeout(() => process.exit(1), 17_000);
     force.unref();
     await watcher.stop();
+    app.server.closeIdleConnections();
     await app.close();
+    clearTimeout(cutInflight);
     await pool.end();
     process.exit(0);
   };

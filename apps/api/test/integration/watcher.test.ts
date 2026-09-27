@@ -189,14 +189,7 @@ describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
     });
     expect(response.status).toBe(404);
     const health = await fetch(`${s.baseUrl}/healthz`);
-    const body = (await health.json()) as { rooms: { watcher_ok: boolean }[] };
-    expect(body.rooms).toEqual([
-      expect.objectContaining({
-        sharednet_room_id: SHAREDNET_ROOM,
-        activation_state: 'active',
-        watcher_ok: false,
-      }),
-    ]);
+    expect(await health.json()).toMatchObject({ rooms_active: 1, watcher_ok_rooms: 0 });
   });
 
   it('watcher.recovery: an undecryptable seat token degrades the room instead of crashing', async () => {

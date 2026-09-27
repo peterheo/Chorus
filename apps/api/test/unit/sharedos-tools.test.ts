@@ -9,6 +9,7 @@ import { chorusTools } from '../../src/sharedos/tools/index.ts';
 const deps = {
   pool: {} as pg.Pool,
   leaseDurationSeconds: 900,
+  gitCommit: 'test',
   logger: { error: () => undefined },
 };
 
@@ -23,9 +24,9 @@ const scope: ChorusRequestScope = {
 describe('chorus tool definitions', () => {
   const tools = chorusTools(deps);
 
-  it('K11 tools.snapshot: exactly the 23 shipped tools, with stable definitions', () => {
+  it('K11 tools.snapshot: exactly the 24 shipped tools (23 + whoami), with stable definitions', () => {
     const definitions = tools.map((t) => t.definition).sort((a, b) => (a.name < b.name ? -1 : 1));
-    expect(definitions).toHaveLength(23);
+    expect(definitions).toHaveLength(24);
     expect(definitions).toMatchSnapshot();
   });
 

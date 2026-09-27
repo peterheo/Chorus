@@ -44,3 +44,87 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test:unit
       - run: pnpm test:integration
+
+  container-smoke:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production image
+        run: docker build --build-arg GIT_COMMIT=${{ github.sha }} -t chorus-api:ci .
+      - name: Start PostgreSQL
+        run: |
+          docker network create chorus-ci
+          docker run -d --name pg --network chorus-ci \
+            -e POSTGRES_USER=chorus_owner \
+            -e POSTGRES_PASSWORD=ci \
+            -e POSTGRES_DB=chorus \
+            postgres:18
+          for attempt in $(seq 1 30); do
+            if docker exec pg pg_isready -U chorus_owner -d chorus; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker exec pg pg_isready -U chorus_owner -d chorus
+      - name: Migrate database
+        run: >-
+          docker run --rm --network chorus-ci
+          -e DATABASE_URL=postgres://chorus_owner:ci@pg:5432/chorus
+          -e CHORUS_APP_PASSWORD=ci_app
+          chorus-api:ci node packages/database/src/cli.ts
+      - name: Start API container
+        run: |
+          CHORUS_SECRETS_KEY="$(openssl rand -base64 32)"
+          docker run -d --name api --network chorus-ci \
+            -p 127.0.0.1:18080:18080 \
+            -e CHORUS_ENV=production \
+            -e HOST=0.0.0.0 \
+            -e PUBLIC_BASE_URL=https://ci.invalid \
+            -e DATABASE_URL_APP=postgres://chorus_app:ci_app@pg:5432/chorus \
+            -e CHORUS_SECRETS_KEY="$CHORUS_SECRETS_KEY" \
+            chorus-api:ci
+      - name: Verify health and deployed commit
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/healthz -o /tmp/healthz.json; then
+              break
+            fi
+            sleep 1
+          done
+          jq -e --arg commit "$EXPECTED_COMMIT" \
+            '.status == "ok" and .commit == $commit' /tmp/healthz.json
+      - name: Smoke-test entry pages
+        run: |
+          curl --fail --silent --show-error -D /tmp/index.headers \
+            http://127.0.0.1:18080/ -o /tmp/index.html
+          grep -i '^content-type: text/html' /tmp/index.headers
+          grep -F 'https://ci.invalid/mcp' /tmp/index.html
+          curl --fail --silent --show-error -D /tmp/llms.headers \
+            http://127.0.0.1:18080/llms.txt -o /tmp/llms.txt
+          grep -i '^content-type: text/plain' /tmp/llms.headers
+      - name: Verify non-root runtime and excluded tests
+        run: |
+          test "$(docker exec api id -u)" != "0"
+          docker exec api test ! -e /app/apps/api/test
+          docker exec api sh -c 'test -z "${POSTGRES_PASSWORD:-}" && test -z "${CHORUS_APP_PASSWORD:-}"'
+      - name: Stop API gracefully
+        run: timeout 15s docker stop -t 15 api
+      - name: Verify shutdown log
+        run: |
+          docker logs api 2>&1 | tee /tmp/api.log
+          grep -F 'shutting down' /tmp/api.log
+          if grep -E '(^|[[:space:]])Error:|[[:space:]]at .*\.ts:' /tmp/api.log; then
+            exit 1
+          fi
+      - name: Print API logs on failure
+        if: failure()
+        run: docker logs api || true
+      - name: Clean up containers and network
+        if: always()
+        run: |
+          docker rm -f api pg 2>/dev/null || true
+          docker network rm chorus-ci 2>/dev/null || true

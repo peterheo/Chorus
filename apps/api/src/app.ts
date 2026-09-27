@@ -3,25 +3,37 @@ import type { Writable } from 'node:stream';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import type pg from 'pg';
 import type { Config } from './config.ts';
+import { registerActivateRoutes } from './activate.ts';
+import { registerAuditRoutes } from './audit-read.ts';
 import { registerEnrollRoutes } from './enroll.ts';
 import { sendError } from './http.ts';
+import { registerMcpRoutes } from './mcp.ts';
 import { RateLimiter } from './rate-limit.ts';
+import type { SharedNetClient } from './sharednet/client.ts';
+import { createChorusKernel } from './sharedos/kernel.ts';
+import { registerStaticPages } from './static.ts';
 
 export interface AppLimits {
   readonly enrollStartPerRoomPerMinute: number;
   readonly enrollStartGlobalPerMinute: number;
   readonly enrollCompleteGlobalPerMinute: number;
+  readonly mcpPerTokenPerMinute: number;
+  readonly activateGlobalPerMinute: number;
 }
 
 const DEFAULT_LIMITS: AppLimits = {
   enrollStartPerRoomPerMinute: 20,
   enrollStartGlobalPerMinute: 60,
   enrollCompleteGlobalPerMinute: 120,
+  mcpPerTokenPerMinute: 120,
+  activateGlobalPerMinute: 10,
 };
 
 export interface AppOptions {
   readonly config: Pick<Config, 'publicBaseUrl' | 'leaseDurationSeconds' | 'gitCommit'>;
   readonly pool: pg.Pool;
+  /** For `POST /v1/rooms/activate`: the SharedNet client and the key that seals the seat token. */
+  readonly sharednet: { readonly client: SharedNetClient; readonly secretsKey: Buffer };
   readonly version?: string;
   /** Overridable in tests (an internal constructor option, not environment). */
   readonly limits?: Partial<AppLimits>;
@@ -46,6 +58,9 @@ interface RequestNotes {
   actorId?: string;
   tool?: string;
 }
+
+/** How long shutdown waits for buffered audit events to be written. */
+const AUDIT_FLUSH_TIMEOUT_MS = 5000;
 
 export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const { pool, config } = options;
@@ -87,6 +102,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     );
     done();
   });
+
+  const note = (request: FastifyRequest, fields: RequestNotes): void => {
+    notes.set(request, { ...notes.get(request), ...fields });
+  };
 
   app.setNotFoundHandler((request, reply) =>
     sendError(request, reply, 404, 'not_found', 'No such route.'),
@@ -134,6 +153,44 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     },
   });
 
+  // ---------------------------------------------------------------------------------------------
+  // SharedOS host: the kernel with every chorus.* tool, served as JSON-only MCP on POST /mcp, plus the
+  // audit read and the entry pages.
+  // ---------------------------------------------------------------------------------------------
+  const { kernel, audit } = createChorusKernel({
+    pool,
+    leaseDurationSeconds: config.leaseDurationSeconds,
+    gitCommit: config.gitCommit,
+    logger: {
+      error: (obj, msg) => {
+        app.log.error(obj, msg);
+      },
+    },
+  });
+  registerMcpRoutes(app, {
+    pool,
+    kernel,
+    version: options.version ?? '0.0.0',
+    perToken: new RateLimiter({ limit: limits.mcpPerTokenPerMinute, windowMs: 60_000 }),
+    note,
+  });
+  registerActivateRoutes(app, {
+    pool,
+    client: options.sharednet.client,
+    secretsKey: options.sharednet.secretsKey,
+    publicBaseUrl: config.publicBaseUrl,
+    limiter: new RateLimiter({ limit: limits.activateGlobalPerMinute, windowMs: 60_000 }),
+  });
+  registerAuditRoutes(app, { pool });
+  registerStaticPages(app, { publicBaseUrl: config.publicBaseUrl, billingEnabled: false });
+  // Shutdown: the HTTP server has already stopped accepting and drained (Fastify close); write what is buffered.
+  app.addHook('onClose', async () => {
+    await Promise.race([
+      audit.flush().catch(() => undefined),
+      new Promise((resolve) => setTimeout(resolve, AUDIT_FLUSH_TIMEOUT_MS).unref()),
+    ]);
+  });
+
   app.get('/healthz', async (_request, reply) => {
     try {
       const timeout = new Promise<never>((_, reject) => {
@@ -142,25 +199,28 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         }, 2000).unref();
       });
       await Promise.race([pool.query('SELECT 1'), timeout]);
-      const { rows } = await pool.query<{
-        external_room_id: string;
-        activation_state: string;
-        watcher_ok: boolean;
-      }>('SELECT * FROM chorus_room_health()');
+      const { rows } = await pool.query<{ activation_state: string; watcher_ok: boolean }>(
+        'SELECT activation_state, watcher_ok FROM chorus_room_health()',
+      );
+      const active = rows.filter((r) => r.activation_state === 'active');
+      // Counts only: a public health check never names a room.
       return await reply.code(200).send({
         status: 'ok',
         commit: config.gitCommit,
         db: 'ok',
-        rooms: rows.map((r) => ({
-          sharednet_room_id: r.external_room_id,
-          activation_state: r.activation_state,
-          watcher_ok: r.watcher_ok,
-        })),
+        audit_write_failures: audit.failures(),
+        rooms_active: active.length,
+        watcher_ok_rooms: active.filter((r) => r.watcher_ok).length,
       });
     } catch {
-      return reply
-        .code(503)
-        .send({ status: 'degraded', commit: config.gitCommit, db: 'down', rooms: [] });
+      return reply.code(503).send({
+        status: 'degraded',
+        commit: config.gitCommit,
+        db: 'down',
+        audit_write_failures: audit.failures(),
+        rooms_active: 0,
+        watcher_ok_rooms: 0,
+      });
     }
   });
 
