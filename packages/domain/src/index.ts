@@ -173,3 +173,12 @@ export {
   type SignalKind,
   type Transition,
 } from './coordination/types.ts';
+export { applyMessages } from './coordination/engine.ts';
+export { evaluate } from './coordination/rules.ts';
+export { contentTokens, jaccard, textSimilarity } from './coordination/similarity.ts';
+export {
+  extractEvents,
+  type EventType,
+  type ExtractedEvent,
+  type RawTarget,
+} from './coordination/extract.ts';

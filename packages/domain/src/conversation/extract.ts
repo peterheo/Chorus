@@ -64,8 +64,8 @@ const MEDIUM_COMMITMENTS: readonly RegExp[] = [
   /\b(on it|I'm on it|leave it (with|to) me|we('ll| will)\s+(look|check|investigate|handle|fix|follow up))\b/i,
 ];
 
-/** Applies the pre-processing of rule 1 and returns the message's sentences. */
-function sentencesOf(content: string): string[] {
+/** Applies the pre-processing of rule 1 and returns the message's sentences. Reused by CC-2's rules-v2. */
+export function sentencesOf(content: string): string[] {
   const head = new TextDecoder().decode(new TextEncoder().encode(content).subarray(0, MAX_BYTES));
   return head
     .replace(/```[\s\S]*?(```|$)/g, ' ')
@@ -77,7 +77,8 @@ function sentencesOf(content: string): string[] {
     .filter((sentence) => Array.from(sentence).length >= MIN_SENTENCE);
 }
 
-const truncate = (sentence: string): string => {
+/** Truncates to at most 280 code points, the CC-1a excerpt rule. Reused by CC-2's rules-v2. */
+export const truncate = (sentence: string): string => {
   const points = Array.from(sentence);
   return points.length <= MAX_EXCERPT ? sentence : `${points.slice(0, MAX_EXCERPT - 1).join('')}…`;
 };
