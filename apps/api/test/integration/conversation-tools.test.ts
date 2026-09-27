@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
@@ -89,6 +89,20 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
   });
 
   it('CC1: scans, explicitly links a suggestion, and completes the normal task lifecycle', async () => {
+    let activeConnections = 0;
+    let heldConnectionDuringFetch = false;
+    const acquired = () => {
+      activeConnections += 1;
+    };
+    const released = () => {
+      activeConnections -= 1;
+    };
+    stack.pool.on('acquire', acquired);
+    stack.pool.on('release', released);
+    const connectSpy = vi.spyOn(stack.pool, 'connect');
+    stack.fake.onMessagesRequest = () => {
+      heldConnectionDuringFetch = activeConnections > 0;
+    };
     const a = stack.agent('A');
     const question = stack.fake.post(SHAREDNET_ROOM, {
       memberId: a.memberId,
@@ -116,6 +130,12 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
       to_sequence: commitment.sequence,
     });
     expect(scanned.isError, JSON.stringify(scanned.data)).toBe(false);
+    expect(connectSpy).toHaveBeenCalled();
+    expect(heldConnectionDuringFetch).toBe(false);
+    stack.fake.onMessagesRequest = undefined;
+    stack.pool.off('acquire', acquired);
+    stack.pool.off('release', released);
+    connectSpy.mockRestore();
     expect(scanned.data).toMatchObject({
       scan: {
         from_sequence: question.sequence,

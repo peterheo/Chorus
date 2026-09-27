@@ -55,6 +55,8 @@ export class FakeSharedNet {
     limit: number;
     order: string | null;
   }[] = [];
+  /** Synchronous probe run while the API's fetch is in flight. */
+  onMessagesRequest: (() => void) | undefined;
   /** When true, items are returned without sender fields (a contract violation). */
   breakContract = false;
   private server: Server | undefined;
@@ -165,6 +167,7 @@ export class FakeSharedNet {
         const after = Number(url.searchParams.get('after') ?? '0');
         const limit = Number(url.searchParams.get('limit') ?? '50');
         const order = url.searchParams.get('order');
+        this.onMessagesRequest?.();
         this.messageRequests.push({ roomId, after, limit, order });
         const all = messageRoom.messages.filter((message) => message.sequence > after);
         const page = all.slice(0, limit);
