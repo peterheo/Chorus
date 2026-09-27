@@ -31,6 +31,8 @@ const READABLE = [
   'sharedos_audit_events',
   'purchases',
   'payment_verification_failures',
+  'conversation_scans',
+  'conversation_suggestions',
 ] as const;
 /** Tables with no privileges for the runtime role at all. */
 const NO_ACCESS = [
@@ -45,6 +47,7 @@ const NO_ACCESS = [
 const DEFINERS = [
   'chorus_activate_room',
   'chorus_arena_payee',
+  'chorus_conversation_seat',
   'chorus_create_session',
   'chorus_enroll_complete',
   'chorus_enroll_start',
@@ -129,6 +132,22 @@ describe('row-level security and definer functions, as the runtime role chorus_a
     await f.owner(
       `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, instance_id, room_id) VALUES ($1, $2, $3, $4, $5)`,
       [w.ws.id, w.executor.id, sha256(`${w.ws.id}-token`), w.executor.instanceId, w.ws.roomId],
+    );
+    const scanId = await first(
+      `INSERT INTO conversation_scans
+         (workspace_id, session_id, room_id, from_sequence, to_sequence, cutoff_sequence, messages_examined,
+          extractor, requested_by)
+       VALUES ($1, $2, $3, 1, 5, 5, 1, 'rules-v1', $4) RETURNING id`,
+      [w.ws.id, w.session.id, w.ws.roomId, w.manager.id],
+    );
+    await f.owner(
+      `INSERT INTO conversation_suggestions
+         (workspace_id, session_id, kind, fingerprint, excerpt, confidence, source_message_id, source_sequence,
+          source_member_id, source_principal_id, source_name, source_content_snapshot, source_content_sha256,
+          replied_by_other, suggested_next_action, first_scan_id, last_scan_id)
+       VALUES ($1, $2, 'question', $3, 'Who owns this?', 'high', 'msg_RlsSeed01', 1, 'i_RlsSeed01',
+               'p_RlsSeed01', 'seed', 'Who owns this?', $4, false, 'Answer it.', $5, $5)`,
+      [w.ws.id, w.session.id, sha256(`${w.session.id}-rls-seed`), sha256('Who owns this?'), scanId],
     );
   }
 
