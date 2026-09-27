@@ -25,7 +25,7 @@ curl -sS -X POST {{PUBLIC_BASE_URL}}/v1/rooms/activate -H 'content-type: applica
   -d '{"sharednet_room_id":"rom_…","sharednet_invite_token":"rit_…"}'
 ```
 
-Chorus joins as member "chorus" and posts nothing. It reads chorus-verify messages, and, only when a member calls chorus.scan_conversation, the selected window of at most 200 messages; from that window it stores the suggestions and their source snapshots.
+Chorus joins as member "chorus" and posts nothing by default. It reads chorus-verify messages, and scans only the selected window when a member calls chorus.scan_conversation, storing suggestions and their source snapshots. If a session administrator turns on coordination mode observe or assist, Chorus reads every new room message for that session. In assist it posts at most 3 short coordination notes per 5 minutes, containing only what was said in the room.
 
 ## 5. Enroll
 
@@ -76,6 +76,8 @@ The reviewer: `chorus.list_my_reviews` → `chorus.get_result` → `chorus.revie
 Conversation suggestions (inferred, never authority): chorus.scan_conversation (a window of at most 200 messages) → chorus.list_suggestions → {{#billing}}create the task (chorus.create_tasks with request_id = recommended_request_id when billing is on) → {{/billing}}chorus.link_suggestion, or chorus.dismiss_suggestion.
 
 `from_sequence` and `to_sequence` are SharedNet message sequence numbers from the room messages API. `chorus.list_suggestions` accepts states `open`, `linked`, or `dismissed`, and kinds `question` or `commitment`.
+
+`chorus.set_coordination_mode(session_id, mode, expected_version)` is administrator-only. The mode is `off`, `observe`, or `assist`. Enabling observe or assist starts from the room's latest sequence, so earlier messages are not re-announced.
 
 
 E6 request/response examples from a passing deployed run (IDs and times are placeholders):

@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`chorus tool definitions > K11 tools.snapshot: exactly the 33 shipped tools, with stable definitions 1`] = `
+exports[`chorus tool definitions > K11 tools.snapshot: exactly the 34 shipped tools, with stable definitions 1`] = `
 [
   {
     "description": "Returns task counts and the five most recently completed tasks on boards in a session.",
@@ -1147,6 +1147,44 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 33 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "link_message",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Sets a session’s room-message coordination mode. Requires an administrator and the latest session version.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_version": {
+          "type": "integer",
+        },
+        "idempotency_key": {
+          "type": "string",
+        },
+        "mode": {
+          "type": "string",
+        },
+        "session_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+        "mode",
+        "expected_version",
+        "idempotency_key",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.set_coordination_mode",
+    "namespace": "chorus",
+    "readWrite": "write",
+    "requiredCapability": {
+      "action": "administer",
       "resource": {
         "namespace": "chorus",
         "path": [],

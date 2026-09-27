@@ -1,4 +1,5 @@
 import {
+  ChorusError,
   createBoard,
   getSession,
   grantRole,
@@ -8,10 +9,44 @@ import {
   removeMember,
   revokeRole,
   setSessionPolicy,
+  withReadTx,
 } from '@chorus/domain';
 import { B, I, S, SA, type ChorusToolSpec } from './define.ts';
 
 const session = (a: Record<string, unknown>): string[] => ['sessions', a['session_id'] as string];
+
+async function setCoordinationMode({ read, command, input }: Parameters<ChorusToolSpec['run']>[0]) {
+  const sessionId = input['session_id'] as string;
+  const mode = input['mode'] as string;
+  let coordinationCursor: number | undefined;
+  if (mode === 'observe' || mode === 'assist') {
+    coordinationCursor = await withReadTx(read, async (db) => {
+      const { rows } = await db.query<{ last_sequence: string | null }>(
+        `SELECT watcher.last_sequence
+           FROM public.sessions s
+           LEFT JOIN public.chorus_watcher_rooms() watcher
+             ON watcher.workspace_id = s.workspace_id AND watcher.room_id = s.room_id
+          WHERE s.workspace_id = $1 AND s.id = $2`,
+        [read.workspaceId, sessionId],
+      );
+      if (rows.length === 0) throw new ChorusError('not_found', 'Not found.');
+      const cursor = Number(rows[0]?.last_sequence ?? 0);
+      if (!Number.isSafeInteger(cursor) || cursor < 0) {
+        throw new ChorusError('internal_error', 'The room cursor is invalid.');
+      }
+      return cursor;
+    });
+  }
+  return setSessionPolicy(
+    command,
+    {
+      session_id: sessionId,
+      expected_version: input['expected_version'],
+      coordination_mode: mode,
+    },
+    coordinationCursor === undefined ? {} : { coordinationCursor },
+  );
+}
 
 const POLICY = {
   name: S,
@@ -99,6 +134,17 @@ export const sessionTools: readonly ChorusToolSpec[] = [
     required: ['session_id', 'expected_version'],
     path: session,
     run: ({ command, input }) => setSessionPolicy(command, input),
+  },
+  {
+    name: 'chorus.set_coordination_mode',
+    description:
+      'Sets a session’s room-message coordination mode. Requires an administrator and the latest session version.',
+    action: 'administer',
+    write: true,
+    props: { session_id: S, mode: S, expected_version: I },
+    required: ['session_id', 'mode', 'expected_version'],
+    path: session,
+    run: setCoordinationMode,
   },
   {
     name: 'chorus.remove_member',

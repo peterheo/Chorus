@@ -84,6 +84,7 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     'chorus.grant_role',
     'chorus.revoke_role',
     'chorus.set_session_policy',
+    'chorus.set_coordination_mode',
     'chorus.remove_member',
   ];
 
@@ -111,7 +112,7 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     expect(asAdmin).toEqual(
       expect.arrayContaining([...ADMIN_ONLY, 'chorus.complete', 'chorus.create_board']),
     );
-    expect(asAdmin).toHaveLength(33); // 26 + room_pulse, create_action_board, create_tasks, and 4 conversation tools
+    expect(asAdmin).toHaveLength(34); // 27 + room_pulse, create_action_board, create_tasks, and 4 conversation tools
 
     expect(await toolNames(roomOnly)).toEqual([
       'chorus.create_action_board',
@@ -124,6 +125,95 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     // A stranger to the room sees nothing at all.
     const stranger = await f.actor(ws, 'k1-stranger', { inRoom: false });
     expect(await toolNames(stranger)).toEqual([]);
+  });
+
+  it('CC-2d-1 coordination mode is administrator-only and starts at the watcher checkpoint', async () => {
+    const admin = await f.actor(ws, 'coordination-mode-admin');
+    const session = await f.session(admin);
+    const participant = await f.actor(ws, 'coordination-mode-participant');
+    await f.join(session, participant);
+    const sealedMemberId = 'i_SealedSeatMember01';
+    await f.owner(
+      "UPDATE rooms SET provider = 'sharednet', external_room_id = 'rom_ModeTest01' WHERE id = $1",
+      [session.roomId],
+    );
+    await f.owner(
+      `INSERT INTO sharednet_seats
+         (workspace_id, room_id, member_id, principal_id, token_ciphertext, token_nonce, key_id)
+       VALUES ($1, $2, $3, 'p_SealedPrincipal01', $4, $5, 'deadbeef')`,
+      [
+        ws.id,
+        session.roomId,
+        sealedMemberId,
+        Buffer.from('sealed-token-sentinel'),
+        Buffer.alloc(12, 7),
+      ],
+    );
+    await f.owner(
+      'INSERT INTO sharednet_cursors (workspace_id, room_id, last_sequence) VALUES ($1, $2, 42)',
+      [ws.id, session.roomId],
+    );
+
+    expect(
+      await call(participant, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'observe',
+        expected_version: 2,
+      }),
+    ).toMatchObject({ status: 'denied' });
+
+    const observe = okOutput(
+      await call(admin, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'observe',
+        expected_version: 2,
+      }),
+    );
+    const serialized = JSON.stringify(observe);
+    expect(serialized).not.toContain('sealed-token-sentinel');
+    expect(serialized).not.toContain('token_ciphertext');
+    expect(serialized).not.toContain('token_nonce');
+    expect(serialized).not.toContain('deadbeef');
+    expect(serialized).not.toContain(sealedMemberId);
+    const cursor = async () =>
+      Number(
+        (
+          await f.owner<{ cursor: string }>(
+            'SELECT cursor FROM conversation_engine_state WHERE session_id = $1',
+            [session.id],
+          )
+        )[0]?.cursor,
+      );
+    expect(await cursor()).toBe(42);
+
+    await f.owner('UPDATE sharednet_cursors SET last_sequence = 57 WHERE room_id = $1', [
+      session.roomId,
+    ]);
+    okOutput(
+      await call(admin, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'assist',
+        expected_version: 3,
+      }),
+    );
+    expect(await cursor()).toBe(57);
+
+    await f.owner('UPDATE sharednet_cursors SET last_sequence = 80 WHERE room_id = $1', [
+      session.roomId,
+    ]);
+    okOutput(
+      await call(admin, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'off',
+        expected_version: 4,
+      }),
+    );
+    expect(await cursor()).toBe(57);
+    const [row] = await f.owner<{ coordination_mode: string }>(
+      'SELECT coordination_mode FROM sessions WHERE id = $1',
+      [session.id],
+    );
+    expect(row?.coordination_mode).toBe('off');
   });
 
   it('K2 sharedos.enforcement.cross_session: another session is denied by SharedOS before any domain call', async () => {

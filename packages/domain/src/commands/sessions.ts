@@ -395,6 +395,7 @@ export type PolicyChanged = { session_id: string; version: number; changed: stri
 export async function setSessionPolicy(
   ctx: CommandContext,
   input: unknown,
+  options: { readonly coordinationCursor?: number } = {},
 ): Promise<PolicyChanged> {
   const raw = requireObject(input, [
     'session_id',
@@ -449,6 +450,10 @@ export async function setSessionPolicy(
     ]);
   const fields = Object.keys(changes);
   if (fields.length === 0) throw invalid('input', 'At least one policy field is required.');
+  const coordinationCursor =
+    options.coordinationCursor === undefined
+      ? undefined
+      : requireInteger(options.coordinationCursor, 'coordination_cursor', 0);
 
   return runCommand(ctx, {
     type: 'session.set_policy',
@@ -465,6 +470,18 @@ export async function setSessionPolicy(
         'SELECT chorus_session_set_policy($1, $2::jsonb) AS version',
         [sessionId, JSON.stringify(changes)],
       );
+      if (
+        coordinationCursor !== undefined &&
+        (changes['coordination_mode'] === 'observe' || changes['coordination_mode'] === 'assist')
+      ) {
+        await tx.db.query(
+          `INSERT INTO conversation_engine_state (workspace_id, session_id, cursor)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (workspace_id, session_id) DO UPDATE
+             SET cursor = EXCLUDED.cursor, updated_at = now()`,
+          [tx.workspaceId, sessionId, coordinationCursor],
+        );
+      }
       const version = tx.recordSessionVersion(changed.rows[0]?.version ?? 0);
       return {
         result: { session_id: sessionId, version, changed: fields },

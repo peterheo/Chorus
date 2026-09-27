@@ -98,6 +98,9 @@ describe('static entry pages', () => {
       expect(page).toContain('chorus.scan_conversation');
       expect(page).toContain('source snapshots');
       expect(page).toContain('chorus.list_suggestions');
+      expect(page).toContain('chorus.set_coordination_mode');
+      expect(page).toContain('reads every new room message');
+      expect(page).toContain('3 short coordination notes per 5 minutes');
     }
   });
 
