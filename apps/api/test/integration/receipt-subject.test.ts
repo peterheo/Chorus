@@ -7,7 +7,10 @@ import {
   claimAs,
   makeWorld,
   newTask,
+  requestReviewAs,
   submitAs,
+  taskInReview,
+  verdictAs,
   type World,
 } from '../../../../packages/domain/test/helpers/world.ts';
 
@@ -93,5 +96,90 @@ describe('receipt subject binding', () => {
       result: { submitted_by: { actor_id: world.executor.id, member_id: null } },
       review: null,
     });
+  });
+
+  it('returns the complete approved review block with unique submitter and reviewer member IDs', async () => {
+    const reviewedWorld = await makeWorld(fixture, await fixture.workspace('receipt-reviewed'));
+    await fixture.owner(
+      "UPDATE rooms SET provider = 'sharednet', external_room_id = 'rom_ReviewTest01' WHERE id = $1",
+      [reviewedWorld.session.roomId],
+    );
+    const flow = await taskInReview(reviewedWorld);
+    const requested = await requestReviewAs(
+      reviewedWorld,
+      flow.taskId,
+      flow.version,
+      flow.revision,
+      reviewedWorld.reviewer,
+    );
+    await verdictAs(
+      reviewedWorld,
+      requested.review,
+      flow.digest,
+      'approved',
+      reviewedWorld.reviewer,
+    );
+    await fixture.owner(
+      "UPDATE agent_instances SET sharednet_member_id = 'i_Submitter0001' WHERE id = $1",
+      [reviewedWorld.executor.instanceId],
+    );
+    await fixture.owner(
+      "UPDATE agent_instances SET sharednet_member_id = 'i_Reviewer0001' WHERE id = $1",
+      [reviewedWorld.reviewer.instanceId],
+    );
+
+    const envelope = await getReceipt(
+      fixture.readCtx(reviewedWorld.manager),
+      reviewedWorld.session.id,
+      flow.taskId,
+      'abc1234',
+      'https://chorus.example',
+      key.privateKey,
+      key.keyId,
+    );
+    expect(envelope.receipt).toMatchObject({
+      result: {
+        revision: 1,
+        content_sha256: flow.digest,
+        submitted_by: {
+          actor_id: reviewedWorld.executor.id,
+          member_id: 'i_Submitter0001',
+        },
+      },
+      review: {
+        id: requested.review.id,
+        verdict: 'approved',
+        reviewer: {
+          actor_id: reviewedWorld.reviewer.id,
+          member_id: 'i_Reviewer0001',
+        },
+      },
+    });
+    const review = envelope.receipt['review'] as Record<string, unknown>;
+    expect(typeof review['decided_at']).toBe('string');
+
+    await expect(
+      getReceipt(
+        fixture.readCtx(reviewedWorld.outsider),
+        reviewedWorld.session.id,
+        flow.taskId,
+        'abc1234',
+        'https://chorus.example',
+        key.privateKey,
+        key.keyId,
+      ),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    const otherWorld = await makeWorld(fixture, await fixture.workspace('receipt-other-session'));
+    await expect(
+      getReceipt(
+        fixture.readCtx(otherWorld.executor),
+        otherWorld.session.id,
+        flow.taskId,
+        'abc1234',
+        'https://chorus.example',
+        key.privateKey,
+        key.keyId,
+      ),
+    ).rejects.toMatchObject({ code: 'not_found' });
   });
 });

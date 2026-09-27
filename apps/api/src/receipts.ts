@@ -1,7 +1,7 @@
 import { createHash, createPublicKey, sign, verify, type KeyObject } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import type pg from 'pg';
-import { ChorusError, isUuid, withReadTx, type Queryable, type ReadContext } from '@chorus/domain';
+import { ChorusError, isUuid, withReadTx, type ReadContext } from '@chorus/domain';
 import { sendError } from './http.ts';
 import type { RateLimiter } from './rate-limit.ts';
 
@@ -86,19 +86,6 @@ export function verifyReceiptEnvelope(
   }
 }
 
-async function memberIdFor(
-  db: Queryable,
-  workspaceId: string,
-  actorId: string,
-): Promise<string | null> {
-  const { rows } = await db.query<{ member_id: string }>(
-    `SELECT DISTINCT sharednet_member_id AS member_id FROM agent_instances
-      WHERE workspace_id = $1 AND actor_id = $2 AND sharednet_member_id IS NOT NULL`,
-    [workspaceId, actorId],
-  );
-  return rows.length === 1 ? (rows[0]?.member_id ?? null) : null;
-}
-
 export async function getReceipt(
   ctx: ReadContext,
   sessionId: string,
@@ -174,7 +161,15 @@ export async function getReceipt(
     if (row.revision === null || row.content_sha256 === null || row.submitted_by === null) {
       throw new ChorusError('internal_error', 'Completed task is missing its result.');
     }
-    const submitterMember = await memberIdFor(db, ctx.workspaceId, row.submitted_by);
+    const subjectActorIds = [row.submitted_by];
+    if (row.reviewer_actor_id !== null) subjectActorIds.push(row.reviewer_actor_id);
+    const subjectMembers = await db.query<{ actor_id: string; member_id: string | null }>(
+      'SELECT actor_id, member_id FROM chorus_session_member_ids($1, $2::uuid[])',
+      [sessionId, subjectActorIds],
+    );
+    const memberIds = new Map(
+      subjectMembers.rows.map((member) => [member.actor_id, member.member_id]),
+    );
     const review =
       row.review_required &&
       row.review_id !== null &&
@@ -186,7 +181,7 @@ export async function getReceipt(
             verdict: 'approved',
             reviewer: {
               actor_id: row.reviewer_actor_id,
-              member_id: await memberIdFor(db, ctx.workspaceId, row.reviewer_actor_id),
+              member_id: memberIds.get(row.reviewer_actor_id) ?? null,
             },
             decided_at: row.decided_at.toISOString(),
           }
@@ -203,7 +198,10 @@ export async function getReceipt(
       result: {
         revision: row.revision,
         content_sha256: row.content_sha256,
-        submitted_by: { actor_id: row.submitted_by, member_id: submitterMember },
+        submitted_by: {
+          actor_id: row.submitted_by,
+          member_id: memberIds.get(row.submitted_by) ?? null,
+        },
       },
       review,
       completed_at: row.completed_at.toISOString(),
@@ -233,7 +231,7 @@ export function registerReceiptRoutes(
   });
 
   app.post('/v1/receipts/verify', async (request, reply) => {
-    const decision = deps.limiter.hit(request.ip);
+    const decision = deps.limiter.hit('global');
     if (!decision.ok)
       return sendError(request, reply, 429, 'rate_limited', 'Too many requests.', {
         'retry-after': String(decision.retryAfterSeconds),

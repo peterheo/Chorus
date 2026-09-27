@@ -15,7 +15,7 @@ describe('signed receipt endpoints', () => {
     stack = await startStack({
       watch: false,
       receiptKey: pair.privateKey,
-      limits: { receiptVerifyPerIpPerMinute: 2 },
+      limits: { receiptVerifyPerMinute: 2 },
     });
   });
   afterAll(async () => stack.stop());

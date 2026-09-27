@@ -24,7 +24,7 @@ export interface AppLimits {
   readonly paidPerActorPerMinute: number;
   readonly pulsePerActorPerMinute: number;
   readonly conversationScanPerActorPerMinute: number;
-  readonly receiptVerifyPerIpPerMinute: number;
+  readonly receiptVerifyPerMinute: number;
 }
 
 const DEFAULT_LIMITS: AppLimits = {
@@ -36,7 +36,7 @@ const DEFAULT_LIMITS: AppLimits = {
   paidPerActorPerMinute: 30,
   pulsePerActorPerMinute: 10,
   conversationScanPerActorPerMinute: 6,
-  receiptVerifyPerIpPerMinute: 30,
+  receiptVerifyPerMinute: 600,
 };
 
 export interface AppOptions {
@@ -229,7 +229,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     pool,
     privateKey: config.receiptPrivateKey ?? null,
     keyId: config.receiptKeyId ?? null,
-    limiter: new RateLimiter({ limit: limits.receiptVerifyPerIpPerMinute, windowMs: 60_000 }),
+    limiter: new RateLimiter({ limit: limits.receiptVerifyPerMinute, windowMs: 60_000 }),
   });
   registerStaticPages(app, {
     publicBaseUrl: config.publicBaseUrl,
