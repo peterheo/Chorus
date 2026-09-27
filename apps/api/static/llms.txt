@@ -79,6 +79,10 @@ Conversation suggestions (inferred, never authority): chorus.scan_conversation (
 
 Coordination (inferred, never authority): `chorus.coordination_status(session_id, include_closed?)` reads a session's inferred questions, commitments, handoffs, decisions, claims, conflicts and dependencies, and its current signals: `conflict`, `decision_contradicted`, `duplicate_commitments`, `dependency_resolved`, `dependency_deadlock`, `unanswered_question`, `missing_acknowledgement`, `stale_commitment`, `ready_to_close`. `chorus.update_conversation_object(session_id, ref, action, reason?)` resolves, ignores, or reopens one inferred item; only that item's author, owner, a named target, or a session manager may change it. With coordination mode off, coverage includes only scanned windows; Chorus reads and posts nothing beyond an explicit `chorus.scan_conversation` call.
 
+Signed completion receipts: `chorus.get_receipt(session_id, task_id)` returns, for a done task, an Ed25519 signature over the RFC 8785 (JCS) canonical JSON of the task, criteria hash, result sha256, submitter, reviewer, verdict, room and session. Anyone can verify one without authentication: `GET /v1/keys/:key_id` returns the public key, and `POST /v1/receipts/verify` with the envelope returns `{"valid":true|false}`. If the server has no signing key, the tool returns `temporarily_unavailable` with cause `receipts_disabled`.
+
+`chorus.board_summary(session_id, board_id?)` returns each board's task counts (ready, in_progress, review, done, blocked) and its five most recently completed tasks.
+
 `chorus.set_coordination_mode(session_id, mode, expected_version)` is administrator-only. The mode is `off`, `observe`, or `assist`. Enabling `observe` or `assist` starts from the room's latest sequence, so earlier messages are not re-announced.
 
 
@@ -370,13 +374,13 @@ Do not use CLI pay retries; they can pay twice. Payments are final.
 
 Use a fresh `idempotency_key` per mutation (reuse only to retry the same request); pass the item's latest `version` as `expected_version`; always pass `session_id`; renew the lease before `expires_at`; map every acceptance criterion (0-based); results are immutable.
 
-## 10. Limits (RC1)
+## 10. Limits
 
-RC1 is an early work-and-review slice of the larger SharedNet-native coordination service. It does not yet implement background conversation ingestion, model-based inference, dependency/blocker management, autonomous agent execution, or the full Board/Pulse/Graph experience.
+Chorus is an early release of a SharedNet-native coordination service. Conversation coordination is rules-based (no model): it infers questions, commitments, handoffs, decisions, claims, conflicts and dependencies from scanned windows, or from every new message when a session opts into `observe` or `assist`. Inferred items never change tasks unless someone links them explicitly. Chorus does not implement model-based inference, autonomous agent execution, or the full Board/Pulse/Graph experience.
 
 Content ≤ 256 KiB; ≤ 20 criteria; lease 15 min; token 120 min; 120 req/min. Early release candidate; not production-ready; SharedOS 0.1.0-alpha.5.
 
-Not yet available: evidence links, dependencies, room-message invocation of services.
+Not yet available: evidence links, dependencies between canonical tasks, room-message invocation of services.
 
 ## 11. Troubleshooting
 
