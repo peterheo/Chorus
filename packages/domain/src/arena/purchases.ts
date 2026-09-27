@@ -42,7 +42,7 @@ export type Purchase = {
   payee_member_id: string;
   payee_principal_id: string;
   memo: string;
-  state: 'quoted' | 'delivered';
+  state: 'quoted' | 'delivered' | 'voided';
   created_at: string;
   delivered_at: string | null;
   txn_id: string | null;
@@ -292,6 +292,7 @@ export async function deliverPurchase(
         if (row.state === 'delivered' && row.response !== null) {
           return { result: row.response, events: [], noop: true };
         }
+        if (row.state === 'voided') throw voided();
         // Fast refusal when this buyer already spent the txn on another purchase; the UNIQUE index on
         // txn_id still arbitrates every race (and every buyer), below.
         const used = await tx.db.query('SELECT 1 FROM purchases WHERE txn_id = $1 AND id <> $2', [
@@ -332,6 +333,11 @@ export async function deliverPurchase(
     },
   );
 }
+
+const voided = (): ChorusError =>
+  new ChorusError('invalid_transition', 'This purchase was voided and its payment refunded.', {
+    details: { reason: 'purchase_voided' },
+  });
 
 const alreadyUsed = (): ChorusError =>
   new ChorusError('payment_already_used', 'This payment was already used for another purchase.');
@@ -391,6 +397,163 @@ export async function recordVerificationFailure(
           ],
         );
         return { result: { recorded: true }, events: [], noop: true };
+      },
+    },
+  );
+}
+
+/** The refund of a voided purchase: `pending` until SharedNet accepted the transfer, then `sent`. */
+export type PurchaseRefund = {
+  purchase_id: string;
+  txn_id: string;
+  amount: number;
+  to_member_id: string;
+  reason: string;
+  transfer_key: string;
+  refund_txn_id: string | null;
+  created_at: string;
+  sent_at: string | null;
+};
+
+type RefundRow = Omit<PurchaseRefund, 'created_at' | 'sent_at'> & {
+  created_at: Date;
+  sent_at: Date | null;
+};
+
+const REFUND_COLUMNS =
+  'purchase_id, txn_id, amount, to_member_id, reason, transfer_key, refund_txn_id, created_at, sent_at';
+
+const toRefund = (row: RefundRow): PurchaseRefund => ({
+  ...row,
+  created_at: row.created_at.toISOString(),
+  sent_at: row.sent_at === null ? null : row.sent_at.toISOString(),
+});
+
+/** The caller's own refund of a purchase, if it was voided (row-level security scopes it to them). */
+export async function findRefund(
+  ctx: ReadContext,
+  purchaseId: string,
+): Promise<PurchaseRefund | undefined> {
+  return withReadTx(ctx, async (db) => {
+    const { rows } = await db.query<RefundRow>(
+      `SELECT ${REFUND_COLUMNS} FROM purchase_refunds WHERE workspace_id = $1 AND purchase_id = $2`,
+      [ctx.workspaceId, purchaseId],
+    );
+    const row = rows[0];
+    return row === undefined ? undefined : toRefund(row);
+  });
+}
+
+/**
+ * Voids a paid, undelivered purchase in ONE transaction (key `arena-void:<purchase_id>`): lock it, refuse a
+ * delivered one, return the existing refund of an already voided one, refuse a txn another purchase holds,
+ * then mark it voided WITH its txn (so that payment can never buy anything else, nor this purchase be
+ * delivered later) and record a pending refund to the seat that paid. The payment must already be verified
+ * against the ledger by the caller; sending the refund is a separate, retryable step outside any transaction.
+ */
+export async function voidPurchase(
+  ctx: CommandContext,
+  args: { readonly purchase: Purchase; readonly txn_id: string; readonly reason: string },
+): Promise<PurchaseRefund> {
+  const { purchase, txn_id: txnId, reason } = args;
+  return runCommand<PurchaseRefund>(
+    { ...ctx, idempotencyKey: `arena-void:${purchase.id}` },
+    {
+      type: 'arena.void',
+      input: { purchase_id: purchase.id },
+      authorize: async (tx) => {
+        await requireRoomMember(tx, ctx.roomId);
+      },
+      handle: async (tx) => {
+        const locked = await tx.db.query<PurchaseRow>(
+          `SELECT ${COLUMNS} FROM purchases WHERE workspace_id = $1 AND id = $2 FOR UPDATE`,
+          [tx.workspaceId, purchase.id],
+        );
+        const row = locked.rows[0];
+        if (row === undefined) throw notFound();
+        if (row.state === 'delivered') {
+          throw new ChorusError('invalid_transition', 'A delivered purchase cannot be voided.', {
+            details: { reason: 'delivered' },
+          });
+        }
+        if (row.state === 'voided') {
+          const existing = await tx.db.query<RefundRow>(
+            `SELECT ${REFUND_COLUMNS} FROM purchase_refunds WHERE workspace_id = $1 AND purchase_id = $2`,
+            [tx.workspaceId, purchase.id],
+          );
+          const refund = existing.rows[0];
+          if (refund === undefined)
+            throw new ChorusError('internal_error', 'A voided purchase has no refund.');
+          return { result: toRefund(refund), events: [], noop: true };
+        }
+        const used = await tx.db.query('SELECT 1 FROM purchases WHERE txn_id = $1 AND id <> $2', [
+          txnId,
+          purchase.id,
+        ]);
+        if (used.rowCount !== 0) throw alreadyUsed();
+        try {
+          await tx.db.query(
+            `UPDATE purchases SET state = 'voided', txn_id = $3 WHERE workspace_id = $1 AND id = $2`,
+            [tx.workspaceId, purchase.id, txnId],
+          );
+        } catch (error) {
+          if ((error as { code?: string }).code === '23505') throw alreadyUsed();
+          throw error;
+        }
+        const inserted = await tx.db.query<RefundRow>(
+          `INSERT INTO purchase_refunds (workspace_id, purchase_id, actor_id, txn_id, amount, to_member_id, reason)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING ${REFUND_COLUMNS}`,
+          [
+            tx.workspaceId,
+            purchase.id,
+            tx.actorId,
+            txnId,
+            row.amount,
+            row.requester_member_id,
+            reason,
+          ],
+        );
+        const refund = inserted.rows[0];
+        if (refund === undefined)
+          throw new ChorusError('internal_error', 'The refund was not stored.');
+        // Like a quote, a void changes no aggregate: the purchase and refund rows are the record.
+        return { result: toRefund(refund), events: [], noop: true };
+      },
+    },
+  );
+}
+
+/** Records that SharedNet accepted the refund transfer (key `arena-refund:<purchase_id>`). Once only. */
+export async function recordRefundSent(
+  ctx: CommandContext,
+  args: { readonly purchase_id: string; readonly refund_txn_id: string },
+): Promise<PurchaseRefund> {
+  return runCommand<PurchaseRefund>(
+    { ...ctx, idempotencyKey: `arena-refund:${args.purchase_id}` },
+    {
+      type: 'arena.refund_sent',
+      input: { purchase_id: args.purchase_id, refund_txn_id: args.refund_txn_id },
+      // Row-level security limits this to the buyer's own refund. Room membership is deliberately not
+      // required: a buyer who has since left the room is still owed the record that the money went back.
+      authorize: () => Promise.resolve(),
+      handle: async (tx) => {
+        const updated = await tx.db.query<RefundRow>(
+          `UPDATE purchase_refunds SET refund_txn_id = $3, sent_at = now()
+            WHERE workspace_id = $1 AND purchase_id = $2 AND refund_txn_id IS NULL
+            RETURNING ${REFUND_COLUMNS}`,
+          [tx.workspaceId, args.purchase_id, args.refund_txn_id],
+        );
+        const row =
+          updated.rows[0] ??
+          (
+            await tx.db.query<RefundRow>(
+              `SELECT ${REFUND_COLUMNS} FROM purchase_refunds WHERE workspace_id = $1 AND purchase_id = $2`,
+              [tx.workspaceId, args.purchase_id],
+            )
+          ).rows[0];
+        if (row === undefined) throw notFound();
+        return { result: toRefund(row), events: [], noop: true };
       },
     },
   );

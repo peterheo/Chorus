@@ -24,9 +24,9 @@ const scope: ChorusRequestScope = {
 describe('chorus tool definitions', () => {
   const tools = chorusTools(deps);
 
-  it('K11 tools.snapshot: exactly the 36 shipped tools, with stable definitions', () => {
+  it('K11 tools.snapshot: exactly the 37 shipped tools, with stable definitions', () => {
     const definitions = tools.map((t) => t.definition).sort((a, b) => (a.name < b.name ? -1 : 1));
-    expect(definitions).toHaveLength(36);
+    expect(definitions).toHaveLength(37);
     expect(definitions).toMatchSnapshot();
   });
 
@@ -37,9 +37,13 @@ describe('chorus tool definitions', () => {
       expect(d.requiredCapability.resource).toEqual({ namespace: 'chorus', path: [] });
       expect(d.inputSchema).toMatchObject({ type: 'object', additionalProperties: false });
       expect(d.description.length).toBeGreaterThan(20);
-      // Mutations carry an idempotency key, except the paid tools: their own request_id is their idempotency.
+      // Mutations carry an idempotency key, except the purchase tools: the purchase's request_id is their
+      // idempotency (the paid tools, and void_purchase, which names the purchase to void by it).
       const required = (d.inputSchema as { required: string[] }).required;
-      const paid = d.name === 'chorus.create_action_board' || d.name === 'chorus.create_tasks';
+      const paid =
+        d.name === 'chorus.create_action_board' ||
+        d.name === 'chorus.create_tasks' ||
+        d.name === 'chorus.void_purchase';
       expect(required.includes('idempotency_key')).toBe(d.readWrite === 'write' && !paid);
       expect(required.includes('request_id')).toBe(paid);
     }

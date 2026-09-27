@@ -13,7 +13,7 @@ import {
   reviewVerdict,
   submitResult,
 } from '@chorus/domain';
-import { B, I, OA, S, SA, type ChorusToolSpec } from './define.ts';
+import { B, I, OA, S, SA, objectArray, type ChorusToolSpec } from './define.ts';
 import { getReceipt } from '../../receipts.ts';
 
 const session = (a: Record<string, unknown>): string[] => ['sessions', a['session_id'] as string];
@@ -173,7 +173,16 @@ export const workTools: readonly ChorusToolSpec[] = [
       content: S,
       content_type: S,
       criteria_mapping: OA,
-      supporting_refs: SA,
+      supporting_refs: {
+        ...objectArray(
+          {
+            url: { type: 'string', minLength: 1, maxLength: 2048 },
+            label: { type: 'string', minLength: 1, maxLength: 200 },
+          },
+          ['url', 'label'],
+        ),
+        maxItems: 10,
+      },
     },
     required: [
       'session_id',

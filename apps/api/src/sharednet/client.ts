@@ -19,6 +19,14 @@ export interface SharedNetMessage {
   readonly type?: string;
 }
 
+/**
+ * The name to show for a sender. SharedNet's `sender.name` is nullable display text (an unnamed seat sends
+ * null, and it may be absent or blank), so every reader falls back to the member id the same way.
+ */
+export function senderDisplayName(name: unknown, memberId: string): string {
+  return typeof name === 'string' && name.trim() !== '' ? name : memberId;
+}
+
 export interface WaitPage {
   readonly messages: readonly SharedNetMessage[];
   readonly hasMore: boolean;

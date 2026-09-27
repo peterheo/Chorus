@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`chorus tool definitions > K11 tools.snapshot: exactly the 36 shipped tools, with stable definitions 1`] = `
+exports[`chorus tool definitions > K11 tools.snapshot: exactly the 37 shipped tools, with stable definitions 1`] = `
 [
   {
     "description": "Returns task counts and the five most recently completed tasks on boards in a session.",
@@ -1319,8 +1319,26 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 36 shipped to
         },
         "supporting_refs": {
           "items": {
-            "type": "string",
+            "additionalProperties": false,
+            "properties": {
+              "label": {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string",
+              },
+              "url": {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string",
+              },
+            },
+            "required": [
+              "url",
+              "label",
+            ],
+            "type": "object",
           },
+          "maxItems": 10,
           "type": "array",
         },
         "task_id": {
@@ -1385,6 +1403,40 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 36 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "link_message",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Refund path for a paid call you paid for but that was never delivered (for example, refused because the session changed after your quote). Voids the purchase and sends its credits back to the seat that paid. Final: the purchase can no longer be delivered. Safe to call again; if the refund is pending, calling again retries it without ever paying twice.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "payment_txn_id": {
+          "type": "string",
+        },
+        "request_id": {
+          "type": "string",
+        },
+        "service": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "service",
+        "request_id",
+        "payment_txn_id",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.void_purchase",
+    "namespace": "chorus",
+    "readWrite": "write",
+    "requiredCapability": {
+      "action": "void_purchase",
       "resource": {
         "namespace": "chorus",
         "path": [],

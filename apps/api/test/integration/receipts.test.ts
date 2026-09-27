@@ -64,7 +64,9 @@ describe('shareable receipt verification link', () => {
 
   it('shows a signed receipt to anyone who opens the link, without authentication', async () => {
     const envelope = signReceipt({ task: { id: 'task-1', title: 'Done' } }, pair.privateKey, keyId);
-    const url = new URL(receiptVerifyUrl(stack.baseUrl, envelope));
+    const link = receiptVerifyUrl(stack.baseUrl, envelope);
+    if (link === null) throw new Error('expected a link for a short envelope');
+    const url = new URL(link);
     expect(url.pathname).toBe('/v1/receipts/verify');
 
     const response = await fetch(url);
@@ -76,6 +78,11 @@ describe('shareable receipt verification link', () => {
       receipt: envelope.receipt,
       envelope,
     });
+  });
+
+  it('gives no link for an envelope too long to fit in a URL', () => {
+    const long = signReceipt({ note: 'x'.repeat(8000) }, pair.privateKey, keyId);
+    expect(receiptVerifyUrl(stack.baseUrl, long)).toBeNull();
   });
 
   it('never echoes a receipt whose signature does not verify', async () => {

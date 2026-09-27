@@ -12,7 +12,11 @@ import {
   type Uuid,
 } from '@chorus/domain';
 import { roomRosters, type RoomRosters } from './room-roster.ts';
-import type { SharedNetClient, SharedNetMessage } from './sharednet/client.ts';
+import {
+  senderDisplayName,
+  type SharedNetClient,
+  type SharedNetMessage,
+} from './sharednet/client.ts';
 
 /**
  * CC-2d (spec §10): follow + assist posting. After the watcher has handled a page of room messages, every
@@ -106,7 +110,7 @@ const toSource = (m: SharedNetMessage): SourceMessage => ({
   sequence: m.sequence,
   sender_member_id: m.senderMemberId,
   sender_principal_id: m.senderPrincipalId,
-  sender_name: m.senderName ?? '',
+  sender_name: senderDisplayName(m.senderName, m.senderMemberId),
   content: m.content,
   reply_to_message_id: m.replyToMessageId ?? null,
 });
@@ -134,7 +138,10 @@ export class CoordinationFollower {
       room.external_room_id,
       page
         .filter((m) => (m.type ?? 'message') === 'message')
-        .map((m) => ({ member_id: m.senderMemberId, name: m.senderName ?? '' })),
+        .map((m) => ({
+          member_id: m.senderMemberId,
+          name: senderDisplayName(m.senderName, m.senderMemberId),
+        })),
     );
     const roster = rosters.get(room.external_room_id, [room.member_id]);
     const fresh = page.filter(

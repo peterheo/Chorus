@@ -1,7 +1,12 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { JsonObject, SharedOSKernel, ToolResult } from '@aicoo/sharedos';
-import type { CreditTransfer, LedgerClient } from '@chorus/sharednet-ledger';
+import {
+  LedgerUnavailableError,
+  type CreditTransfer,
+  type LedgerClient,
+  type TransferRequest,
+} from '@chorus/sharednet-ledger';
 import { createFakeLedgerClient, sampleTransfer } from '@chorus/sharednet-ledger/testing';
 import {
   createFixture,
@@ -9,7 +14,7 @@ import {
   type Fixture,
   type SessionSeed,
 } from '../../../../packages/domain/test/helpers/fixture.ts';
-import { coordinationModeOf, isChorusError } from '@chorus/domain';
+import { coordinationModeOf, findRefund, isChorusError } from '@chorus/domain';
 import { RateLimiter } from '../../src/rate-limit.ts';
 import { buildAccessContext } from '../../src/sharedos/access-context.ts';
 import { createChorusKernel } from '../../src/sharedos/kernel.ts';
@@ -24,6 +29,10 @@ describe('paid coordination modes (real PostgreSQL as chorus_app, fake ledger)',
   let ledgerCalls = 0;
   /** Runs once, DURING the next payment verification (outside any transaction), to interleave a change. */
   let duringVerification: (() => Promise<unknown>) | undefined;
+  /** Refund transfers SharedNet accepted: one per Idempotency-Key, as SharedNet guarantees. */
+  const refunds: (TransferRequest & { id: string })[] = [];
+  /** How many refund attempts to fail (as a network error) before accepting. */
+  let failRefunds = 0;
   const ledger: LedgerClient = {
     listTransfers: async (args, signal) => {
       ledgerCalls++;
@@ -31,6 +40,17 @@ describe('paid coordination modes (real PostgreSQL as chorus_app, fake ledger)',
       duringVerification = undefined;
       if (hook !== undefined) await hook();
       return createFakeLedgerClient(transfers).listTransfers(args, signal);
+    },
+    transfer: (request) => {
+      if (failRefunds > 0) {
+        failRefunds--;
+        return Promise.reject(new LedgerUnavailableError('network'));
+      }
+      const known = refunds.find((r) => r.idempotencyKey === request.idempotencyKey);
+      if (known !== undefined) return Promise.resolve({ id: known.id });
+      const sent = { ...request, id: `txn_Refund${tag()}` };
+      refunds.push(sent);
+      return Promise.resolve({ id: sent.id });
     },
   };
   const kernels = new Map<'enabled' | 'disabled', SharedOSKernel>();
@@ -744,5 +764,247 @@ describe('paid coordination modes (real PostgreSQL as chorus_app, fake ledger)',
     expect(reused.code).toBe('request_conflict');
     expect(await purchases(w)).toBe(before);
     expect((await sessionState(w)).mode).toBe('off');
+  });
+
+  describe('the refund/void path', () => {
+    /** Quotes observe → assist, turns the mode off (free), pays: the delivery is refused as mode_changed. */
+    const stranded = async (label: string) => {
+      const w = await world(label);
+      await buy(w, 'observe', `${label}-observe`);
+      const args = await modeArgs(w, 'assist', `${label}-assist`);
+      const quote =
+        failed(await invoke('enabled', w.admin, 'chorus.set_coordination_mode', args)).details ??
+        {};
+      okOut(
+        await invoke(
+          'enabled',
+          w.admin,
+          'chorus.set_coordination_mode',
+          await modeArgs(w, 'off', `${label}-off`),
+        ),
+      );
+      const transfer = pay(w, quote);
+      const refused = failed(
+        await invoke('enabled', w.admin, 'chorus.set_coordination_mode', {
+          ...args,
+          expected_version: (await sessionState(w)).version,
+          payment_txn_id: transfer.id,
+        }),
+      );
+      return { w, args, quote, transfer, refused };
+    };
+    const voidArgs = (requestId: string, txn: string) => ({
+      service: 'set_coordination_mode',
+      request_id: requestId,
+      payment_txn_id: txn,
+    });
+    const purchaseState = async (w: World, requestId: string) =>
+      (
+        await f.owner<{ state: string; txn_id: string | null }>(
+          'SELECT state, txn_id FROM purchases WHERE session_id = $1 AND request_id = $2',
+          [w.session.id, requestId],
+        )
+      )[0];
+
+    it('a paid delivery refused by the race says the payment is unspent and how to get it back', async () => {
+      const { transfer, refused } = await stranded('hint');
+      expect(refused).toMatchObject({
+        code: 'invalid_transition',
+        details: {
+          reason: 'mode_changed',
+          refund_available: {
+            tool: 'chorus.void_purchase',
+            arguments: voidArgs('hint-assist', transfer.id),
+          },
+        },
+      });
+    });
+
+    it('voiding refunds the seat that paid, once, and the purchase can never be delivered afterwards', async () => {
+      const { w, args, quote, transfer } = await stranded('void');
+      const voided = okOut(
+        await invoke(
+          'enabled',
+          w.admin,
+          'chorus.void_purchase',
+          voidArgs('void-assist', transfer.id),
+        ),
+      );
+      expect(voided).toMatchObject({
+        state: 'VOIDED',
+        service: 'set_coordination_mode',
+        request_id: 'void-assist',
+        amount: 1,
+        txn_id: transfer.id,
+        refund: { state: 'sent', amount: 1, to_member_id: w.seat },
+      });
+      const refund = voided['refund'] as { refund_txn_id: string };
+      const sent = refunds.filter((r) => r.id === refund.refund_txn_id);
+      expect(sent).toEqual([
+        expect.objectContaining({
+          to: w.seat,
+          amount: 1,
+          memo: `chorus:v1:refund:${String(quote['purchase_id'])}`,
+          roomId: w.external,
+        }),
+      ]);
+      expect(await purchaseState(w, 'void-assist')).toEqual({
+        state: 'voided',
+        txn_id: transfer.id,
+      });
+
+      // Voiding again returns the same refund and sends nothing new.
+      const again = okOut(
+        await invoke(
+          'enabled',
+          w.admin,
+          'chorus.void_purchase',
+          voidArgs('void-assist', transfer.id),
+        ),
+      );
+      const { audit_trace_id: _first, ...stable } = voided;
+      const { audit_trace_id: _again, ...repeated } = again;
+      expect(repeated).toEqual(stable);
+      expect(refunds.filter((r) => r.to === w.seat)).toHaveLength(1);
+
+      // Even where the delivery would now succeed, a voided purchase is never delivered.
+      await f.owner(`UPDATE sessions SET coordination_mode = 'observe' WHERE id = $1`, [
+        w.session.id,
+      ]);
+      const late = failed(
+        await invoke('enabled', w.admin, 'chorus.set_coordination_mode', {
+          ...args,
+          expected_version: (await sessionState(w)).version,
+          payment_txn_id: transfer.id,
+        }),
+      );
+      expect(late).toMatchObject({
+        code: 'invalid_transition',
+        details: { reason: 'purchase_voided' },
+      });
+      expect(late.details?.['refund_available']).toBeUndefined();
+      expect((await sessionState(w)).mode).toBe('observe');
+
+      // The refunded payment cannot buy anything else either.
+      const other = await modeArgs(w, 'assist', 'void-other');
+      failed(await invoke('enabled', w.admin, 'chorus.set_coordination_mode', other));
+      expect(
+        failed(
+          await invoke('enabled', w.admin, 'chorus.set_coordination_mode', {
+            ...other,
+            payment_txn_id: transfer.id,
+          }),
+        ).code,
+      ).toMatch(/^payment_(already_used|not_verified)$/);
+    });
+
+    it('a refund SharedNet did not accept stays pending, and calling again sends it exactly once', async () => {
+      const { w, transfer } = await stranded('pending');
+      failRefunds = 1;
+      const first = okOut(
+        await invoke(
+          'enabled',
+          w.admin,
+          'chorus.void_purchase',
+          voidArgs('pending-assist', transfer.id),
+        ),
+      );
+      expect(first).toMatchObject({
+        state: 'VOIDED',
+        refund: { state: 'pending', refund_txn_id: null, pending_cause: 'network' },
+      });
+      expect(refunds.filter((r) => r.to === w.seat)).toHaveLength(0);
+      const second = okOut(
+        await invoke(
+          'enabled',
+          w.admin,
+          'chorus.void_purchase',
+          voidArgs('pending-assist', transfer.id),
+        ),
+      );
+      expect(second).toMatchObject({ refund: { state: 'sent', to_member_id: w.seat } });
+      expect(refunds.filter((r) => r.to === w.seat)).toHaveLength(1);
+    });
+
+    it('voided purchases and sent refunds are immutable, and only the buyer sees a refund', async () => {
+      const { w, transfer } = await stranded('void-guard');
+      const voided = okOut(
+        await invoke(
+          'enabled',
+          w.admin,
+          'chorus.void_purchase',
+          voidArgs('void-guard-assist', transfer.id),
+        ),
+      );
+      const id = voided['purchase_id'] as string;
+      await expect(
+        f.owner(`UPDATE purchases SET state = 'quoted', txn_id = NULL WHERE id = $1`, [id]),
+      ).rejects.toMatchObject({ code: 'CH010' });
+      await expect(
+        f.owner(
+          `UPDATE purchase_refunds SET refund_txn_id = 'txn_Other12345' WHERE purchase_id = $1`,
+          [id],
+        ),
+      ).rejects.toMatchObject({ code: 'CH010' });
+      await expect(
+        f.owner(`DELETE FROM purchase_refunds WHERE purchase_id = $1`, [id]),
+      ).rejects.toBeDefined();
+      // A voided purchase must hold the payment it voided.
+      const unpaid = failed(
+        await invoke(
+          'enabled',
+          w.admin,
+          'chorus.set_coordination_mode',
+          await modeArgs(w, 'assist', 'void-guard-unpaid'),
+        ),
+      ).details;
+      await expect(
+        f.owner(`UPDATE purchases SET state = 'voided' WHERE id = $1`, [unpaid?.['purchase_id']]),
+      ).rejects.toMatchObject({ code: '23514' });
+      const stranger = await seated(w.admin.ws, 'refund-nosy');
+      expect(await findRefund(f.readCtx(w.admin), id)).toMatchObject({ purchase_id: id });
+      expect(await findRefund(f.readCtx(stranger), id)).toBeUndefined();
+    });
+
+    it('refuses to void a delivered purchase, an unpaid one, and someone else’s request', async () => {
+      const w = await world('void-refuse');
+      const { transfer } = await buy(w, 'observe', 'vr-observe');
+      expect(
+        failed(
+          await invoke(
+            'enabled',
+            w.admin,
+            'chorus.void_purchase',
+            voidArgs('vr-observe', transfer.id),
+          ),
+        ),
+      ).toMatchObject({ code: 'invalid_transition', details: { reason: 'delivered' } });
+
+      const unpaid = await modeArgs(w, 'assist', 'vr-unpaid');
+      failed(await invoke('enabled', w.admin, 'chorus.set_coordination_mode', unpaid));
+      expect(
+        failed(
+          await invoke(
+            'enabled',
+            w.admin,
+            'chorus.void_purchase',
+            voidArgs('vr-unpaid', `txn_Never${tag()}`),
+          ),
+        ).code,
+      ).toBe('payment_not_found');
+      expect(await purchaseState(w, 'vr-unpaid')).toEqual({ state: 'quoted', txn_id: null });
+
+      const stranger = await seated(w.admin.ws, 'stranger');
+      expect(
+        failed(
+          await invoke(
+            'enabled',
+            stranger,
+            'chorus.void_purchase',
+            voidArgs('vr-unpaid', `txn_Never${tag()}`),
+          ),
+        ).code,
+      ).toBe('not_found');
+    });
   });
 });
