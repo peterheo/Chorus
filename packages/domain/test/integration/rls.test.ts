@@ -52,6 +52,7 @@ const DEFINERS = [
   'chorus_activate_room',
   'chorus_arena_payee',
   'chorus_conversation_seat',
+  'chorus_coordination_apply',
   'chorus_create_session',
   'chorus_enroll_complete',
   'chorus_enroll_start',

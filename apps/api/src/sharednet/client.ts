@@ -12,6 +12,11 @@ export interface SharedNetMessage {
   /** The SharedNet agent tag of the sender, when it has one (used only for `policy_matched` joins). */
   readonly senderAgentId: string | null;
   readonly content: string;
+  /** Optional fields the coordination follow uses (spec §10); absent or mistyped values read as unknown. */
+  readonly senderName?: string;
+  readonly replyToMessageId?: string | null;
+  /** The item type (`message` for chat); absent on servers that do not send it. */
+  readonly type?: string;
 }
 
 export interface WaitPage {
@@ -90,6 +95,38 @@ export class SharedNetClient {
     return parseInstance(body);
   }
 
+  /**
+   * Posts `content` from the seat that owns `token` (`POST /api/v1/rooms/{id}/messages`), optionally as a reply.
+   * `idempotencyKey` (a UUID) is sent as `Idempotency-Key`, so a retried send is one message. Returns its id.
+   */
+  async postMessage(
+    roomId: string,
+    token: string,
+    message: { readonly content: string; readonly replyToMessageId: string | null },
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const url = `${this.baseUrl}/api/v1/rooms/${encodeURIComponent(roomId)}/messages`;
+    const body = await this.request(url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/json',
+        'content-type': 'application/json',
+        'idempotency-key': idempotencyKey,
+      },
+      body: JSON.stringify({
+        content: message.content,
+        reply_to_message_id: message.replyToMessageId,
+      }),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    const posted = isRecord(body) && isRecord(body['message']) ? body['message'] : body;
+    const id = isRecord(posted) ? posted['id'] : undefined;
+    if (typeof id !== 'string' || id === '') fail('a posted message lacks id');
+    return id;
+  }
+
   private async request(url: string, init: RequestInit): Promise<unknown> {
     const timeout = AbortSignal.timeout(this.timeoutMs);
     const response = await this.fetchImpl(url, {
@@ -165,6 +202,9 @@ export function parsePage(body: unknown, after: number): WaitPage {
     const principal = item['sender_principal_id'];
     const agentRaw = item['sender_agent_id'];
     const content = item['content'];
+    const name = isRecord(sender) ? sender['name'] : undefined;
+    const reply = item['reply_to_message_id'];
+    const type = item['type'];
     if (typeof id !== 'string' || id === '') fail('an item lacks id');
     if (typeof sequence !== 'number' || !Number.isSafeInteger(sequence))
       fail('an item lacks an integer sequence');
@@ -182,6 +222,9 @@ export function parsePage(body: unknown, after: number): WaitPage {
       senderMemberId: memberId,
       senderAgentId: typeof agentRaw === 'string' && agentRaw !== '' ? agentRaw : null,
       content,
+      ...(typeof name === 'string' ? { senderName: name } : {}),
+      ...(typeof reply === 'string' || reply === null ? { replyToMessageId: reply } : {}),
+      ...(typeof type === 'string' ? { type } : {}),
     });
   }
   return { messages, hasMore: page['has_more'] === true };

@@ -107,7 +107,7 @@ export async function persistCoordResult(
   sessionId: Uuid,
   before: CoordState,
   result: ApplyResult,
-  actorId: Uuid,
+  actorId: Uuid | null,
 ): Promise<{ readonly newObjects: number }> {
   // Compared canonically: bodies read back from jsonb have their keys reordered, and an engine may rebuild an
   // unchanged object as a fresh literal. Both sides are the CoordObject body only (no DB-only columns).
@@ -166,7 +166,7 @@ export async function insertTransitions(
   workspaceId: Uuid,
   sessionId: Uuid,
   transitions: readonly Transition[],
-  actorId: Uuid,
+  actorId: Uuid | null,
 ): Promise<void> {
   for (const t of transitions) {
     await db.query(
@@ -196,7 +196,8 @@ export async function applyScanToCoordination(
   db: Queryable,
   workspaceId: Uuid,
   sessionId: Uuid,
-  actorId: Uuid,
+  /** The scanner; `null` for the room watcher's follow (spec §10), which acts for no one. */
+  actorId: Uuid | null,
   window: { readonly from: number; readonly to: number },
   messages: readonly SourceMessage[],
   engine: CoordinationEngine,
