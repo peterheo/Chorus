@@ -2,6 +2,7 @@ import {
   ChorusError,
   createSessionInTx,
   createTaskInTx,
+  conversationDigest,
   parseCreateSession,
   parseCreateTask,
   roomPulse,
@@ -93,11 +94,19 @@ export const arenaTools: readonly ChorusToolSpec[] = [
     props: { session_id: S },
     required: [],
     path: room,
-    run: ({ read, input }) =>
-      roomPulse(
-        read,
-        input['session_id'] === undefined ? {} : { session_id: input['session_id'] as Uuid },
-      ),
+    run: async ({ read, input }) => {
+      const filter =
+        input['session_id'] === undefined ? {} : { session_id: input['session_id'] as Uuid };
+      const [pulse, digest] = await Promise.all([
+        roomPulse(read, filter),
+        conversationDigest(read, filter),
+      ]);
+      return {
+        ...pulse,
+        conversation: digest.map((entry) => ({ ...entry, inferred: true })),
+        coverage: 'chorus_state_and_stored_conversation_suggestions',
+      };
+    },
   },
   {
     name: 'chorus.create_action_board',

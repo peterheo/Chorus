@@ -20,9 +20,14 @@ export interface ToolDeps {
   /** Paid Arena tools need the ledger; absent in tests that never call them. */
   readonly arena?: ArenaDeps;
   /** Per-actor limits for the tools that name one (`rateLimit`). */
-  readonly limits?: { readonly paid: RateLimiter; readonly pulse: RateLimiter };
+  readonly limits?: {
+    readonly paid: RateLimiter;
+    readonly pulse: RateLimiter;
+    readonly conversation?: RateLimiter;
+  };
   /** `enabled`: the free create_session / create_task are not registered (only their paid equivalents). */
   readonly billing?: 'enabled' | 'disabled';
+  readonly sharednet?: { readonly baseUrl: string; readonly secretsKey: Buffer };
   readonly logger: { error: (obj: Record<string, unknown>, msg: string) => void };
 }
 
@@ -63,7 +68,7 @@ export interface ChorusToolSpec {
    */
   readonly idempotency?: 'key' | 'request_id';
   /** Which per-actor limiter this tool counts against. */
-  readonly rateLimit?: 'paid' | 'pulse';
+  readonly rateLimit?: 'paid' | 'pulse' | 'conversation';
   /** The resource path under the `chorus` namespace, from the parsed arguments only. */
   readonly path: (args: Args) => string[];
   readonly run: (run: ToolRun) => Promise<unknown>;
@@ -170,8 +175,12 @@ export function defineChorusTool(spec: ChorusToolSpec, deps: ToolDeps): ToolHand
         ) {
           return failed(call, 'internal_error', 'The request scope does not match the caller.');
         }
-        if (spec.rateLimit !== undefined && deps.limits !== undefined) {
-          const decision = deps.limits[spec.rateLimit].hit(scope.actorId);
+        const limiter = spec.rateLimit === undefined ? undefined : deps.limits?.[spec.rateLimit];
+        if (spec.rateLimit === 'conversation' && limiter === undefined) {
+          throw new ChorusError('internal_error', 'The conversation rate limit is not configured.');
+        }
+        if (limiter !== undefined) {
+          const decision = limiter.hit(scope.actorId);
           if (!decision.ok) {
             throw new ChorusError('rate_limited', 'Too many requests; retry later.', {
               details: { retry_after_seconds: decision.retryAfterSeconds },

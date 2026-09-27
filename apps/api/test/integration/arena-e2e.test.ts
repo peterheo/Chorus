@@ -178,7 +178,10 @@ describe('Arena over /mcp: the real SDK client against the app with billing enab
     });
     expect(changed.data['code']).toBe('request_conflict');
     const pulse = await call(client, 'chorus.room_pulse', {});
-    expect(pulse).toMatchObject({ isError: false, data: { coverage: 'chorus_state_only' } });
+    expect(pulse).toMatchObject({
+      isError: false,
+      data: { coverage: 'chorus_state_and_stored_conversation_suggestions' },
+    });
     expect(
       await s.owner<{ n: string }>(`SELECT count(*) AS n FROM purchases WHERE state = 'delivered'`),
     ).toEqual([{ n: '2' }]);

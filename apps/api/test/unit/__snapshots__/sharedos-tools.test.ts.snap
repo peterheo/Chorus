@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`chorus tool definitions > K11 tools.snapshot: exactly the 27 shipped tools (23 + whoami + 3 Arena), with stable definitions 1`] = `
+exports[`chorus tool definitions > K11 tools.snapshot: exactly the 31 shipped tools (23 + whoami + 3 Arena + 4 conversation), with stable definitions 1`] = `
 [
   {
     "description": "Claims a ready task and takes a lease with a fence token, at the task version you expect. Fails if someone else owns it.",
@@ -324,6 +324,43 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 27 shipped to
     "source": "host",
   },
   {
+    "description": "Explicitly dismisses an inferred suggestion. Suggestions are not commitments or answers; nothing is created automatically.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "idempotency_key": {
+          "type": "string",
+        },
+        "reason": {
+          "type": "string",
+        },
+        "session_id": {
+          "type": "string",
+        },
+        "suggestion_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+        "suggestion_id",
+        "idempotency_key",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.dismiss_suggestion",
+    "namespace": "chorus",
+    "readWrite": "write",
+    "requiredCapability": {
+      "action": "link_message",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
     "description": "Returns one submitted result revision of a task, with its content and digest.",
     "inputSchema": {
       "additionalProperties": false,
@@ -515,6 +552,44 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 27 shipped to
     "source": "host",
   },
   {
+    "description": "Explicitly links an inferred suggestion to an existing task and its source message. Suggestions are not commitments or answers; nothing is created automatically.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "idempotency_key": {
+          "type": "string",
+        },
+        "item_id": {
+          "type": "string",
+        },
+        "session_id": {
+          "type": "string",
+        },
+        "suggestion_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+        "suggestion_id",
+        "item_id",
+        "idempotency_key",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.link_suggestion",
+    "namespace": "chorus",
+    "readWrite": "write",
+    "requiredCapability": {
+      "action": "link_message",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
     "description": "Lists the boards of a session you belong to.",
     "inputSchema": {
       "additionalProperties": false,
@@ -617,6 +692,50 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 27 shipped to
     "readWrite": "read",
     "requiredCapability": {
       "action": "read_sessions",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Lists inferred suggestions in a session. Suggestions are not commitments or answers; nothing is created automatically. Linking or dismissing is explicit.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "type": "string",
+        },
+        "kinds": {
+          "items": {
+            "type": "string",
+          },
+          "type": "array",
+        },
+        "limit": {
+          "type": "integer",
+        },
+        "session_id": {
+          "type": "string",
+        },
+        "states": {
+          "items": {
+            "type": "string",
+          },
+          "type": "array",
+        },
+      },
+      "required": [
+        "session_id",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.list_suggestions",
+    "namespace": "chorus",
+    "readWrite": "read",
+    "requiredCapability": {
+      "action": "read",
       "resource": {
         "namespace": "chorus",
         "path": [],
@@ -897,6 +1016,44 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 27 shipped to
     "readWrite": "read",
     "requiredCapability": {
       "action": "pulse",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Infers suggestions from only the selected room messages. Suggestions are not commitments or answers; nothing is created automatically. Linking or dismissing is explicit.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "from_sequence": {
+          "type": "integer",
+        },
+        "idempotency_key": {
+          "type": "string",
+        },
+        "session_id": {
+          "type": "string",
+        },
+        "to_sequence": {
+          "type": "integer",
+        },
+      },
+      "required": [
+        "session_id",
+        "from_sequence",
+        "to_sequence",
+        "idempotency_key",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.scan_conversation",
+    "namespace": "chorus",
+    "readWrite": "write",
+    "requiredCapability": {
+      "action": "link_message",
       "resource": {
         "namespace": "chorus",
         "path": [],

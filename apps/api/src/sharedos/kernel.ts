@@ -13,6 +13,7 @@ export interface ChorusKernelDeps {
   readonly arena?: ToolDeps['arena'];
   readonly limits?: ToolDeps['limits'];
   readonly billing?: ToolDeps['billing'];
+  readonly sharednet?: ToolDeps['sharednet'];
   readonly logger: AuditLogger & { warn?: (obj: Record<string, unknown>, msg: string) => void };
 }
 
@@ -36,6 +37,7 @@ export function createChorusKernel(deps: ChorusKernelDeps): {
     ...(deps.arena === undefined ? {} : { arena: deps.arena }),
     ...(deps.limits === undefined ? {} : { limits: deps.limits }),
     ...(deps.billing === undefined ? {} : { billing: deps.billing }),
+    ...(deps.sharednet === undefined ? {} : { sharednet: deps.sharednet }),
     logger: deps.logger,
   })) {
     kernel.registerTool(tool);
