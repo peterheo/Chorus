@@ -186,3 +186,10 @@ export {
   type UpdateAction,
   type UpdateConversationObjectResult,
 } from './coordination/commands.ts';
+export type {
+  CoordEvent,
+  CoordEventType,
+  ContentTokens,
+  ExtractEvents,
+  Jaccard,
+} from './coordination/events.ts';

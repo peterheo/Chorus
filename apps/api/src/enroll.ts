@@ -5,6 +5,7 @@ import { withReadTx, type Uuid } from '@chorus/domain';
 import { newChorusToken, sha256Hex } from './auth.ts';
 import { sendError } from './http.ts';
 import type { RateLimiter } from './rate-limit.ts';
+import { proofMessage } from './watcher.ts';
 
 /**
  * Automated enrollment (spec section 4). A SharedNet participant proves control of its OWN seat by
@@ -70,7 +71,7 @@ export function registerEnrollRoutes(app: FastifyInstance, deps: EnrollDeps): vo
       );
       const row = rows[0];
       if (row === undefined) throw new Error('chorus_enroll_start returned no row');
-      const message = `chorus-verify ${nonce}`;
+      const message = proofMessage(nonce);
       return await reply
         .code(201)
         .type('application/json; charset=utf-8')
