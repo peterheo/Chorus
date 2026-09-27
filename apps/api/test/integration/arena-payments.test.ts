@@ -270,13 +270,15 @@ describe('arena purchases: quote, verify outside the transaction, deliver atomic
       `SELECT payload FROM domain_events WHERE session_id = $1 AND event_type = 'task.created' ORDER BY occurred_at, id`,
       [w.session.id],
     );
-    expect(events.filter((e) => e.payload.purchase !== undefined)).toHaveLength(1);
-    expect(events.find((e) => e.payload.purchase !== undefined)?.payload.purchase).toEqual({
+    // EVERY created task's creation event carries the purchase provenance.
+    const provenance = {
       purchase_id: quote['purchase_id'],
       service: 'create_tasks',
       amount: 3,
       txn_id: transfer.id,
-    });
+    };
+    expect(events).toHaveLength(3);
+    for (const event of events) expect(event.payload.purchase).toEqual(provenance);
     // Single write path: the quote and the delivery are commands, not ad-hoc writes.
     const commands = await f.owner<{ idempotency_key: string; command_type: string }>(
       `SELECT idempotency_key, command_type FROM commands WHERE workspace_id = $1 AND idempotency_key LIKE 'arena%'`,

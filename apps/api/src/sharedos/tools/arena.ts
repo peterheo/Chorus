@@ -31,6 +31,46 @@ const defined = (record: Record<string, unknown>): Record<string, unknown> =>
 const invalid = (message: string, field: string): ChorusError =>
   new ChorusError('invalid_request', message, { details: { field } });
 
+/** The only keys a task of `create_tasks` may carry (the target session and board are the call's own). */
+const TASK_KEYS: ReadonlySet<string> = new Set([
+  'title',
+  'body',
+  'acceptance_criteria',
+  'priority',
+  'review_required',
+  'shareable',
+]);
+
+/** Validates task `index`, and prefixes every field error with `tasks[index].` so the caller can find it. */
+function parseTaskAt(
+  task: unknown,
+  index: number,
+  input: Record<string, unknown>,
+): CreateTaskParams {
+  const at = `tasks[${String(index)}]`;
+  if (task === null || typeof task !== 'object' || Array.isArray(task)) {
+    throw invalid(`${at} must be an object.`, at);
+  }
+  for (const key of Object.keys(task)) {
+    if (!TASK_KEYS.has(key)) throw invalid(`${at}.${key} is not allowed.`, `${at}.${key}`);
+  }
+  try {
+    return parseCreateTask({
+      ...(task as Record<string, unknown>),
+      session_id: input['session_id'],
+      board_id: input['board_id'],
+    });
+  } catch (error) {
+    if (error instanceof ChorusError && error.code === 'invalid_request') {
+      const field = error.details['field'];
+      throw new ChorusError('invalid_request', `${at}.${error.message}`, {
+        details: { ...error.details, field: typeof field === 'string' ? `${at}.${field}` : at },
+      });
+    }
+    throw error;
+  }
+}
+
 const requestIdOf = (input: Record<string, unknown>): string => {
   const value = input['request_id'];
   if (typeof value !== 'string') throw invalid('request_id is required.', 'request_id');
@@ -125,8 +165,8 @@ export const arenaTools: readonly ChorusToolSpec[] = [
       if (!Array.isArray(list) || list.length < 1 || list.length > PRICES.create_tasks_max) {
         throw invalid(`tasks must hold 1-${String(PRICES.create_tasks_max)} items.`, 'tasks');
       }
-      const params: CreateTaskParams[] = (list as Record<string, unknown>[]).map((task) =>
-        parseCreateTask({ ...task, session_id: input['session_id'], board_id: input['board_id'] }),
+      const params: CreateTaskParams[] = (list as unknown[]).map((task, index) =>
+        parseTaskAt(task, index, input),
       );
       const first = params[0];
       if (first === undefined) throw invalid('tasks must not be empty.', 'tasks');
