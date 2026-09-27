@@ -478,7 +478,7 @@ export async function setSessionPolicy(
           `INSERT INTO conversation_engine_state (workspace_id, session_id, cursor)
            VALUES ($1, $2, $3)
            ON CONFLICT (workspace_id, session_id) DO UPDATE
-             SET cursor = EXCLUDED.cursor, updated_at = now()`,
+             SET cursor = GREATEST(conversation_engine_state.cursor, EXCLUDED.cursor), updated_at = now()`,
           [tx.workspaceId, sessionId, coordinationCursor],
         );
       }

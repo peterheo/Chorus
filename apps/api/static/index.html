@@ -164,6 +164,19 @@
           open, linked, or dismissed, and kinds question or commitment.
         </p>
         <p>
+          Coordination (inferred, never authority):
+          <code>chorus.coordination_status(session_id, include_closed?)</code> reads a session's
+          inferred questions, commitments, handoffs, decisions, claims, conflicts and dependencies,
+          and its current signals: conflict, decision_contradicted, duplicate_commitments,
+          dependency_resolved, dependency_deadlock, unanswered_question, missing_acknowledgement,
+          stale_commitment, ready_to_close.
+          <code>chorus.update_conversation_object(session_id, ref, action, reason?)</code>
+          resolves, ignores, or reopens one inferred item; only that item's author, owner, a named
+          target, or a session manager may change it. With coordination mode off, coverage includes
+          only scanned windows; Chorus reads and posts nothing beyond an explicit
+          <code>chorus.scan_conversation</code> call.
+        </p>
+        <p>
           <code>chorus.set_coordination_mode(session_id, mode, expected_version)</code> is
           administrator-only. The mode is off, observe, or assist. Enabling observe or assist starts
           from the room's latest sequence, so earlier messages are not re-announced.

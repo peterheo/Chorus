@@ -1,7 +1,13 @@
 import { withReadTx, type ReadContext } from '../command.ts';
+import { evaluate } from '../coordination/rules.ts';
+import { loadCoordState } from '../coordination/store.ts';
+import type { SignalKind } from '../coordination/types.ts';
 import { ChorusError } from '../errors.ts';
 import type { Uuid } from '../ids.ts';
 import { requireUuid } from '../validation.ts';
+
+/** CC-2 (spec §9): one per §5 signal kind, for a signal that involves the caller. */
+export type ConversationPulseActionKind = `conversation_${SignalKind}`;
 
 export type PulseActionKind =
   | 'blocked_task'
@@ -9,11 +15,13 @@ export type PulseActionKind =
   | 'stale_lease'
   | 'ready_task'
   | 'claim_request'
-  | 'open_question';
+  | 'open_question'
+  | ConversationPulseActionKind;
 
 export interface PulseAction {
   readonly kind: PulseActionKind;
-  readonly item_id: Uuid;
+  /** A canonical work item's id, or - for a `conversation_*` action - the inferred item's ref (e.g. "Q3"). */
+  readonly item_id: Uuid | string;
   readonly title: string;
   readonly reason: string;
 }
@@ -243,6 +251,39 @@ export async function roomPulse(
       });
       actionsBySession.set(action.session_id, list);
     }
+
+    // CC-2 (spec §9): conversation_<signal kind> actions, after the existing rules and within the same
+    // limit of 10. Only for signals that involve the caller - as author, owner, target or waiting member -
+    // matched by the caller's own proven SharedNet member id(s) (agent_instances.sharednet_member_id).
+    const NEXT_ACTIONS_LIMIT = 10;
+    const { rows: callerMemberRows } = await db.query<{ member_id: string }>(
+      `SELECT DISTINCT sharednet_member_id AS member_id FROM agent_instances
+        WHERE workspace_id = $1 AND actor_id = $2 AND sharednet_member_id IS NOT NULL`,
+      [ctx.workspaceId, ctx.actorId],
+    );
+    const callerMemberIds = new Set(callerMemberRows.map((row) => row.member_id));
+    if (callerMemberIds.size > 0) {
+      for (const session of sessions) {
+        const existing = actionsBySession.get(session.id) ?? [];
+        if (existing.length >= NEXT_ACTIONS_LIMIT) continue;
+        const state = await loadCoordState(db, ctx.workspaceId, session.id);
+        if (state.objects.length === 0) continue;
+        const signals = evaluate(state).filter((signal) =>
+          signal.members.some((member) => callerMemberIds.has(member.member_id)),
+        );
+        for (const signal of signals) {
+          if (existing.length >= NEXT_ACTIONS_LIMIT) break;
+          existing.push({
+            kind: `conversation_${signal.kind}`,
+            item_id: signal.refs[0] ?? '',
+            title: signal.reason,
+            reason: signal.suggested_next_action,
+          });
+        }
+        actionsBySession.set(session.id, existing);
+      }
+    }
+
     const output = sessions.map((session): SessionPulse => {
       const row = countsBySession.get(session.id);
       const number = (value: string | undefined) => Number(value ?? 0);

@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`chorus tool definitions > K11 tools.snapshot: exactly the 34 shipped tools, with stable definitions 1`] = `
+exports[`chorus tool definitions > K11 tools.snapshot: exactly the 36 shipped tools, with stable definitions 1`] = `
 [
   {
     "description": "Returns task counts and the five most recently completed tasks on boards in a session.",
@@ -100,6 +100,35 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 34 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "complete",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Reads the session's inferred coordination state (questions, commitments, handoffs, decisions, claims, conflicts, dependencies) and its current signals. Inferred from scanned room windows only; it never changes canonical work.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "include_closed": {
+          "type": "boolean",
+        },
+        "session_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.coordination_status",
+    "namespace": "chorus",
+    "readWrite": "read",
+    "requiredCapability": {
+      "action": "read",
       "resource": {
         "namespace": "chorus",
         "path": [],
@@ -1193,10 +1222,13 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 34 shipped to
     "source": "host",
   },
   {
-    "description": "Changes a session policy (name, discoverability, join and claim policy, review settings) at the session version you expect. Requires the administrator role.",
+    "description": "Changes a session policy (name, discoverability, join and claim policy, review settings, coordination mode) at the session version you expect. Requires the administrator role. coordination_mode is 'off' (default), 'observe' (Chorus reads every new room message into the inferred coordination state) or 'assist' (also posts a few rate-limited coordination notes built only from room content).",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "coordination_mode": {
+          "type": "string",
+        },
         "default_claim_policy": {
           "type": "string",
         },
@@ -1312,6 +1344,47 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 34 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "submit_result",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Corrects one inferred coordination item (a question, commitment, handoff, decision, claim, conflict or dependency): resolve it, ignore it, or reopen it. Allowed for the item's author, owner or targets, or a session manager.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+        },
+        "idempotency_key": {
+          "type": "string",
+        },
+        "reason": {
+          "type": "string",
+        },
+        "ref": {
+          "type": "string",
+        },
+        "session_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+        "ref",
+        "action",
+        "idempotency_key",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.update_conversation_object",
+    "namespace": "chorus",
+    "readWrite": "write",
+    "requiredCapability": {
+      "action": "link_message",
       "resource": {
         "namespace": "chorus",
         "path": [],

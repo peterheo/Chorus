@@ -103,6 +103,8 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
         'chorus.list_work',
         'chorus.review',
         'chorus.leave_session',
+        'chorus.coordination_status',
+        'chorus.update_conversation_object',
       ]),
     );
     expect(asParticipant).not.toContain('chorus.complete');
@@ -112,7 +114,7 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     expect(asAdmin).toEqual(
       expect.arrayContaining([...ADMIN_ONLY, 'chorus.complete', 'chorus.create_board']),
     );
-    expect(asAdmin).toHaveLength(34); // 27 + room_pulse, create_action_board, create_tasks, and 4 conversation tools
+    expect(asAdmin).toHaveLength(36); // 27 + room_pulse, create_action_board, create_tasks, and 6 conversation tools
 
     expect(await toolNames(roomOnly)).toEqual([
       'chorus.create_action_board',
@@ -198,6 +200,21 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     );
     expect(await cursor()).toBe(57);
 
+    await f.owner('UPDATE conversation_engine_state SET cursor = 120 WHERE session_id = $1', [
+      session.id,
+    ]);
+    await f.owner('UPDATE sharednet_cursors SET last_sequence = 100 WHERE room_id = $1', [
+      session.roomId,
+    ]);
+    okOutput(
+      await call(admin, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'observe',
+        expected_version: 4,
+      }),
+    );
+    expect(await cursor()).toBe(120);
+
     await f.owner('UPDATE sharednet_cursors SET last_sequence = 80 WHERE room_id = $1', [
       session.roomId,
     ]);
@@ -205,10 +222,10 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
       await call(admin, 'chorus.set_coordination_mode', {
         session_id: session.id,
         mode: 'off',
-        expected_version: 4,
+        expected_version: 5,
       }),
     );
-    expect(await cursor()).toBe(57);
+    expect(await cursor()).toBe(120);
     const [row] = await f.owner<{ coordination_mode: string }>(
       'SELECT coordination_mode FROM sessions WHERE id = $1',
       [session.id],
