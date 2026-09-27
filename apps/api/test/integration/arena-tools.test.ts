@@ -491,4 +491,182 @@ describe('Arena tools through the SharedOS kernel (real PostgreSQL as chorus_app
       pulse = new RateLimiter({ limit: 1000, windowMs: 60_000 });
     }
   });
+
+  it('S1-6 arena.task_shape: a task takes only its own keys, and field errors say which task', async () => {
+    const w = await world('shape');
+    const before = await f.count(`SELECT count(*) AS n FROM purchases WHERE workspace_id = $1`, [
+      w.ws.id,
+    ]);
+    const call = async (tasks: unknown[]) => {
+      const args = { ...tasksArgs(w, 1, `shape-${tag()}`), tasks };
+      return failed(await invoke('enabled', w.buyer, 'chorus.create_tasks', args));
+    };
+    const good = { title: 'ok', acceptance_criteria: ['c'] };
+    // Keys outside the six are refused, including the ones the call itself owns.
+    for (const key of ['session_id', 'board_id', 'state', 'owner_actor_id', 'request_id']) {
+      const error = await call([{ ...good, [key]: 'x' }]);
+      expect(error.code, key).toBe('invalid_request');
+      expect(error.details?.['field'], key).toBe(`tasks[0].${key}`);
+    }
+    // A field error names the task: tasks[i].<field>.
+    const second = await call([good, { title: '', acceptance_criteria: ['c'] }]);
+    expect(second).toMatchObject({ code: 'invalid_request', details: { field: 'tasks[1].title' } });
+    const criteria = await call([good, good, { title: 't', acceptance_criteria: [] }]);
+    expect(criteria.details?.['field']).toBe('tasks[2].acceptance_criteria');
+    expect((criteria as { message?: string }).message ?? '').toMatch(/^tasks\[2\]\./);
+    const notObject = await call([good, 'nope']);
+    // A non-object item never reaches the domain: the tool schema refuses it first.
+    expect(notObject.code).toBe('invalid_tool_arguments');
+    // Nothing was quoted for any of it. (Malformed calls do count against the actor's rate limit.)
+    expect(
+      await f.count(`SELECT count(*) AS n FROM purchases WHERE workspace_id = $1`, [w.ws.id]),
+    ).toBe(before);
+  });
+
+  it('S1-6 arena.create_tasks_authorization: no purchase for a non-member, a removed member, or a member who left', async () => {
+    const w = await world('authz');
+    const stranger = await seated(w.ws, 'stranger'); // in the room, not in the session
+    const revoked = await seated(w.ws, 'revoked');
+    await f.join(w.session, revoked); // a participant, then...
+    await f.owner(
+      `UPDATE session_members SET removed_at = now() WHERE session_id = $1 AND actor_id = $2`,
+      [w.session.id, revoked.id],
+    );
+    // A member who joined and then LEFT holds no participant role any more.
+    const left = await seated(w.ws, 'left');
+    await f.join(w.session, left);
+    okOut(
+      await invoke('enabled', left, 'chorus.leave_session', {
+        idempotency_key: randomUUID(),
+        session_id: w.session.id,
+      }),
+    );
+    for (const [label, actor] of [
+      ['non-member', stranger],
+      ['removed member', revoked],
+      ['member who left', left],
+    ] as const) {
+      const result = await invoke(
+        'enabled',
+        actor,
+        'chorus.create_tasks',
+        tasksArgs(w, 1, `authz-${label.replaceAll(' ', '-')}`),
+      );
+      expect(['denied', 'failed'], label).toContain(result.status);
+      const code = (result as { error: { code: string } }).error.code;
+      expect(
+        ['tool_unavailable', 'no_matching_grant', 'not_found', 'action_forbidden'],
+        `${label}: ${code}`,
+      ).toContain(code);
+      expect(
+        await f.count(`SELECT count(*) AS n FROM purchases WHERE actor_id = $1`, [actor.id]),
+        label,
+      ).toBe(0);
+    }
+    expect(
+      await f.count(
+        `SELECT count(*) AS n FROM work_items WHERE session_id = $1 AND kind = 'task'`,
+        [w.session.id],
+      ),
+    ).toBe(0);
+  });
+
+  it('S1-6 arena.all_or_nothing: one failing task insert leaves no tasks, the purchase quoted and the txn unclaimed', async () => {
+    const w = await world('atomic');
+    const args = {
+      ...tasksArgs(w, 3, 'atomic-tasks'),
+      tasks: [
+        { title: 'first', acceptance_criteria: ['c'] },
+        { title: 'BOOM', acceptance_criteria: ['c'] },
+        { title: 'third', acceptance_criteria: ['c'] },
+      ],
+    };
+    const quote =
+      failed(await invoke('enabled', w.buyer, 'chorus.create_tasks', args)).details ?? {};
+    const transfer = pay(w, quote);
+    await f.owner(`CREATE FUNCTION s16_boom() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.title = 'BOOM' THEN RAISE EXCEPTION 'injected insert failure'; END IF; RETURN NEW; END $$`);
+    await f.owner(
+      `CREATE TRIGGER s16_boom BEFORE INSERT ON work_items FOR EACH ROW EXECUTE FUNCTION s16_boom()`,
+    );
+    try {
+      const result = await invoke('enabled', w.buyer, 'chorus.create_tasks', {
+        ...args,
+        payment_txn_id: transfer.id,
+      });
+      expect(result.status).toBe('failed'); // the second insert failed AFTER the first task was written
+      const tasks = () =>
+        f.count(`SELECT count(*) AS n FROM work_items WHERE session_id = $1 AND kind = 'task'`, [
+          w.session.id,
+        ]);
+      expect(await tasks()).toBe(0);
+      const [row] = await f.owner<{ state: string; txn_id: string | null }>(
+        `SELECT state, txn_id FROM purchases WHERE id = $1`,
+        [quote['purchase_id']],
+      );
+      expect(row).toEqual({ state: 'quoted', txn_id: null });
+      expect(
+        await f.count(`SELECT count(*) AS n FROM purchases WHERE txn_id = $1`, [transfer.id]),
+      ).toBe(0);
+      // With the fault gone, the same request and txn deliver all three, once.
+      await f.owner(`DROP TRIGGER s16_boom ON work_items`);
+      const done = okOut(
+        await invoke('enabled', w.buyer, 'chorus.create_tasks', {
+          ...args,
+          payment_txn_id: transfer.id,
+        }),
+      );
+      expect(done['state']).toBe('DELIVERED');
+      expect(await tasks()).toBe(3);
+    } finally {
+      await f.owner(`DROP TRIGGER IF EXISTS s16_boom ON work_items`);
+      await f.owner(`DROP FUNCTION IF EXISTS s16_boom()`);
+    }
+  });
+
+  it('S1-6 arena.provenance: every task.created of a delivery carries the purchase, and the tasks stay claimable', async () => {
+    const w = await world('prov');
+    const args = tasksArgs(w, 3, 'prov-tasks');
+    const quote =
+      failed(await invoke('enabled', w.buyer, 'chorus.create_tasks', args)).details ?? {};
+    const transfer = pay(w, quote);
+    const done = okOut(
+      await invoke('enabled', w.buyer, 'chorus.create_tasks', {
+        ...args,
+        payment_txn_id: transfer.id,
+      }),
+    ) as {
+      result: { tasks: { id: string; version: number }[] };
+    };
+    const events = await f.owner<{
+      aggregate_id: string;
+      payload: { purchase?: Record<string, unknown> };
+    }>(
+      `SELECT aggregate_id, payload FROM domain_events WHERE session_id = $1 AND event_type = 'task.created'`,
+      [w.session.id],
+    );
+    expect(events).toHaveLength(3);
+    expect(new Set(events.map((e) => e.aggregate_id))).toEqual(
+      new Set(done.result.tasks.map((t) => t.id)),
+    );
+    for (const event of events) {
+      expect(event.payload.purchase).toEqual({
+        purchase_id: quote['purchase_id'],
+        service: 'create_tasks',
+        amount: 3,
+        txn_id: transfer.id,
+      });
+    }
+    // No aggregate version was consumed by the provenance: the first real command still gets version 2.
+    const first = done.result.tasks[0];
+    expect(first?.version).toBe(1);
+    okOut(
+      await invoke('enabled', w.buyer, 'chorus.claim', {
+        idempotency_key: randomUUID(),
+        session_id: w.session.id,
+        task_id: first?.id,
+        expected_version: 1,
+      }),
+    );
+  });
 });

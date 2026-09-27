@@ -301,17 +301,17 @@ const alreadyUsed = (): ChorusError =>
   new ChorusError('payment_already_used', 'This payment was already used for another purchase.');
 
 /**
- * Records which purchase created what, on the FIRST created aggregate's creation event. It is data on that
- * event, not an event of its own: a separate event would need an aggregate version of its own, which the
- * aggregate's next real command would then collide with.
+ * Records which purchase created what, on EVERY created aggregate's creation event (version 1: the session of
+ * a board, each task of a batch). It is data on those events, not an event of its own: a separate event would
+ * need an aggregate version of its own, which the aggregate's next real command would then collide with.
  */
 function withPurchaseProvenance(
   events: readonly DomainEventDraft[],
   purchase: { purchase_id: string; service: ArenaService; amount: number; txn_id: string },
 ): DomainEventDraft[] {
-  const [first, ...rest] = events;
-  if (first === undefined) return [];
-  return [{ ...first, payload: { ...first.payload, purchase } }, ...rest];
+  return events.map((event) =>
+    event.aggregateVersion === 1 ? { ...event, payload: { ...event.payload, purchase } } : event,
+  );
 }
 
 /**
