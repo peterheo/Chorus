@@ -227,6 +227,42 @@ describe('static entry pages', () => {
     expect(unavailableRow.replace(/<[^>]*>/gu, ' ').replace(/\s+/gu, ' ')).toContain(explanation);
   });
 
+  it('troubleshoots the same agent-facing error codes in both pages', async () => {
+    const codes = [
+      'rate_limited',
+      'temporarily_unavailable',
+      'idempotency_conflict',
+      'invalid_transition',
+      'lease_conflict',
+      'payment_required',
+      'payment_not_found',
+      'payment_not_verified',
+      'payment_already_used',
+      'request_conflict',
+    ];
+    const pages = await fetchPages(true);
+    const llmsTable = pages.llms.slice(pages.llms.indexOf('## 11. Troubleshooting'));
+    const htmlTable = pages.html.slice(pages.html.indexOf('<h2>11. Troubleshooting</h2>'));
+    for (const code of codes) {
+      expect(llmsTable).toContain(`| \`${code}\` |`);
+      expect(htmlTable).toContain(`<td>${code}</td>`);
+    }
+  });
+
+  it('tells a buyer to send the quoted payment instruction unchanged from the quoted seat', async () => {
+    const pages = await fetchPages(true);
+    for (const page of [pages.llms, pages.html]) {
+      for (const phrase of [
+        'details.instruction',
+        'pay_from_seat',
+        'transfer.id',
+        'Idempotency-Key',
+      ]) {
+        expect(page).toContain(phrase);
+      }
+    }
+  });
+
   it('documents only the exact JSON keys in each curl body', async () => {
     const expectedKeySets = [
       ['sharednet_room_id', 'sharednet_invite_token'],

@@ -114,6 +114,45 @@ async function postRoomMessage(sharednetUrl, roomId, token, content) {
   return response.status;
 }
 
+async function postRoomMessageRecord(sharednetUrl, roomId, token, content) {
+  const { body } = await responseJson(
+    `${sharednetUrl}/api/v1/rooms/${encodeURIComponent(roomId)}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/json',
+        'content-type': 'application/json',
+      },
+      body: json({ content }),
+    },
+    [200, 201],
+  );
+  const message = body?.message;
+  check(
+    typeof message?.id === 'string' && Number.isSafeInteger(message?.sequence),
+    'sharednet_post_contract',
+  );
+  return { id: message.id, sequence: message.sequence };
+}
+
+async function payQuotedInstruction(instruction, token) {
+  const response = await fetchRetry(instruction.url, {
+    method: instruction.method,
+    headers: {
+      authorization: `Bearer ${token}`,
+      'Idempotency-Key': randomUUID(),
+      'Content-Type': instruction.headers['Content-Type'],
+      accept: 'application/json',
+    },
+    body: json(instruction.body),
+  });
+  requireStatus(response, [201]);
+  const txnId = (await readJson(response))?.transfer?.id;
+  check(/^txn_[A-Za-z0-9]{6,64}$/u.test(txnId ?? ''), 'payment_transfer_id_missing');
+  return txnId;
+}
+
 async function startEnrollment(baseUrl, roomId, seat, label) {
   const { response, body } = await responseJson(
     `${baseUrl}/v1/enroll/start`,
@@ -276,7 +315,13 @@ async function runPaidSteps(ctx, step, runId, ids) {
 
   await step('P1', 'Check free room pulse', async () => {
     const pulse = await toolOk(ctx.clients.B, 'chorus.room_pulse');
-    check(pulse.coverage === 'chorus_state_only', 'pulse_coverage');
+    check(
+      pulse.coverage ===
+        (ctx.conversationMode
+          ? 'chorus_state_and_stored_conversation_suggestions'
+          : 'chorus_state_only'),
+      'pulse_coverage',
+    );
     const session = (pulse.sessions ?? []).find((item) => item.session_id === ctx.sessionId);
     check(
       session !== undefined &&
@@ -441,6 +486,190 @@ async function runPaidSteps(ctx, step, runId, ids) {
   });
 }
 
+/**
+ * E10 (CC-1 rev1.1 section 6, deployed CC1): A asks, B commits, C scans exactly that window; B buys the
+ * suggested task with `request_id = recommended_request_id`; C links the suggestion. Spends 1 credit from B.
+ */
+async function runConversationStep(ctx, step, runId, ids) {
+  await step('E10', 'Scan a conversation window, buy the suggested task, and link it', async () => {
+    const asked = await postRoomMessageRecord(
+      ctx.sharednetUrl,
+      ctx.roomId,
+      ctx.seats.A.token,
+      `Can someone check why the deploy fails for ${runId}?`,
+    );
+    const promised = await postRoomMessageRecord(
+      ctx.sharednetUrl,
+      ctx.roomId,
+      ctx.seats.B.token,
+      `I'll investigate the deploy failure for ${runId}.`,
+    );
+    check(
+      promised.sequence > asked.sequence && promised.sequence - asked.sequence < 200,
+      'conversation_window_invalid',
+    );
+    const window = {
+      session_id: ctx.sessionId,
+      from_sequence: asked.sequence,
+      to_sequence: promised.sequence,
+    };
+    const scanArgs = { ...window, idempotency_key: randomUUID() };
+    const scanned = await toolOk(ctx.clients.C, 'chorus.scan_conversation', scanArgs);
+    check(
+      scanned.scan?.extractor === 'rules-v1' &&
+        scanned.scan.from_sequence === asked.sequence &&
+        scanned.scan.to_sequence === promised.sequence &&
+        scanned.coverage === 'selected_conversation_window',
+      'conversation_scan_contract',
+    );
+    const suggestions = scanned.suggestions ?? [];
+    check(
+      suggestions.every(
+        (item) =>
+          item.inferred === true &&
+          item.source?.sequence >= asked.sequence &&
+          item.source?.sequence <= promised.sequence,
+      ),
+      'conversation_outside_window',
+    );
+    const questions = suggestions.filter((item) => item.source?.message_id === asked.id);
+    const commitments = suggestions.filter((item) => item.source?.message_id === promised.id);
+    check(
+      questions.length === 1 &&
+        questions[0].kind === 'question' &&
+        questions[0].confidence === 'high' &&
+        questions[0].source.sender_member_id === ctx.seats.A.member_id,
+      'conversation_question_missing',
+    );
+    check(
+      commitments.length === 1 &&
+        commitments[0].kind === 'commitment' &&
+        commitments[0].confidence === 'high' &&
+        commitments[0].source.sender_member_id === ctx.seats.B.member_id,
+      'conversation_commitment_missing',
+    );
+    const question = questions[0];
+    check(
+      question.state === 'open' &&
+        question.recommended_request_id === `sugg-${question.suggestion_id}` &&
+        typeof question.suggested_task?.title === 'string' &&
+        Array.isArray(question.suggested_task?.acceptance_criteria),
+      'conversation_suggestion_shape',
+    );
+    const replay = await toolOk(ctx.clients.C, 'chorus.scan_conversation', scanArgs);
+    check(json(stable(replay)) === json(stable(scanned)), 'conversation_scan_replay_changed');
+
+    const taskArgs = {
+      request_id: question.recommended_request_id,
+      session_id: ctx.sessionId,
+      board_id: ctx.boardId,
+      tasks: [
+        {
+          title: question.suggested_task.title,
+          acceptance_criteria: question.suggested_task.acceptance_criteria,
+        },
+      ],
+    };
+    const quote = await toolError(
+      ctx.clients.B,
+      'chorus.create_tasks',
+      taskArgs,
+      'payment_required',
+    );
+    const details = quote.error?.details;
+    check(
+      details?.amount === 1 && details.pay_from_seat === ctx.seats.B.member_id,
+      'conversation_quote_contract',
+    );
+    const balanceBefore = await sharedNetBalance(ctx.sharednetUrl, ctx.seats.B.token);
+    const txnId = await payQuotedInstruction(details.instruction, ctx.seats.B.token);
+    check(
+      balanceBefore - (await sharedNetBalance(ctx.sharednetUrl, ctx.seats.B.token)) === 1,
+      'conversation_payment_balance_delta',
+    );
+    const delivered = await toolOk(ctx.clients.B, 'chorus.create_tasks', {
+      ...taskArgs,
+      payment_txn_id: txnId,
+    });
+    const task = delivered.result?.tasks?.[0];
+    check(typeof task?.id === 'string', 'conversation_task_missing');
+    ids.tasks.push(task.id);
+
+    const linked = await toolOk(
+      ctx.clients.C,
+      'chorus.link_suggestion',
+      { session_id: ctx.sessionId, suggestion_id: question.suggestion_id, item_id: task.id },
+      true,
+    );
+    check(
+      linked.suggestion?.state === 'linked' &&
+        linked.suggestion.linked_item_id === task.id &&
+        linked.item?.id === task.id,
+      'conversation_link_contract',
+    );
+    await toolError(
+      ctx.clients.C,
+      'chorus.link_suggestion',
+      {
+        session_id: ctx.sessionId,
+        suggestion_id: question.suggestion_id,
+        item_id: task.id,
+        idempotency_key: randomUUID(),
+      },
+      'invalid_transition',
+      'suggestion_decided',
+    );
+    const stored = await toolOk(ctx.clients.C, 'chorus.get_task', {
+      session_id: ctx.sessionId,
+      task_id: task.id,
+    });
+    check(
+      stored.state === 'ready' && stored.owner_actor_id === null,
+      'conversation_silent_authority',
+    );
+
+    const rescanned = await toolOk(ctx.clients.C, 'chorus.scan_conversation', window, true);
+    check(
+      (rescanned.suggestions ?? []).every(
+        (item) =>
+          item.source?.message_id !== asked.id || item.suggestion_id === question.suggestion_id,
+      ),
+      'conversation_rescan_duplicated',
+    );
+    const listed = await toolOk(ctx.clients.C, 'chorus.list_suggestions', {
+      session_id: ctx.sessionId,
+      states: ['open', 'linked', 'dismissed'],
+    });
+    const forQuestion = (listed.suggestions ?? []).filter(
+      (item) => item.source?.message_id === asked.id,
+    );
+    check(
+      forQuestion.length === 1 &&
+        forQuestion[0].state === 'linked' &&
+        forQuestion[0].linked_item_id === task.id,
+      'conversation_linked_not_listed',
+    );
+    const pulse = await toolOk(ctx.clients.B, 'chorus.room_pulse', { session_id: ctx.sessionId });
+    const digest = (pulse.conversation ?? []).find((item) => item.session_id === ctx.sessionId);
+    check(
+      digest !== undefined &&
+        digest.inferred === true &&
+        digest.open_commitments >= 1 &&
+        digest.last_scan !== null,
+      'conversation_pulse_digest',
+    );
+    return {
+      ids: {
+        question_message_id: asked.id,
+        commitment_message_id: promised.id,
+        suggestion_id: question.suggestion_id,
+        task_id: task.id,
+        transfer_id: txnId,
+      },
+    };
+  });
+}
+
 async function writePageExamples(runId, calls, identifiers) {
   const outputPath = resolve(ROOT, 'tests/deployed/out', `page-examples-${runId}.json`);
   await mkdir(dirname(outputPath), { recursive: true });
@@ -456,6 +685,7 @@ export async function runE2E() {
   const seatsPath = process.env.E2E_SEATS_FILE;
   const paidMode = process.env.E2E_PAID === '1';
   const pageExamplesEnabled = process.env.E2E_PAGE_EXAMPLES === '1';
+  const conversationMode = process.env.E2E_CONVERSATION === '1';
   const paidSessionId = process.env.E2E_SESSION_ID;
   const paidSession2Id = process.env.E2E_SESSION2_ID;
   const paidBoardId = process.env.E2E_BOARD_ID;
@@ -479,6 +709,7 @@ export async function runE2E() {
     );
   }
   check(!pageExamplesEnabled || !paidMode, 'page_examples_requires_unpaid_run');
+  check(!conversationMode || paidMode, 'conversation_requires_paid_run');
 
   const absoluteSeatsPath = resolve(seatsPath);
   const relativeSeatsPath = relative(ROOT, absoluteSeatsPath);
@@ -535,6 +766,7 @@ export async function runE2E() {
     session2Id: paidMode ? paidSession2Id : undefined,
     boardId: paidMode ? paidBoardId : undefined,
     paidMode,
+    conversationMode,
     pageExamplesEnabled,
     e6Calls: [],
   };
@@ -735,6 +967,7 @@ export async function runE2E() {
 
     if (paidMode) {
       await runPaidSteps(ctx, step, runId, ids);
+      if (conversationMode) await runConversationStep(ctx, step, runId, ids);
     } else {
       await step('E5', 'Check session visibility and joining', async () => {
         const principalId = await sharedNetCurrent(sharednetUrl, seats.A.token, seats.A.member_id);

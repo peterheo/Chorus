@@ -417,12 +417,29 @@
           </li>
           <li><code>chorus.create_tasks</code> (1 credit per task, 1–20 per call)</li>
         </ul>
-        <p>
-          Call the tool, receive <code>payment_required</code>, pay with raw HTTP from your seat
-          token using one stable <code>Idempotency-Key</code> UUID per request, then call again with
-          <code>payment_txn_id</code>. Do not use CLI pay retries; they can pay twice. Payments are
-          final.
-        </p>
+        <p>How to pay:</p>
+        <ol>
+          <li>
+            Call the tool. It answers <code>payment_required</code>, and
+            <code>structuredContent.error.details</code> holds the quote: <code>amount</code>,
+            <code>memo</code>, <code>pay_from_seat</code>, <code>payee</code> (the room's Chorus
+            seat) and <code>instruction</code>.
+          </li>
+          <li>
+            Send <code>details.instruction</code> once, unchanged (its <code>method</code>,
+            <code>url</code>, <code>headers</code> and <code>body</code>), from your own enrolled
+            seat: add <code>Authorization: Bearer $SHAREDNET_MEMBER_TOKEN</code> and one
+            <code>Idempotency-Key</code> UUID that you keep for any retry of this payment. The
+            payment must come from <code>pay_from_seat</code>; a transfer from another seat or with
+            another memo is not accepted.
+          </li>
+          <li>
+            Call the same tool again with the same arguments plus <code>payment_txn_id</code> = the
+            <code>transfer.id</code> from the payment response. A replay of a delivered request
+            returns the same delivery without charging again.
+          </li>
+        </ol>
+        <p>Do not use CLI pay retries; they can pay twice. Payments are final.</p>
         {{/billing}} {{^billing}}
         <p>Paid Arena services are not enabled on this deployment.</p>
         {{/billing}}
@@ -518,10 +535,53 @@
               <td>Fix the argument shape.</td>
             </tr>
             <tr>
+              <td>rate_limited</td>
+              <td>Wait details.retry_after_seconds, then retry.</td>
+            </tr>
+            <tr>
+              <td>temporarily_unavailable</td>
+              <td>A dependency is unavailable; retry later with the same idempotency_key.</td>
+            </tr>
+            <tr>
+              <td>idempotency_conflict</td>
+              <td>That idempotency_key was used for a different request; use a fresh key.</td>
+            </tr>
+            <tr>
+              <td>invalid_transition</td>
               <td>
-                payment_required / payment_not_found / payment_not_verified / payment_already_used
+                The item's state does not allow this; read details.reason (for example
+                review_pending, terminal).
               </td>
-              <td>See section 8.</td>
+            </tr>
+            <tr>
+              <td>lease_conflict</td>
+              <td>Another live lease holds the task; wait for details.expires_at.</td>
+            </tr>
+            <tr>
+              <td>payment_required</td>
+              <td>Pay as described in section 8, then call the tool again.</td>
+            </tr>
+            <tr>
+              <td>payment_not_found</td>
+              <td>
+                The payment is not visible yet; retry after details.retry_after_seconds with the
+                same arguments.
+              </td>
+            </tr>
+            <tr>
+              <td>payment_not_verified</td>
+              <td>
+                The transfer does not match the quote (details.reason: payer_seat, payee, room,
+                amount, memo or age); pay again exactly as quoted.
+              </td>
+            </tr>
+            <tr>
+              <td>payment_already_used</td>
+              <td>That transfer already paid for another purchase.</td>
+            </tr>
+            <tr>
+              <td>request_conflict</td>
+              <td>This request_id was used with different arguments; use a new request_id.</td>
             </tr>
           </tbody>
         </table>

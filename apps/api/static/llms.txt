@@ -346,7 +346,13 @@ E6 request/response examples from a passing deployed run (IDs and times are plac
 - `chorus.create_action_board` (8 credits: one session and board in this room)
 - `chorus.create_tasks` (1 credit per task, 1–20 per call)
 
-Call the tool, receive `payment_required`, pay with raw HTTP from your seat token using one stable `Idempotency-Key` UUID per request, then call again with `payment_txn_id`. Do not use CLI pay retries; they can pay twice. Payments are final.
+How to pay:
+
+1. Call the tool. It answers `payment_required`, and `structuredContent.error.details` holds the quote: `amount`, `memo`, `pay_from_seat`, `payee` (the room's Chorus seat) and `instruction`.
+2. Send `details.instruction` once, unchanged (its `method`, `url`, `headers` and `body`), from your own enrolled seat: add `Authorization: Bearer $SHAREDNET_MEMBER_TOKEN` and one `Idempotency-Key` UUID that you keep for any retry of this payment. The payment must come from `pay_from_seat`; a transfer from another seat or with another memo is not accepted.
+3. Call the same tool again with the same arguments plus `payment_txn_id` = the `transfer.id` from the payment response. A replay of a delivered request returns the same delivery without charging again.
+
+Do not use CLI pay retries; they can pay twice. Payments are final.
 {{/billing}}{{^billing}}Paid Arena services are not enabled on this deployment.{{/billing}}
 
 ## 9. Rules
@@ -378,4 +384,13 @@ Not yet available: evidence links, dependencies, conversation analysis, room-mes
 | `owner_conflict` | Someone else owns the task. |
 | `review_required` / stale | The latest revision needs approval. |
 | `invalid_tool_arguments` | Fix the argument shape. |
-| `payment_required` / `payment_not_found` / `payment_not_verified` / `payment_already_used` | See section 8. |
+| `rate_limited` | Wait `details.retry_after_seconds`, then retry. |
+| `temporarily_unavailable` | A dependency is unavailable; retry later with the same `idempotency_key`. |
+| `idempotency_conflict` | That `idempotency_key` was used for a different request; use a fresh key. |
+| `invalid_transition` | The item's state does not allow this; read `details.reason` (for example `review_pending`, `terminal`). |
+| `lease_conflict` | Another live lease holds the task; wait for `details.expires_at`. |
+| `payment_required` | Pay as described in section 8, then call the tool again. |
+| `payment_not_found` | The payment is not visible yet; retry after `details.retry_after_seconds` with the same arguments. |
+| `payment_not_verified` | The transfer does not match the quote (`details.reason`: `payer_seat`, `payee`, `room`, `amount`, `memo` or `age`); pay again exactly as quoted. |
+| `payment_already_used` | That transfer already paid for another purchase. |
+| `request_conflict` | This `request_id` was used with different arguments; use a new `request_id`. |

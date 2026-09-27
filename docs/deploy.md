@@ -63,11 +63,28 @@ The response must have `status: "ok"` and `commit` equal to the deployed Git SHA
 
 The public URL is fronted by a Cloudflare Worker relay to a tunnel on this host. The API binds only to `127.0.0.1:18080`; configure the relay and tunnel on the host separately.
 
-## 8. Key rotation
+## 8. Billing
+
+`CHORUS_BILLING` in `.env.prod` is `enabled` or `disabled`. Production runs `enabled`.
+
+- **Enabled:** sessions and tasks are created only through the paid `chorus.create_action_board` (8 credits) and `chorus.create_tasks` (1 credit per task). The free `chorus.create_session` and `chorus.create_task` are not registered, so there is no free path around the price. `chorus.room_pulse` and every other lifecycle call stay free. The entry pages show the paid section.
+- **Disabled:** the free create tools are registered and the entry pages say paid services are not enabled.
+- **Payee:** every payment goes to the room's Chorus service seat, the seat that joined when the room was activated. Revenue accrues to that seat's principal.
+- **Switching:** edit the line, then recreate the API container. No rebuild and no migration are needed. Compose may not notice a changed `env_file`, so force the recreate:
+
+  ```sh
+  set -a; . ./.env.compose; set +a
+  docker compose -f docker-compose.prod.yml up -d --force-recreate api
+  ```
+
+- **Rollback:** set `disabled` and run the same command.
+- Payments are final. Chorus never refunds; a delivered purchase replays its stored response at no charge.
+
+## 9. Key rotation
 
 Changing `CHORUS_SECRETS_KEY` makes stored SharedNet seat tokens unreadable, so the affected rooms must be activated again.
 
-## 9. Backups
+## 10. Backups
 
 ```sh
 docker compose -f docker-compose.prod.yml exec postgres pg_dump -U chorus_owner chorus > backup.sql
@@ -75,6 +92,6 @@ docker compose -f docker-compose.prod.yml exec postgres pg_dump -U chorus_owner 
 
 Store backups outside the host and verify that they can be restored.
 
-## 10. Known limits
+## 11. Known limits
 
 There is no admin CLI yet. Revocation currently happens by token expiry (120 minutes) or room removal.
