@@ -94,7 +94,7 @@ openssl genpkey -algorithm ed25519 -out chorus-receipt-key.pem
 
 Keep the private key secret and set `CHORUS_RECEIPT_KEY` to its PEM contents in `.env.prod`. The API publishes the matching public key at `/v1/keys/:key_id`; `public_key_raw_b64` is unpadded Base64url per RFC 4648 section 5. Rotating this key creates a new key ID, so retain old public keys separately if old receipts need continued independent verification.
 
-`POST /v1/receipts/verify` is public and limited to 600 requests per minute per API process (a global bucket, not per client IP).
+`POST /v1/receipts/verify` and the shareable-link form `GET /v1/receipts/verify?envelope=…` are public and share one limit of 600 requests per minute per API process (a global bucket, not per client IP).
 
 ## 10. Backups
 

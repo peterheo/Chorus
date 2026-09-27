@@ -104,7 +104,7 @@ describe('receipt MCP to HTTP verification', () => {
       session_id: session,
       task_id: task.id,
     });
-    const { audit_trace_id: _trace, ...envelope } = toolOutput;
+    const { audit_trace_id: _trace, verify_url: verifyUrl, ...envelope } = toolOutput;
     const verify = async (value: unknown) =>
       fetch(stack.baseUrl + '/v1/receipts/verify', {
         method: 'POST',
@@ -112,6 +112,14 @@ describe('receipt MCP to HTTP verification', () => {
         body: JSON.stringify(value),
       });
     expect(await (await verify(envelope)).json()).toMatchObject({ valid: true });
+    // The shareable link carries the same envelope; the test stack's public base URL is a placeholder.
+    expect(typeof verifyUrl).toBe('string');
+    const link = new URL(verifyUrl as string);
+    const opened = await fetch(stack.baseUrl + link.pathname + link.search);
+    expect(await opened.json()).toMatchObject({
+      valid: true,
+      receipt: envelope['receipt'],
+    });
     const receipt = envelope['receipt'] as Record<string, unknown>;
     const changed = {
       ...envelope,
