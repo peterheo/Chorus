@@ -407,6 +407,7 @@ export async function setSessionPolicy(
     'default_claim_policy',
     'manager_review_allowed',
     'default_review_required',
+    'coordination_mode',
   ]);
   const sessionId = requireUuid(raw['session_id'], 'session_id');
   const expectedVersion = requireInteger(raw['expected_version'], 'expected_version', 1);
@@ -439,6 +440,13 @@ export async function setSessionPolicy(
       'default_review_required',
       true,
     );
+  // CC-2d: the coordination engine's mode for this session (0009); the column CHECK enforces the same set.
+  if (raw['coordination_mode'] !== undefined)
+    changes['coordination_mode'] = requireEnum(raw['coordination_mode'], 'coordination_mode', [
+      'off',
+      'observe',
+      'assist',
+    ]);
   const fields = Object.keys(changes);
   if (fields.length === 0) throw invalid('input', 'At least one policy field is required.');
 

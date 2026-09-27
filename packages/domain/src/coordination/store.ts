@@ -267,7 +267,8 @@ export async function syncObjectFromSuggestion(
   if (change.linkedItemId !== undefined) {
     await db.query(
       `UPDATE conversation_objects
-          SET linked_item_id = $4, body = jsonb_set(body, '{linked_item_id}', to_jsonb($4::text)), updated_at = now()
+          SET linked_item_id = $4::uuid, body = jsonb_set(body, '{linked_item_id}', to_jsonb($4::uuid)),
+              updated_at = now()
         WHERE workspace_id = $1 AND session_id = $2 AND ref = $3`,
       [workspaceId, sessionId, object.ref, change.linkedItemId],
     );
