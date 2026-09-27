@@ -161,11 +161,12 @@ export class RoomWatcher {
     else this.abort.signal.addEventListener('abort', onStop, { once: true });
     const lock = await pool.connect();
     const lockState = { broken: false };
-    lock.on('error', () => {
+    const onLockError = (): void => {
       lockState.broken = true;
       this.held.delete(key);
       roomAbort.abort();
-    });
+    };
+    lock.on('error', onLockError);
     let gotLock = false;
     try {
       const got = await lock.query<{ got: boolean }>(LOCK_SQL, [room.room_id]);
@@ -202,6 +203,7 @@ export class RoomWatcher {
     } finally {
       this.held.delete(key); // synchronously, before any await: exit for any reason ends the lease
       this.abort.signal.removeEventListener('abort', onStop);
+      lock.off('error', onLockError); // a released client goes back to the pool and is reused
       if (gotLock && !lockState.broken) {
         await lock.query(UNLOCK_SQL, [room.room_id]).catch(() => undefined);
       }
