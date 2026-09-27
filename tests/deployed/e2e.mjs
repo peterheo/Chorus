@@ -737,16 +737,58 @@ export async function runE2E() {
         ['one'],
       );
       ids.tasks.push(staleTask.task.id);
-      const staleLease = await claimTask(ctx.clients.B, ctx.sessionId, staleTask.task);
-      check(staleLease.fence >= 1, 'stale_fence_requires_prior_fence');
+      const firstLease = await claimTask(ctx.clients.B, ctx.sessionId, staleTask.task);
+      const staleContent = `${runId} stale fence`;
+      const staleDigest = createHash('sha256')
+        .update(Buffer.from(staleContent, 'utf8'))
+        .digest('hex');
+      const staleSubmit = await submitTask(
+        ctx.clients.B,
+        ctx.sessionId,
+        staleTask.task.id,
+        firstLease,
+        staleContent,
+        [{ criterion: 0, note: 'done' }],
+      );
+      const staleReview = await toolOk(
+        ctx.clients.B,
+        'chorus.request_review',
+        {
+          session_id: ctx.sessionId,
+          task_id: staleTask.task.id,
+          expected_version: staleSubmit.version,
+          revision: 1,
+          reviewer_actor_id: ctx.actors.C.actor_id,
+        },
+        true,
+      );
+      const staleVerdict = await toolOk(
+        ctx.clients.C,
+        'chorus.review',
+        {
+          session_id: ctx.sessionId,
+          review_id: staleReview.review.id,
+          expected_version: staleReview.review.version,
+          verdict: 'changes_requested',
+          content_sha256: staleDigest,
+        },
+        true,
+      );
+      check(staleVerdict.review?.state === 'changes_requested', 'stale_review_verdict');
+      const returnedTask = await toolOk(ctx.clients.B, 'chorus.get_task', {
+        session_id: ctx.sessionId,
+        task_id: staleTask.task.id,
+      });
+      const secondLease = await claimTask(ctx.clients.B, ctx.sessionId, returnedTask);
+      check(secondLease.fence === firstLease.fence + 1, 'stale_fence_did_not_increment');
       await toolError(
         ctx.clients.B,
         'chorus.renew_lease',
         {
           session_id: ctx.sessionId,
           task_id: staleTask.task.id,
-          expected_version: staleLease.version,
-          fence: staleLease.fence - 1,
+          expected_version: secondLease.version,
+          fence: firstLease.fence,
           idempotency_key: randomUUID(),
         },
         'lease_lost',
