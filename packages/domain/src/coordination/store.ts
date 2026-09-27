@@ -1,4 +1,5 @@
 import type { Queryable } from '../authz.ts';
+import { canonicalJson } from '../command.ts';
 import { ChorusError } from '../errors.ts';
 import type { Uuid } from '../ids.ts';
 import type { SourceMessage } from '../conversation/extract.ts';
@@ -108,12 +109,14 @@ export async function persistCoordResult(
   result: ApplyResult,
   actorId: Uuid,
 ): Promise<{ readonly newObjects: number }> {
-  const previous = new Map(before.objects.map((object) => [object.ref, JSON.stringify(object)]));
+  // Compared canonically: bodies read back from jsonb have their keys reordered, and an engine may rebuild an
+  // unchanged object as a fresh literal. Both sides are the CoordObject body only (no DB-only columns).
+  const previous = new Map(before.objects.map((object) => [object.ref, canonicalJson(object)]));
   let newObjects = 0;
   for (const object of result.state.objects) {
     const body = JSON.stringify(object);
     const old = previous.get(object.ref);
-    if (old === body) continue;
+    if (old === canonicalJson(object)) continue;
     if (old === undefined) {
       newObjects += 1;
       await db.query(

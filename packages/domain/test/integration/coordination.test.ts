@@ -137,6 +137,18 @@ const fakeEvaluate: Evaluate = (state) => {
 
 const ENGINE: CoordinationEngine = { apply: fakeApply, excludeMemberIds: [] };
 
+/** The fake engine, but every object comes back as a fresh literal with its keys in reverse order. */
+const REBUILDING_ENGINE: CoordinationEngine = {
+  apply: (state, messages, ctx) => {
+    const result = fakeApply(state, messages, ctx);
+    const objects = result.state.objects.map(
+      (o) => Object.fromEntries(Object.entries(o).reverse()) as CoordObject,
+    );
+    return { ...result, state: { ...result.state, objects } };
+  },
+  excludeMemberIds: [],
+};
+
 // ---------------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------------
@@ -202,7 +214,7 @@ describe('coordination persistence and commands (CC-2c; real PostgreSQL as choru
     actor: Actor,
     session: SessionSeed,
     msgs: readonly SourceMessage[],
-    window: { from?: number; to?: number; key?: string } = {},
+    window: { from?: number; to?: number; key?: string; engine?: CoordinationEngine } = {},
   ) => {
     const from = window.from ?? Math.min(...msgs.map((m) => m.sequence));
     const to = window.to ?? Math.max(...msgs.map((m) => m.sequence));
@@ -213,7 +225,7 @@ describe('coordination persistence and commands (CC-2c; real PostgreSQL as choru
       cutoff_sequence: to,
       messages: msgs,
       extracted: rulesV1.extract(msgs),
-      coordination: ENGINE,
+      coordination: window.engine ?? ENGINE,
     });
   };
 
@@ -372,6 +384,33 @@ describe('coordination persistence and commands (CC-2c; real PostgreSQL as choru
       ['open', 'answered', 'message', reply.message_id],
     ]);
     expect(transitions[1]?.actor_id).toBe(w.executor2.id);
+  });
+
+  it('an unchanged object the engine rebuilds with another key order is not rewritten', async () => {
+    const w = await world('coord-rebuild');
+    await scan(w.executor, w.session, [message(`Can @${BOB.id} check the logs?`)]);
+    const q1Row = () =>
+      f.owner<{ body: CoordObject; updated_at: Date }>(
+        `SELECT body, updated_at FROM conversation_objects
+          WHERE workspace_id = $1 AND session_id = $2 AND ref = 'Q1'`,
+        [w.ws.id, w.session.id],
+      );
+    const [before] = await q1Row();
+
+    const next = await scan(w.executor, w.session, [message('Is this a new question?')], {
+      engine: REBUILDING_ENGINE,
+    });
+    expect(next.coordination).toEqual({
+      applied_messages: 1,
+      skipped_before_cursor: 0,
+      new_objects: 1,
+      transitions: 1,
+    });
+    const [after] = await q1Row();
+    expect(after?.updated_at).toEqual(before?.updated_at);
+    expect(after?.body).toEqual(before?.body);
+    expect(await transitionRows(w.session, 'Q1')).toHaveLength(1);
+    expect((await objectRows(w.session)).map((o) => o.ref)).toEqual(['Q1', 'Q2']);
   });
 
   // -------------------------------------------------------------------------------------------------
