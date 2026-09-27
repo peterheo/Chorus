@@ -1319,8 +1319,26 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 36 shipped to
         },
         "supporting_refs": {
           "items": {
-            "type": "string",
+            "additionalProperties": false,
+            "properties": {
+              "label": {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string",
+              },
+              "url": {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string",
+              },
+            },
+            "required": [
+              "url",
+              "label",
+            ],
+            "type": "object",
           },
+          "maxItems": 10,
           "type": "array",
         },
         "task_id": {

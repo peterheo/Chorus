@@ -48,8 +48,10 @@ const MAX_LINK_ENVELOPE = 8192;
  * A public link that verifies the envelope and shows its receipt: the envelope travels in the URL, so a
  * stranger can check a finished task without an account and without Chorus storing anything to share it.
  */
-export function receiptVerifyUrl(publicBaseUrl: string, envelope: ReceiptEnvelope): string {
+export function receiptVerifyUrl(publicBaseUrl: string, envelope: ReceiptEnvelope): string | null {
   const encoded = Buffer.from(JSON.stringify(envelope)).toString('base64url');
+  // Long supporting_refs can outgrow a URL: the envelope is then shared as is, for POST /v1/receipts/verify.
+  if (encoded.length > MAX_LINK_ENVELOPE) return null;
   return `${publicBaseUrl}/v1/receipts/verify?envelope=${encoded}`;
 }
 
@@ -106,7 +108,7 @@ export async function getReceipt(
   issuer: string,
   privateKey: KeyObject | null,
   keyId: string | null,
-): Promise<ReceiptEnvelope & { verify_url: string }> {
+): Promise<ReceiptEnvelope & { verify_url: string | null }> {
   if (privateKey === null || keyId === null) {
     throw new ChorusError('temporarily_unavailable', 'Receipts are disabled.', {
       details: { cause: 'receipts_disabled' },
@@ -131,6 +133,7 @@ export async function getReceipt(
       completed_at: Date | null;
       revision: number | null;
       content_sha256: string | null;
+      supporting_refs: { url: string; label: string }[] | null;
       submitted_by: string | null;
       review_id: string | null;
       verdict: string | null;
@@ -139,7 +142,7 @@ export async function getReceipt(
     }>(
       `SELECT w.id, w.title, w.state, r.external_room_id AS room_id, d.acceptance_criteria AS criteria,
               d.review_required, completed.completed_at,
-              result.revision, result.content_sha256, result.submitted_by,
+              result.revision, result.content_sha256, result.supporting_refs, result.submitted_by,
               review.id AS review_id, review.verdict, review.reviewer_actor_id, review.verdict_at AS decided_at
          FROM work_items w
          JOIN rooms r ON r.workspace_id = w.workspace_id AND r.id = w.home_room_id
@@ -149,7 +152,7 @@ export async function getReceipt(
             WHERE workspace_id = w.workspace_id AND aggregate_id = w.id AND event_type = 'task.completed'
          ) completed ON true
          LEFT JOIN LATERAL (
-           SELECT revision, content_sha256, submitted_by FROM task_result_revisions
+           SELECT revision, content_sha256, supporting_refs, submitted_by FROM task_result_revisions
             WHERE workspace_id = w.workspace_id AND task_id = w.id ORDER BY revision DESC LIMIT 1
          ) result ON true
          LEFT JOIN LATERAL (
@@ -201,6 +204,9 @@ export async function getReceipt(
     const receipt: Record<string, unknown> = {
       v: 1,
       type: 'chorus.task_completion',
+      // What the signature vouches for: this exact result (and its references) was submitted and, when review
+      // was required, approved by another member. Chorus does not run, fetch or check what the result claims.
+      attests: 'result_review',
       issuer,
       issued_at: new Date().toISOString(),
       server_commit: serverCommit,
@@ -210,6 +216,8 @@ export async function getReceipt(
       result: {
         revision: row.revision,
         content_sha256: row.content_sha256,
+        // The submitter's evidence (commit, CI run, deployment), signed as submitted; never fetched by Chorus.
+        supporting_refs: (row.supporting_refs ?? []).map(({ url, label }) => ({ url, label })),
         submitted_by: {
           actor_id: row.submitted_by,
           member_id: memberIds.get(row.submitted_by) ?? null,

@@ -179,9 +179,14 @@
         <p>
           Signed completion receipts: <code>chorus.get_receipt(session_id, task_id)</code> returns,
           for a done task, an Ed25519 signature over the RFC 8785 (JCS) canonical JSON of the task,
-          criteria hash, result sha256, submitter, reviewer, verdict, room and session. Anyone can
-          verify one without authentication: <code>GET /v1/keys/:key_id</code> returns the public
-          key, and <code>POST /v1/receipts/verify</code> with the envelope returns
+          criteria hash, result sha256, the result's <code>supporting_refs</code>, submitter,
+          reviewer, verdict, room and session. A receipt attests review, not execution: it proves
+          this exact result was submitted and, when review was required, approved by a different
+          member. Chorus never runs, fetches or checks what the result or its references claim, so
+          put the evidence a stranger should check (commit, CI run, deployment) in
+          <code>supporting_refs</code>. Anyone can verify one without authentication:
+          <code>GET /v1/keys/:key_id</code> returns the public key, and
+          <code>POST /v1/receipts/verify</code> with the envelope returns
           <code>{"valid":true|false}</code>. To share one with someone outside the session, hand
           them the <code>verify_url</code> the tool also returns: opening it runs the same check
           and, only when the signature verifies, shows the receipt. Chorus stores nothing to make

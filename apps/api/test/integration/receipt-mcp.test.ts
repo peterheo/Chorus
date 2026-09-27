@@ -82,6 +82,7 @@ describe('receipt MCP to HTTP verification', () => {
       content: 'Reviewed result',
       content_type: 'text/plain',
       criteria_mapping: [{ criterion: 0, note: 'Reviewed' }],
+      supporting_refs: [{ url: 'https://ci.example/runs/42', label: 'CI run' }],
     });
     const requested = await write(submitter, 'chorus.request_review', {
       session_id: session,
@@ -121,6 +122,11 @@ describe('receipt MCP to HTTP verification', () => {
       receipt: envelope['receipt'],
     });
     const receipt = envelope['receipt'] as Record<string, unknown>;
+    // The receipt says what it vouches for, and signs the submitter's evidence as submitted.
+    expect(receipt['attests']).toBe('result_review');
+    expect((receipt['result'] as Record<string, unknown>)['supporting_refs']).toEqual([
+      { url: 'https://ci.example/runs/42', label: 'CI run' },
+    ]);
     const changed = {
       ...envelope,
       receipt: {
