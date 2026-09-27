@@ -57,11 +57,12 @@ export function registerActivateRoutes(app: FastifyInstance, deps: ActivateDeps)
     }
 
     const next = `${deps.publicBaseUrl}/v1/enroll/start`;
-    const reply200 = (chorusRoomId: string) =>
+    // No internal identifier in any unauthenticated response: whether a room is active is observable
+    // (enroll/start reveals it anyway), its Chorus id is not.
+    const reply200 = () =>
       reply.code(200).type('application/json; charset=utf-8').send({
         status: 'already_active',
         sharednet_room_id: roomId,
-        chorus_room_id: chorusRoomId,
         next,
       });
     const activationFailed = () =>
@@ -74,9 +75,7 @@ export function registerActivateRoutes(app: FastifyInstance, deps: ActivateDeps)
     );
     const existing = bound.rows[0];
     if (existing !== undefined) {
-      return existing.activation_state === 'active'
-        ? reply200(existing.room_id)
-        : activationFailed();
+      return existing.activation_state === 'active' ? reply200() : activationFailed();
     }
 
     let memberToken: string;
@@ -127,11 +126,10 @@ export function registerActivateRoutes(app: FastifyInstance, deps: ActivateDeps)
       );
       const row = rows[0];
       if (row === undefined) throw new Error('chorus_activate_room returned no row');
-      if (!row.created) return await reply200(row.room_id);
+      if (!row.created) return await reply200();
       return await reply.code(201).type('application/json; charset=utf-8').send({
         status: 'active',
         sharednet_room_id: roomId,
-        chorus_room_id: row.room_id,
         next,
       });
     } catch (error) {

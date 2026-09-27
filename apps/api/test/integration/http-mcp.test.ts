@@ -460,11 +460,13 @@ describe('C8 activate.self_serve: POST /v1/rooms/activate', () => {
       `SELECT id, workspace_id, activation_state, provider FROM rooms WHERE external_room_id = $1`,
       [ROOM],
     );
-    expect(room).toMatchObject({
-      id: body['chorus_room_id'],
-      activation_state: 'active',
-      provider: 'sharednet',
+    // No internal id is exposed to the (unauthenticated) caller.
+    expect(body).toEqual({
+      status: 'active',
+      sharednet_room_id: ROOM,
+      next: 'http://127.0.0.1:0/v1/enroll/start',
     });
+    expect(room).toMatchObject({ activation_state: 'active', provider: 'sharednet' });
     expect(room?.workspace_id).not.toBe(s.workspaceId); // a workspace per room
     expect(await s.owner(`SELECT 1 FROM sessions WHERE room_id = $1`, [room?.id])).toEqual([]);
     const [row] = await s.owner<{
@@ -494,9 +496,10 @@ describe('C8 activate.self_serve: POST /v1/rooms/activate', () => {
     // Idempotent: 200 already_active with the same room, and the invite is NOT used again.
     const again = await activate(ROOM, INVITE);
     expect(again.status).toBe(200);
-    expect(await again.json()).toMatchObject({
+    expect(await again.json()).toEqual({
       status: 'already_active',
-      chorus_room_id: body['chorus_room_id'],
+      sharednet_room_id: ROOM,
+      next: 'http://127.0.0.1:0/v1/enroll/start',
     });
     expect(s.fake.joins.filter((j) => j.roomId === ROOM)).toHaveLength(1);
 
