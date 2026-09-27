@@ -154,7 +154,9 @@ export class RoomWatcher {
     const key = `${room.workspace_id}/${room.room_id}`;
     // This room's own abort: the watcher's stop() and the loss of the lease connection both end its long-poll.
     const roomAbort = new AbortController();
-    const onStop = (): void => roomAbort.abort();
+    const onStop = (): void => {
+      roomAbort.abort();
+    };
     if (this.abort.signal.aborted) onStop();
     else this.abort.signal.addEventListener('abort', onStop, { once: true });
     const lock = await pool.connect();
@@ -238,7 +240,9 @@ export class RoomWatcher {
     );
     let after = Number(current.rows[0]?.last_sequence ?? room.last_sequence);
     let failures = 0;
-    while (!signal.aborted) {
+    // Read through a function: `aborted` changes during the awaits below, which narrowing cannot see.
+    const stopped = (): boolean => signal.aborted;
+    while (!stopped()) {
       if (!(await leaseHeld())) {
         logger.warn(log, 'consumer lease lost; stopping this loop');
         return;
@@ -266,7 +270,7 @@ export class RoomWatcher {
           if (elapsed < minPollIntervalMs) await sleep(minPollIntervalMs - elapsed, signal);
         }
       } catch (error) {
-        if (signal.aborted) return; // stop(), or the lease connection died: not a watcher error
+        if (stopped()) return; // stop(), or the lease connection died: not a watcher error
         if ((error as { code?: string }).code === 'CH003') {
           logger.warn(log, 'stale consumer epoch; another process took over this room');
           return;
