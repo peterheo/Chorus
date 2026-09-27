@@ -340,13 +340,17 @@ const alreadyUsed = (): ChorusError =>
  * Records which purchase created what, on EVERY created aggregate's creation event (version 1: the session of
  * a board, each task of a batch). It is data on those events, not an event of its own: a separate event would
  * need an aggregate version of its own, which the aggregate's next real command would then collide with.
+ * A set_coordination_mode purchase creates nothing: its one effect is the session's policy change, so that
+ * event carries the purchase instead.
  */
 function withPurchaseProvenance(
   events: readonly DomainEventDraft[],
   purchase: { purchase_id: string; service: ArenaService; amount: number; txn_id: string },
 ): DomainEventDraft[] {
   return events.map((event) =>
-    event.aggregateVersion === 1 ? { ...event, payload: { ...event.payload, purchase } } : event,
+    event.aggregateVersion === 1 || purchase.service === 'set_coordination_mode'
+      ? { ...event, payload: { ...event.payload, purchase } }
+      : event,
   );
 }
 

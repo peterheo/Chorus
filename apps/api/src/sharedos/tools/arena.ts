@@ -281,11 +281,6 @@ export const paidCoordinationModeTool: ChorusToolSpec = {
     const current = await coordinationModeOf(read, change.sessionId);
     const existing = await findPurchase(read, 'set_coordination_mode', requestId);
     const due = coordinationModePrice(current.mode, change.mode);
-    if (existing?.state === 'quoted' && existing.amount !== due) {
-      // An unpaid quote whose price no longer holds is refused BEFORE anyone is asked to pay it: paying
-      // would only be refused at delivery. A new request_id quotes the current price (or is free).
-      throw modeChanged(current.mode, existing.amount, due);
-    }
     if (existing === undefined && due === 0) {
       // Free (the same mode, lowering, off): the ordinary command, keyed by the caller's request_id.
       try {
@@ -308,13 +303,12 @@ export const paidCoordinationModeTool: ChorusToolSpec = {
         throw error;
       }
     }
-    if (existing?.state !== 'delivered' && current.version !== change.expectedVersion) {
-      // Refused before a quote or a payment request, so nobody pays for a change that cannot be delivered
-      // at this version. (A delivered purchase replays whatever the version is now.)
-      throw new ChorusError('version_conflict', 'The session changed after the supplied version.', {
+    const staleVersion = (): ChorusError =>
+      new ChorusError('version_conflict', 'The session changed after the supplied version.', {
         details: { session_id: change.sessionId, current_version: current.version },
       });
-    }
+    // Refused before a quote, so nobody pays for a change that cannot be delivered at this version.
+    if (existing === undefined && current.version !== change.expectedVersion) throw staleVersion();
     // A stored purchase keeps the price it was quoted at (its replay never charges again).
     const amount = existing?.amount ?? due;
     return purchase(
@@ -331,6 +325,13 @@ export const paidCoordinationModeTool: ChorusToolSpec = {
         input: { mode: change.mode },
         amount,
         sessionLock: { expectedVersion: change.expectedVersion },
+        // An unpaid quote of THIS request (the fingerprint already matched, so a reused request_id is a
+        // request_conflict first) whose price or version no longer holds is refused BEFORE anyone is
+        // asked to pay it: paying would only be refused at delivery.
+        checkQuoted: (quoted) => {
+          if (quoted.amount !== due) throw modeChanged(current.mode, quoted.amount, due);
+          if (current.version !== change.expectedVersion) throw staleVersion();
+        },
       },
       async (tx) => {
         const applied = await setCoordinationModeInTx(tx, {
@@ -351,8 +352,15 @@ export const paidCoordinationModeTool: ChorusToolSpec = {
 function requestIdOrKey(input: Record<string, unknown>, key: string | undefined): string {
   const value = input['request_id'];
   if (typeof value === 'string') return value;
-  if (key !== undefined) return key;
-  throw invalid('request_id is required.', 'request_id');
+  if (key === undefined) throw invalid('request_id is required.', 'request_id');
+  // It becomes this call's request_id, so it must satisfy request_id's rules (a UUID does).
+  if (!/^[A-Za-z0-9._:-]{1,100}$/.test(key)) {
+    throw invalid(
+      'idempotency_key must match ^[A-Za-z0-9._:-]{1,100}$ here (it is used as the request_id); or send request_id.',
+      'idempotency_key',
+    );
+  }
+  return key;
 }
 
 /** The quoted price of a mode change no longer holds, because the session's mode moved since the quote. */

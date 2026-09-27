@@ -48,6 +48,11 @@ export interface PurchaseRequest {
   readonly amount: number;
   /** For an effect that changes the session itself: deliver under a session lock at this version. */
   readonly sessionLock?: { readonly expectedVersion: number };
+  /**
+   * Runs on an existing QUOTED purchase once it is known to be this same request (fingerprint matched),
+   * before payment is requested or verified: throw to refuse a quote that no longer holds.
+   */
+  readonly checkQuoted?: (quoted: Purchase) => void;
 }
 
 const REQUEST_ID = /^[A-Za-z0-9._:-]{1,100}$/;
@@ -153,6 +158,7 @@ export async function purchase(
         effect: neverRun,
       });
     }
+    request.checkQuoted?.(existing);
     return settle(deps, cmd, read, existing, request.paymentTxnId, effect, request.sessionLock);
   }
 

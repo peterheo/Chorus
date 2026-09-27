@@ -649,4 +649,76 @@ describe('paid coordination modes (real PostgreSQL as chorus_app, fake ledger)',
     expect(reused.code).toBe('request_conflict');
     expect((await sessionState(w)).mode).toBe('observe');
   });
+  it('a request_id reused for a different mode is request_conflict, never a misleading mode_changed', async () => {
+    const w = await world('reuse');
+    const observe = await modeArgs(w, 'observe', 'u-r1');
+    expect(
+      failed(await invoke('enabled', w.admin, 'chorus.set_coordination_mode', observe)).code,
+    ).toBe('payment_required');
+    const reused = failed(
+      await invoke('enabled', w.admin, 'chorus.set_coordination_mode', {
+        ...observe,
+        mode: 'assist',
+      }),
+    );
+    expect(reused.code).toBe('request_conflict');
+    // The same request with a stale version (its price unchanged) is a version_conflict, before any payment.
+    okOut(
+      await invoke('enabled', w.admin, 'chorus.set_session_policy', {
+        idempotency_key: randomUUID(),
+        session_id: w.session.id,
+        expected_version: observe.expected_version,
+        name: 'renamed',
+      }),
+    );
+    const callsBefore = ledgerCalls;
+    expect(
+      failed(await invoke('enabled', w.admin, 'chorus.set_coordination_mode', observe)).code,
+    ).toBe('version_conflict');
+    expect(ledgerCalls).toBe(callsBefore);
+  });
+
+  it('an idempotency_key that cannot serve as a request_id is refused clearly, before any quote', async () => {
+    const w = await world('badkey');
+    for (const key of ['has space', 'k'.repeat(101)]) {
+      const refused = failed(
+        await invoke('enabled', w.admin, 'chorus.set_coordination_mode', {
+          idempotency_key: key,
+          session_id: w.session.id,
+          mode: 'assist',
+          expected_version: (await sessionState(w)).version,
+        }),
+      );
+      expect(refused).toMatchObject({
+        code: 'invalid_request',
+        details: { field: 'idempotency_key' },
+      });
+    }
+    expect(await purchases(w)).toBe(0);
+  });
+
+  it('the paid mode change is audited: its session.policy_changed event carries the purchase', async () => {
+    const w = await world('audit');
+    const { delivered, transfer } = await buy(w, 'observe', 'a-observe');
+    const events = await f.owner<{
+      payload: {
+        changed?: string[];
+        purchase?: { purchase_id: string; txn_id: string; amount: number };
+      };
+    }>(
+      `SELECT payload FROM domain_events
+        WHERE aggregate_id = $1 AND event_type = 'session.policy_changed'
+        ORDER BY aggregate_version DESC LIMIT 1`,
+      [w.session.id],
+    );
+    expect(events[0]?.payload).toMatchObject({
+      changed: ['coordination_mode'],
+      purchase: {
+        purchase_id: delivered['purchase_id'],
+        service: 'set_coordination_mode',
+        amount: 2,
+        txn_id: transfer.id,
+      },
+    });
+  });
 });
