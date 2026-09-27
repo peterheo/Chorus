@@ -193,25 +193,25 @@ importers:
 
   apps/api:
     dependencies:
+      '@aicoo/sharedos':
+        specifier: 0.1.0-alpha.5
+        version: 0.1.0-alpha.5
+      '@chorus/database':
+        specifier: workspace:*
+        version: link:../../packages/database
       '@chorus/domain':
         specifier: workspace:*
         version: link:../../packages/domain
-      '@modelcontextprotocol/sdk':
-        specifier: 1.30.1
-        version: 1.30.1(zod@4.6.5)
       fastify:
         specifier: 5.12.5
         version: 5.12.5
       pg:
         specifier: 8.23.0
         version: 8.23.0
-      zod:
-        specifier: 4.6.5
-        version: 4.6.5
     devDependencies:
-      '@chorus/database':
-        specifier: workspace:*
-        version: link:../../packages/database
+      '@modelcontextprotocol/sdk':
+        specifier: 1.30.1
+        version: 1.30.1(zod@4.6.5)
       '@types/pg':
         specifier: 8.23.1
         version: 8.23.1
@@ -242,6 +242,34 @@ importers:
   packages/sharednet-ledger: {}
 
 packages:
+
+  '@aicoo/sharedos-client@0.1.0-alpha.5':
+    resolution: {integrity: sha512-nNuYrXaAL71OmqhObJrbr0+vM9EQmHYL2gmcQSbjfZ9QFfqWYIAjZt34XgaEmKIDU2z+kWtvZHP/nf5MrUf6kA==}
+    engines: {node: '>=20.11'}
+
+  '@aicoo/sharedos-contracts@0.1.0-alpha.5':
+    resolution: {integrity: sha512-3TF/1AdQ56WTxi/noARV7Zwsl6xgDHZdkgjX5yEFygfYARXilNUIy6X+FPtN2uFNHrAqdpJO6MHZJXrptqVd8A==}
+    engines: {node: '>=20.11'}
+
+  '@aicoo/sharedos-core@0.1.0-alpha.5':
+    resolution: {integrity: sha512-GA9ElITloaj3wR+TyXfvROWX6+kvmpSBY4I8Lsm6SaWFbQoZcQvd4P0zqwldnXu9OL1Gy+3WaaWAA685oDH9ug==}
+    engines: {node: '>=20.11'}
+
+  '@aicoo/sharedos-http@0.1.0-alpha.5':
+    resolution: {integrity: sha512-EbsyDBdvUpu+Z3so/NGmOWakQkNQNSDMW129hcNr4rZzl6ZAiDFPCvpk/CR9mTqYkHHrPgRuWdqEYgE98cqang==}
+    engines: {node: '>=20.11'}
+
+  '@aicoo/sharedos-os@0.1.0-alpha.5':
+    resolution: {integrity: sha512-hibM/MWdOZsjgM0NfKqC6/M2cDNTaQAzOD0rS8I1Ir9D9+9eZ1ehHbDpMsa8sOIHMTcTEaMMdgfvoBrWqyEQbg==}
+    engines: {node: '>=20.11'}
+
+  '@aicoo/sharedos-runtime@0.1.0-alpha.5':
+    resolution: {integrity: sha512-nLmnUe+IW3LGjs+3e4GuyaIJdYnNsX7KvLUt89k5gGiHlS8q4ZVB/VgUtlOxxKtIuYwu3fw2/DAugy29luPHEw==}
+    engines: {node: '>=20.11'}
+
+  '@aicoo/sharedos@0.1.0-alpha.5':
+    resolution: {integrity: sha512-X2p49xC2DlsgeB8J5ujQMz+xiz3mf7fvKcrcfye92/G3KLfr7ReB4qA5LrzMOZVQixVMN05YCJzzrBivrXSU/Q==}
+    engines: {node: '>=20.11'}
 
   '@cacheable/memory@2.2.0':
     resolution: {integrity: sha512-CTLKqLItRCEixEAewD3/j9DB3/o96gpTPD4eJ1v+DGOlxZRZncRQkGYqqnAGCscYd6RNeXfGeiuCphsPtqyIfQ==}
@@ -1555,10 +1583,51 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
+  zod@3.25.76:
+    resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
+
   zod@4.6.5:
     resolution: {integrity: sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==}
 
 snapshots:
+
+  '@aicoo/sharedos-client@0.1.0-alpha.5':
+    dependencies:
+      '@aicoo/sharedos-contracts': 0.1.0-alpha.5
+
+  '@aicoo/sharedos-contracts@0.1.0-alpha.5':
+    dependencies:
+      zod: 3.25.76
+
+  '@aicoo/sharedos-core@0.1.0-alpha.5':
+    dependencies:
+      '@aicoo/sharedos-contracts': 0.1.0-alpha.5
+
+  '@aicoo/sharedos-http@0.1.0-alpha.5':
+    dependencies:
+      '@aicoo/sharedos-contracts': 0.1.0-alpha.5
+      '@aicoo/sharedos-core': 0.1.0-alpha.5
+      '@aicoo/sharedos-runtime': 0.1.0-alpha.5
+
+  '@aicoo/sharedos-os@0.1.0-alpha.5':
+    dependencies:
+      '@aicoo/sharedos-contracts': 0.1.0-alpha.5
+      '@aicoo/sharedos-core': 0.1.0-alpha.5
+      zod: 3.25.76
+
+  '@aicoo/sharedos-runtime@0.1.0-alpha.5':
+    dependencies:
+      '@aicoo/sharedos-contracts': 0.1.0-alpha.5
+      '@aicoo/sharedos-core': 0.1.0-alpha.5
+
+  '@aicoo/sharedos@0.1.0-alpha.5':
+    dependencies:
+      '@aicoo/sharedos-client': 0.1.0-alpha.5
+      '@aicoo/sharedos-contracts': 0.1.0-alpha.5
+      '@aicoo/sharedos-core': 0.1.0-alpha.5
+      '@aicoo/sharedos-http': 0.1.0-alpha.5
+      '@aicoo/sharedos-os': 0.1.0-alpha.5
+      '@aicoo/sharedos-runtime': 0.1.0-alpha.5
 
   '@cacheable/memory@2.2.0':
     dependencies:
@@ -2792,5 +2861,7 @@ snapshots:
   zod-to-json-schema@3.25.2(zod@4.6.5):
     dependencies:
       zod: 4.6.5
+
+  zod@3.25.76: {}
 
   zod@4.6.5: {}
