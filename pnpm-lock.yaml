@@ -196,6 +196,9 @@ importers:
       '@aicoo/sharedos':
         specifier: 0.1.0-alpha.5
         version: 0.1.0-alpha.5
+      '@aicoo/sharedos-mcp':
+        specifier: 0.1.0-alpha.5
+        version: 0.1.0-alpha.5
       '@chorus/database':
         specifier: workspace:*
         version: link:../../packages/database
@@ -257,6 +260,10 @@ packages:
 
   '@aicoo/sharedos-http@0.1.0-alpha.5':
     resolution: {integrity: sha512-EbsyDBdvUpu+Z3so/NGmOWakQkNQNSDMW129hcNr4rZzl6ZAiDFPCvpk/CR9mTqYkHHrPgRuWdqEYgE98cqang==}
+    engines: {node: '>=20.11'}
+
+  '@aicoo/sharedos-mcp@0.1.0-alpha.5':
+    resolution: {integrity: sha512-M44hIQ7iGAdZbExmI67Vs7PEvmjZtLE1hCM8TIyWDLFI69ClDwSSjBG8P189grwHX/HXIX/GG2mPXR9zQrBQrg==}
     engines: {node: '>=20.11'}
 
   '@aicoo/sharedos-os@0.1.0-alpha.5':
@@ -1608,6 +1615,12 @@ snapshots:
       '@aicoo/sharedos-contracts': 0.1.0-alpha.5
       '@aicoo/sharedos-core': 0.1.0-alpha.5
       '@aicoo/sharedos-runtime': 0.1.0-alpha.5
+
+  '@aicoo/sharedos-mcp@0.1.0-alpha.5':
+    dependencies:
+      '@aicoo/sharedos-contracts': 0.1.0-alpha.5
+      '@aicoo/sharedos-core': 0.1.0-alpha.5
+      zod: 3.25.76
 
   '@aicoo/sharedos-os@0.1.0-alpha.5':
     dependencies:
