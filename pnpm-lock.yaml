@@ -239,6 +239,8 @@ importers:
         specifier: 8.23.1
         version: 8.23.1
 
+  packages/sharednet-ledger: {}
+
 packages:
 
   '@cacheable/memory@2.2.0':
