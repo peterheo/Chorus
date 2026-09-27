@@ -142,14 +142,14 @@ export async function roomPulse(
               LEFT JOIN LATERAL (SELECT max(revision) AS revision FROM task_result_revisions x
                 WHERE x.workspace_id = d.workspace_id AND x.task_id = d.subject_task_id) latest ON true
             WHERE r.workspace_id = $1 AND r.session_id = s.id AND r.kind = 'review'
-              AND r.state = 'requested'
+              AND r.state = 'requested' AND d.cancelled_at IS NULL
               AND d.result_revision = latest.revision) AS pending_reviews,
           (SELECT count(*) FROM work_items r JOIN review_details d
               ON d.workspace_id = r.workspace_id AND d.review_item_id = r.id
               LEFT JOIN LATERAL (SELECT max(revision) AS revision FROM task_result_revisions x
                 WHERE x.workspace_id = d.workspace_id AND x.task_id = d.subject_task_id) latest ON true
             WHERE r.workspace_id = $1 AND r.session_id = s.id AND r.kind = 'review'
-              AND r.state = 'requested'
+              AND r.state = 'requested' AND d.cancelled_at IS NULL
               AND d.result_revision < latest.revision) AS stale_reviews,
           (SELECT count(*) FROM work_items w
             WHERE w.workspace_id = $1 AND w.session_id = s.id AND w.kind = 'question' AND w.state = 'open') AS open_questions,
@@ -179,7 +179,8 @@ export async function roomPulse(
           JOIN LATERAL (SELECT max(revision) AS revision FROM task_result_revisions x
             WHERE x.workspace_id = d.workspace_id AND x.task_id = d.subject_task_id) latest ON true
          WHERE r.workspace_id = $1 AND r.session_id = ANY($2::uuid[]) AND r.kind = 'review'
-           AND r.owner_actor_id = $3 AND r.state = 'requested' AND d.result_revision = latest.revision
+           AND r.owner_actor_id = $3 AND r.state = 'requested' AND d.cancelled_at IS NULL
+           AND d.result_revision = latest.revision
         UNION ALL
         SELECT w.session_id, 'stale_lease', w.id, w.title,
                'Your lease expired; claim again to continue.', 3, l.expires_at, 0
