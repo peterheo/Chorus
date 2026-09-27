@@ -180,3 +180,4 @@ export type {
   ExtractEvents,
   Jaccard,
 } from './coordination/events.ts';
+export { STOPWORDS, contentTokens, jaccard } from './coordination/similarity.ts';
