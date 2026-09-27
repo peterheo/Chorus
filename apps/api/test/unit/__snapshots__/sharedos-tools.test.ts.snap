@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`chorus tool definitions > K11 tools.snapshot: exactly the 23 shipped tools, with stable definitions 1`] = `
+exports[`chorus tool definitions > K11 tools.snapshot: exactly the 24 shipped tools (23 + whoami), with stable definitions 1`] = `
 [
   {
     "description": "Claims a ready task and takes a lease with a fence token, at the task version you expect. Fails if someone else owns it.",
@@ -907,6 +907,26 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 23 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "submit_result",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Returns who you are in this room: your actor and instance, the room, when your token expires, the task lease duration and the server version. It changes nothing.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "type": "object",
+    },
+    "name": "chorus.whoami",
+    "namespace": "chorus",
+    "readWrite": "read",
+    "requiredCapability": {
+      "action": "read_sessions",
       "resource": {
         "namespace": "chorus",
         "path": [],

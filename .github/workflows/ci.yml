@@ -98,8 +98,6 @@ jobs:
           jq -e --arg commit "$EXPECTED_COMMIT" \
             '.status == "ok" and .commit == $commit' /tmp/healthz.json
       - name: Smoke-test entry pages
-        # TODO(O1): remove continue-on-error once S1-3 wires registerStaticPages.
-        continue-on-error: true
         run: |
           curl --fail --silent --show-error -D /tmp/index.headers \
             http://127.0.0.1:18080/ -o /tmp/index.html

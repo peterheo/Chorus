@@ -8,11 +8,12 @@ import {
   type RoomAction,
   type Uuid,
 } from '@chorus/domain';
-import { requireRequestScope } from '../request-scope.ts';
+import { requireRequestScope, type ChorusRequestScope } from '../request-scope.ts';
 
 export interface ToolDeps {
   readonly pool: pg.Pool;
   readonly leaseDurationSeconds: number;
+  readonly gitCommit: string;
   readonly logger: { error: (obj: Record<string, unknown>, msg: string) => void };
 }
 
@@ -35,6 +36,9 @@ export interface ToolRun {
   readonly input: Args;
   readonly read: ReadContext & { readonly roomId: Uuid };
   readonly command: CommandContext;
+  /** The authenticated caller's request scope (identity, room, token expiry). */
+  readonly scope: ChorusRequestScope;
+  readonly deps: ToolDeps;
 }
 
 export interface ChorusToolSpec {
@@ -153,6 +157,8 @@ export function defineChorusTool(spec: ChorusToolSpec, deps: ToolDeps): ToolHand
         const base = { pool: deps.pool, workspaceId: scope.workspaceId, actorId: scope.actorId };
         const output = await spec.run({
           input,
+          scope,
+          deps,
           read: { ...base, roomId: scope.roomId },
           command: {
             ...base,
