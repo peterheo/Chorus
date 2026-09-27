@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it, vi } from 'vitest';
 import { runE2E } from '../../../../../tests/deployed/e2e.mjs';
 import { forbiddenMatches } from '../../../../../tests/deployed/lib/forbidden.mjs';
@@ -5,6 +6,20 @@ import { buildPageExamples } from '../../../../../tests/deployed/lib/examples.mj
 import { redact } from '../../../../../tests/deployed/lib/redact.mjs';
 
 describe('deployed E2E evidence redaction', () => {
+  it('starts seat A enrollment in E2 when E1 did not provide its challenge', async () => {
+    const source = await readFile(
+      new URL('../../../../../tests/deployed/e2e.mjs', import.meta.url),
+      'utf8',
+    );
+    const e2Start = source.indexOf("await step('E2'");
+    const e3Start = source.indexOf('if (!paidMode)', e2Start);
+    expect(e2Start).toBeGreaterThanOrEqual(0);
+    expect(e3Start).toBeGreaterThan(e2Start);
+    const e2Source = source.slice(e2Start, e3Start);
+    expect(e2Source).toContain("label === 'A' && ctx.startedA !== undefined");
+    expect(e2Source).toMatch(/:\s*await startEnrollment\(baseUrl, roomId, seats\[label\]/u);
+  });
+
   it('requires run-one IDs before making a paid-mode network request', async () => {
     vi.stubEnv('CHORUS_URL', 'https://chorus.example.test');
     vi.stubEnv('EXPECTED_COMMIT', 'a'.repeat(40));

@@ -661,7 +661,7 @@ export async function runE2E() {
       const enrollments = {};
       for (const label of ['A', 'B', 'C', 'D']) {
         const probe =
-          label === 'A'
+          label === 'A' && ctx.startedA !== undefined
             ? { status: 201, body: ctx.startedA }
             : await startEnrollment(baseUrl, roomId, seats[label], `${runId}-${label}`);
         check(probe.status === 201, `enroll_start_failed_${label}`);
