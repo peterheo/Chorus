@@ -11,6 +11,7 @@ import {
   roomPulse,
   setCoordinationMode,
   setCoordinationModeInTx,
+  withReadTx,
   type CreateTaskParams,
   type JsonValue,
   type TaskSummary,
@@ -281,11 +282,12 @@ export const paidCoordinationModeTool: ChorusToolSpec = {
     const current = await coordinationModeOf(read, change.sessionId);
     const existing = await findPurchase(read, 'set_coordination_mode', requestId);
     const due = coordinationModePrice(current.mode, change.mode);
+    const freeKey = `set_coordination_mode:${requestId}`;
     if (existing === undefined && due === 0) {
       // Free (the same mode, lowering, off): the ordinary command, keyed by the caller's request_id.
       try {
         return await setCoordinationMode(
-          { ...command, idempotencyKey: `set_coordination_mode:${requestId}` },
+          { ...command, idempotencyKey: freeKey },
           {
             session_id: change.sessionId,
             expected_version: change.expectedVersion,
@@ -307,8 +309,25 @@ export const paidCoordinationModeTool: ChorusToolSpec = {
       new ChorusError('version_conflict', 'The session changed after the supplied version.', {
         details: { session_id: change.sessionId, current_version: current.version },
       });
-    // Refused before a quote, so nobody pays for a change that cannot be delivered at this version.
-    if (existing === undefined && current.version !== change.expectedVersion) throw staleVersion();
+    if (existing === undefined) {
+      // A request_id already spent on a FREE change of this session is not a new purchase: reusing it for
+      // a raise is a request_conflict, exactly as on the paid path (the caller's own command records).
+      const spent = await withReadTx(read, (db) =>
+        db.query(
+          `SELECT 1 FROM commands
+            WHERE workspace_id = $1 AND actor_id = $2 AND scope_key = $3 AND idempotency_key = $4`,
+          [read.workspaceId, read.actorId, change.sessionId, freeKey],
+        ),
+      );
+      if (spent.rowCount !== 0) {
+        throw new ChorusError(
+          'request_conflict',
+          'This request_id was already used for a different request.',
+        );
+      }
+      // Refused before a quote, so nobody pays for a change that cannot be delivered at this version.
+      if (current.version !== change.expectedVersion) throw staleVersion();
+    }
     // A stored purchase keeps the price it was quoted at (its replay never charges again).
     const amount = existing?.amount ?? due;
     return purchase(
