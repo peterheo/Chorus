@@ -55,17 +55,17 @@ export const RESOLVED_STATUS: Readonly<Partial<Record<ObjectKind, string>>> = {
   dependency: 'resolved',
 };
 
-export interface Member {
+export type Member = {
   readonly member_id: string;
   readonly name: string;
-}
+};
 
-export interface MessageSource {
+export type MessageSource = {
   readonly message_id: string;
   readonly sequence: number;
-}
+};
 
-export interface CoordObject {
+export type CoordObject = {
   /** Per-session short ref: Q1, C2, … Numbering is per prefix, and a ref is never reused. */
   readonly ref: string;
   readonly kind: ObjectKind;
@@ -95,17 +95,17 @@ export interface CoordObject {
   readonly touched_seq: number;
   /** Set only through an explicit CC-1 link (spec D9). */
   readonly linked_item_id?: string;
-}
+};
 
-export interface CoordState {
+export type CoordState = {
   /** The highest message sequence the engine has applied for this session (spec D7). */
   readonly cursor: number;
   /** The next number per prefix. */
   readonly next: Readonly<Record<RefPrefix, number>>;
   readonly objects: readonly CoordObject[];
-}
+};
 
-export interface Transition {
+export type Transition = {
   readonly ref: string;
   /** `null` when the object is created. */
   readonly from: string | null;
@@ -113,7 +113,7 @@ export interface Transition {
   readonly cause: 'message' | 'command';
   readonly message_id?: string;
   readonly reason: string;
-}
+};
 
 export type SignalKind =
   | 'conflict'
@@ -126,23 +126,23 @@ export type SignalKind =
   | 'stale_commitment'
   | 'ready_to_close';
 
-export interface Signal {
+export type Signal = {
   readonly kind: SignalKind;
   readonly refs: readonly string[];
   readonly members: readonly Member[];
   readonly reason: string;
   readonly suggested_next_action: string;
-}
+};
 
-export interface ApplyContext {
+export type ApplyContext = {
   /** Members whose messages are never applied (the room's Chorus service seat). */
   readonly excludeMemberIds: readonly string[];
-}
+};
 
-export interface ApplyResult {
+export type ApplyResult = {
   readonly state: CoordState;
   readonly transitions: readonly Transition[];
-}
+};
 
 /** The engine's signature (implemented in CC-2a's `engine.ts`). It is pure: no mutation of its input, no clock. */
 export type ApplyMessages = (
