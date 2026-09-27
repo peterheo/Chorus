@@ -1,4 +1,5 @@
 import { ChorusError, type SourceMessage } from '@chorus/domain';
+import { senderDisplayName } from '../sharednet/client.ts';
 
 export interface FetchWindowArgs {
   readonly sharednetBaseUrl: string;
@@ -72,8 +73,7 @@ function parsePage(value: unknown): readonly [PageItem[], boolean, string | numb
       sequence,
       sender_member_id: member,
       sender_principal_id: principal,
-      // SharedNet's sender.name is nullable (an unnamed seat); show the member id in its place.
-      sender_name: typeof name === 'string' ? name : member,
+      sender_name: senderDisplayName(name, member),
       content,
       reply_to_message_id: reply,
       type: raw['type'],
