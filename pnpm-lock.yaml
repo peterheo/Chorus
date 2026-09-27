@@ -205,6 +205,9 @@ importers:
       '@chorus/domain':
         specifier: workspace:*
         version: link:../../packages/domain
+      '@chorus/sharednet-ledger':
+        specifier: workspace:*
+        version: link:../../packages/sharednet-ledger
       fastify:
         specifier: 5.12.5
         version: 5.12.5

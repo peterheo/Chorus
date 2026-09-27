@@ -29,6 +29,8 @@ const READABLE = [
   'commands',
   'domain_events',
   'sharedos_audit_events',
+  'purchases',
+  'payment_verification_failures',
 ] as const;
 /** Tables with no privileges for the runtime role at all. */
 const NO_ACCESS = [
@@ -42,6 +44,7 @@ const NO_ACCESS = [
 
 const DEFINERS = [
   'chorus_activate_room',
+  'chorus_arena_payee',
   'chorus_create_session',
   'chorus_enroll_complete',
   'chorus_enroll_start',
@@ -110,6 +113,18 @@ describe('row-level security and definer functions, as the runtime role chorus_a
     await f.owner(
       `INSERT INTO sharedos_audit_events (workspace_id, event) VALUES ($1, '{"traceId":"t"}')`,
       [w.ws.id],
+    );
+    const purchaseId = await first(
+      `INSERT INTO purchases (workspace_id, room_id, session_id, board_id, actor_id, requester_member_id, service,
+                              request_id, fingerprint, amount, payee_member_id, payee_principal_id, memo, state)
+       VALUES ($1, $2, $3, $4, $5, 'i_BuyerSeat01', 'create_tasks', 'rls-seed', $6, 1, 'i_PayeeSeat01', 'p_PayeeSeat01',
+               'chorus:v1:create_tasks:seed', 'quoted') RETURNING id`,
+      [w.ws.id, w.ws.roomId, w.session.id, w.session.boardId, w.manager.id, sha256('rls-seed')],
+    );
+    await f.owner(
+      `INSERT INTO payment_verification_failures (workspace_id, actor_id, purchase_id, txn_id, reason, observed)
+       VALUES ($1, $2, $3, 'txn_RlsSeed01', 'memo', '{}'::jsonb)`,
+      [w.ws.id, w.manager.id, purchaseId],
     );
     await f.owner(
       `INSERT INTO api_tokens (workspace_id, actor_id, token_sha256, instance_id, room_id) VALUES ($1, $2, $3, $4, $5)`,
@@ -699,6 +714,8 @@ describe('row-level security and definer functions, as the runtime role chorus_a
       sessions: `CREATE TEMP TABLE sessions (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, room_id uuid, name text, discoverable boolean, join_policy text, listed_principals text[], policy_agent_ids text[], state text, created_by uuid)`,
       api_tokens: `CREATE TEMP TABLE api_tokens (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, actor_id uuid, token_sha256 text, instance_id uuid, room_id uuid, created_at timestamptz DEFAULT now(), expires_at timestamptz, revoked_at timestamptz)`,
       enrollments: `CREATE TEMP TABLE enrollments (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, room_id uuid, claimed_member_id text, display_name text, nonce text, secret_sha256 text, state text, created_at timestamptz DEFAULT now(), expires_at timestamptz, start_sequence bigint, verified_at timestamptz, proof_message_id text, proof_sequence bigint, proof_principal_id text, proof_member_id text, proof_agent_id text, consumed_at timestamptz, issued_actor_id uuid, issued_token_id uuid)`,
+      agent_instances: `CREATE TEMP TABLE agent_instances (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, actor_id uuid, label text, sharednet_member_id text, created_at timestamptz DEFAULT now())`,
+      sharednet_seats: `CREATE TEMP TABLE sharednet_seats (workspace_id uuid, room_id uuid, member_id text, principal_id text, token_ciphertext bytea, token_nonce bytea, key_id text, created_at timestamptz DEFAULT now())`,
       actors: `CREATE TEMP TABLE actors (id uuid DEFAULT gen_random_uuid(), workspace_id uuid, kind text, display_name text, created_at timestamptz DEFAULT now())`,
     };
     const db = () => f.db.url.split('/').pop() ?? '';
@@ -897,13 +914,14 @@ describe('row-level security and definer functions, as the runtime role chorus_a
 
       it('chorus_enroll_complete ignores forged temp enrollments and writes only to real tables', async () => {
         const secret = rid('cvs_', 30);
+        const proofMember = rid('i_');
         const real = await f.owner<{ id: string }>(
           `INSERT INTO enrollments (workspace_id, room_id, claimed_member_id, display_name, nonce, secret_sha256, state, created_at, expires_at, start_sequence, verified_at, proof_principal_id, proof_member_id)
            VALUES ($1, $2, $3, 'legit', $4, $5, 'verified', now(), now() + interval '10 minutes', 0, now(), $6, $3) RETURNING id`,
           [
             wa.ws.id,
             wa.ws.roomId,
-            rid('i_'),
+            proofMember,
             `cvn_${sha256(secret).slice(0, 22)}`,
             sha256(secret),
             rid('p_'),
@@ -912,7 +930,13 @@ describe('row-level security and definer functions, as the runtime role chorus_a
         const client = await f.pool.connect();
         let actorId: string | undefined;
         try {
-          for (const table of ['enrollments', 'actors', 'room_members', 'api_tokens'])
+          for (const table of [
+            'enrollments',
+            'actors',
+            'room_members',
+            'api_tokens',
+            'agent_instances',
+          ])
             await client.query(LOOKALIKE[table] ?? '');
           const { rows } = await client.query<{ status: string; actor_id: string }>(
             'SELECT * FROM chorus_enroll_complete($1, $2, $3)',
@@ -920,17 +944,82 @@ describe('row-level security and definer functions, as the runtime role chorus_a
           );
           expect(rows).toEqual([expect.objectContaining({ status: 'issued' })]);
           actorId = rows[0]?.actor_id;
-          for (const table of ['actors', 'room_members', 'api_tokens']) {
+          for (const table of ['actors', 'room_members', 'api_tokens', 'agent_instances']) {
             const temp = await client.query(`SELECT (SELECT count(*) FROM pg_temp.${table}) AS n`);
             expect(Number((temp.rows[0] as { n: string }).n), `pg_temp.${table}`).toBe(0);
           }
         } finally {
           client.release(true);
         }
+        // The proven SharedNet seat is recorded on the REAL instance (0007), which is what a payment must match.
+        expect(
+          await f.count(
+            `SELECT count(*) AS n FROM agent_instances WHERE actor_id = $1 AND sharednet_member_id = $2`,
+            [actorId, proofMember],
+          ),
+        ).toBe(1);
         expect(await f.count('SELECT count(*) AS n FROM actors WHERE id = $1', [actorId])).toBe(1);
         expect(
           await f.count('SELECT count(*) AS n FROM room_members WHERE actor_id = $1', [actorId]),
         ).toBe(1);
+      });
+
+      it('chorus_arena_payee ignores forged temp seats, rooms and memberships, and answers only live room members', async () => {
+        const w = await f.workspace(`arena-payee-${rid('', 6)}`);
+        const member = await f.actor(w, 'payee-member');
+        const outsider = await f.actor(w, 'payee-outsider', { inRoom: false });
+        const seat = { member: rid('i_'), principal: rid('p_') };
+        await f.owner(
+          `INSERT INTO sharednet_seats (workspace_id, room_id, member_id, principal_id, token_ciphertext, token_nonce, key_id)
+           VALUES ($1, $2, $3, $4, $5, $6, 'abcdef01')`,
+          [w.id, w.roomId, seat.member, seat.principal, Buffer.alloc(20), Buffer.alloc(12)],
+        );
+        const asActor = async (actorId: string, forge: boolean) => {
+          const client = await f.pool.connect();
+          try {
+            await client.query('BEGIN');
+            await client.query(
+              `SELECT set_config('chorus.workspace_id', $1, true), set_config('chorus.actor_id', $2, true)`,
+              [w.id, actorId],
+            );
+            if (forge) {
+              await client.query(LOOKALIKE['rooms'] ?? '');
+              await client.query(LOOKALIKE['room_members'] ?? '');
+              await client.query(LOOKALIKE['sharednet_seats'] ?? '');
+              await client.query(
+                `INSERT INTO pg_temp.room_members (workspace_id, room_id, actor_id) VALUES ($1, $2, $3)`,
+                [w.id, w.roomId, actorId],
+              );
+              await client.query(
+                `INSERT INTO pg_temp.rooms (id, workspace_id, name, provider, external_room_id, activation_state) VALUES ($1, $2, 'x', 'sharednet', 'rom_Forged00001', 'active')`,
+                [w.roomId, w.id],
+              );
+              await client.query(
+                `INSERT INTO pg_temp.sharednet_seats (workspace_id, room_id, member_id, principal_id, token_ciphertext, token_nonce, key_id) VALUES ($1, $2, 'i_ForgedSeat01', 'p_ForgedSeat01', '\\x00', '\\x00', 'deadbeef')`,
+                [w.id, w.roomId],
+              );
+            }
+            return (
+              await client.query<{ member_id: string }>('SELECT * FROM chorus_arena_payee($1)', [
+                w.roomId,
+              ])
+            ).rows;
+          } finally {
+            await client.query('ROLLBACK').catch(() => undefined);
+            client.release(true);
+          }
+        };
+        // A live member gets the REAL seat, however the temp tables are forged.
+        expect((await asActor(member.id, false)).map((r) => r.member_id)).toEqual([seat.member]);
+        expect((await asActor(member.id, true)).map((r) => r.member_id)).toEqual([seat.member]);
+        // A non-member gets nothing, even with a forged membership in pg_temp.
+        expect(await asActor(outsider.id, false)).toEqual([]);
+        expect(await asActor(outsider.id, true)).toEqual([]);
+        // Removing the member closes it; a suspended room does too.
+        await f.owner('UPDATE room_members SET removed_at = now() WHERE actor_id = $1', [
+          member.id,
+        ]);
+        expect(await asActor(member.id, false)).toEqual([]);
       });
 
       it('chorus_room_lookup and chorus_activate_room ignore forged temp workspaces, rooms, seats and cursors', async () => {

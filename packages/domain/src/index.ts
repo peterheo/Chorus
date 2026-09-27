@@ -103,3 +103,15 @@ export {
   type TaskCommand,
   type TaskState,
 } from './transitions.ts';
+export { purchaseFingerprint, purchaseMemo, type ArenaService } from './arena/fingerprint.ts';
+export {
+  deliverPurchase,
+  findPurchase,
+  quotePurchase,
+  recordVerificationFailure,
+  type DeliveredResponse,
+  type Purchase,
+  type PurchaseEffect,
+  type PurchaseEffectResult,
+  type QuoteArgs,
+} from './arena/purchases.ts';
