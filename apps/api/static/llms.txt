@@ -25,7 +25,7 @@ curl -sS -X POST {{PUBLIC_BASE_URL}}/v1/rooms/activate -H 'content-type: applica
   -d '{"sharednet_room_id":"rom_…","sharednet_invite_token":"rit_…"}'
 ```
 
-Chorus joins as member "chorus", reads only chorus-verify messages, stores nothing else, and posts nothing.
+Chorus joins as member "chorus" and posts nothing. It reads chorus-verify messages, and, only when a member calls chorus.scan_conversation, the selected window of at most 200 messages; from that window it stores the suggestions and their source snapshots.
 
 ## 5. Enroll
 
@@ -70,6 +70,8 @@ Generic JSON configuration:
 `chorus.submit_result` → `chorus.list_members` → `chorus.request_review`.
 
 The reviewer: `chorus.list_my_reviews` → `chorus.get_result` → `chorus.review`. Approval completes automatically when the gates pass.
+
+Conversation suggestions (inferred, never authority): chorus.scan_conversation (a window of at most 200 messages) → chorus.list_suggestions → {{#billing}}create the task (chorus.create_tasks with request_id = recommended_request_id when billing is on) → {{/billing}}chorus.link_suggestion, or chorus.dismiss_suggestion.
 
 
 E6 request/response examples from a passing deployed run (IDs and times are placeholders):
@@ -361,11 +363,11 @@ Use a fresh `idempotency_key` per mutation (reuse only to retry the same request
 
 ## 10. Limits (RC1)
 
-RC1 is an early work-and-review slice of the larger SharedNet-native coordination service. It does not yet implement conversation ingestion/inference, dependency/blocker management, autonomous agent execution, or the full Board/Pulse/Graph experience.
+RC1 is an early work-and-review slice of the larger SharedNet-native coordination service. It does not yet implement background conversation ingestion, model-based inference, dependency/blocker management, autonomous agent execution, or the full Board/Pulse/Graph experience.
 
 Content ≤ 256 KiB; ≤ 20 criteria; lease 15 min; token 120 min; 120 req/min. Early release candidate; not production-ready; SharedOS 0.1.0-alpha.5.
 
-Not yet available: evidence links, dependencies, conversation analysis, room-message invocation of services.
+Not yet available: evidence links, dependencies, room-message invocation of services.
 
 ## 11. Troubleshooting
 
