@@ -298,6 +298,40 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 31 shipped to
         },
         "tasks": {
           "items": {
+            "additionalProperties": false,
+            "properties": {
+              "acceptance_criteria": {
+                "items": {
+                  "type": "string",
+                },
+                "maxItems": 20,
+                "minItems": 1,
+                "type": "array",
+              },
+              "body": {
+                "type": "string",
+              },
+              "priority": {
+                "maximum": 4,
+                "minimum": 0,
+                "type": "integer",
+              },
+              "review_required": {
+                "type": "boolean",
+              },
+              "shareable": {
+                "type": "boolean",
+              },
+              "title": {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string",
+              },
+            },
+            "required": [
+              "title",
+              "acceptance_criteria",
+            ],
             "type": "object",
           },
           "type": "array",

@@ -45,6 +45,27 @@ describe('chorus tool definitions', () => {
     }
   });
 
+  it('S1-9 create_tasks.inputSchema: each task item publishes exactly the six real properties, nothing more', () => {
+    const createTasks = tools.find((t) => t.definition.name === 'chorus.create_tasks');
+    const tasksProp = (
+      createTasks?.definition.inputSchema as {
+        properties: {
+          tasks: { items: { properties: Record<string, unknown>; required: string[] } };
+        };
+      }
+    ).properties['tasks'];
+    const TASK_KEYS = [
+      'title',
+      'body',
+      'acceptance_criteria',
+      'priority',
+      'review_required',
+      'shareable',
+    ];
+    expect(Object.keys(tasksProp.items.properties).sort()).toEqual([...TASK_KEYS].sort());
+    expect(tasksProp.items.required).toEqual(['title', 'acceptance_criteria']);
+  });
+
   it('P10 arena.billing_switch (registration): billing on unregisters exactly the free create tools', () => {
     const names = (billing: 'enabled' | 'disabled') =>
       chorusTools({ ...deps, billing })

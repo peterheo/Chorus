@@ -13,7 +13,7 @@ import {
 } from '@chorus/domain';
 import { purchase, type ArenaDeps } from '../../arena/payments.ts';
 import { PRICES } from '../../arena/prices.ts';
-import { B, OA, S, SA, type ChorusToolSpec, type ToolDeps } from './define.ts';
+import { B, S, SA, objectArray, type ChorusToolSpec, type ToolDeps } from './define.ts';
 
 const room = (): string[] => ['room'];
 const session = (a: Record<string, unknown>): string[] => ['sessions', String(a['session_id'])];
@@ -41,6 +41,19 @@ const TASK_KEYS: ReadonlySet<string> = new Set([
   'review_required',
   'shareable',
 ]);
+
+/** Published inputSchema for one `tasks[]` item, mirroring `parseCreateTask`'s exact bounds (tasks.ts). */
+const TASK_ITEM_SCHEMA = objectArray(
+  {
+    title: { type: 'string', minLength: 1, maxLength: 200 },
+    body: { type: 'string' },
+    acceptance_criteria: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 20 },
+    priority: { type: 'integer', minimum: 0, maximum: 4 },
+    review_required: B,
+    shareable: B,
+  },
+  ['title', 'acceptance_criteria'],
+);
 
 /** Validates task `index`, and prefixes every field error with `tasks[index].` so the caller can find it. */
 function parseTaskAt(
@@ -166,7 +179,13 @@ export const arenaTools: readonly ChorusToolSpec[] = [
     write: true,
     idempotency: 'request_id',
     rateLimit: 'paid',
-    props: { request_id: S, session_id: S, board_id: S, tasks: OA, payment_txn_id: S },
+    props: {
+      request_id: S,
+      session_id: S,
+      board_id: S,
+      tasks: TASK_ITEM_SCHEMA,
+      payment_txn_id: S,
+    },
     required: ['request_id', 'session_id', 'board_id', 'tasks'],
     path: session,
     run: ({ command, input, deps }) => {
