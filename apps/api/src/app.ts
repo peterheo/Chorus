@@ -4,6 +4,7 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import type pg from 'pg';
 import type { Config } from './config.ts';
 import { registerActivateRoutes } from './activate.ts';
+import { createLedgerFor, type ArenaDeps } from './arena/payments.ts';
 import { registerAuditRoutes } from './audit-read.ts';
 import { registerEnrollRoutes } from './enroll.ts';
 import { sendError } from './http.ts';
@@ -19,6 +20,8 @@ export interface AppLimits {
   readonly enrollCompleteGlobalPerMinute: number;
   readonly mcpPerTokenPerMinute: number;
   readonly activateGlobalPerMinute: number;
+  readonly paidPerActorPerMinute: number;
+  readonly pulsePerActorPerMinute: number;
 }
 
 const DEFAULT_LIMITS: AppLimits = {
@@ -27,13 +30,18 @@ const DEFAULT_LIMITS: AppLimits = {
   enrollCompleteGlobalPerMinute: 120,
   mcpPerTokenPerMinute: 120,
   activateGlobalPerMinute: 10,
+  paidPerActorPerMinute: 30,
+  pulsePerActorPerMinute: 10,
 };
 
 export interface AppOptions {
-  readonly config: Pick<Config, 'publicBaseUrl' | 'leaseDurationSeconds' | 'gitCommit'>;
+  readonly config: Pick<Config, 'publicBaseUrl' | 'leaseDurationSeconds' | 'gitCommit'> &
+    Partial<Pick<Config, 'billing' | 'sharednetBaseUrl'>>;
   readonly pool: pg.Pool;
   /** For `POST /v1/rooms/activate`: the SharedNet client and the key that seals the seat token. */
   readonly sharednet: { readonly client: SharedNetClient; readonly secretsKey: Buffer };
+  /** Test seam: the ledger the paid tools verify against (default: the payee seat's SharedNet ledger). */
+  readonly arena?: { readonly ledgerFor?: ArenaDeps['ledgerFor'] };
   readonly version?: string;
   /** Overridable in tests (an internal constructor option, not environment). */
   readonly limits?: Partial<AppLimits>;
@@ -157,10 +165,25 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // SharedOS host: the kernel with every chorus.* tool, served as JSON-only MCP on POST /mcp, plus the
   // audit read and the entry pages.
   // ---------------------------------------------------------------------------------------------
+  const billing = config.billing ?? 'disabled';
+  const sharednetBaseUrl = config.sharednetBaseUrl ?? 'https://www.sharednet.ai';
+  const arena: ArenaDeps = {
+    pool,
+    sharednetBaseUrl,
+    ledgerFor:
+      options.arena?.ledgerFor ??
+      createLedgerFor(pool, options.sharednet.secretsKey, sharednetBaseUrl),
+  };
   const { kernel, audit } = createChorusKernel({
     pool,
     leaseDurationSeconds: config.leaseDurationSeconds,
     gitCommit: config.gitCommit,
+    billing,
+    arena,
+    limits: {
+      paid: new RateLimiter({ limit: limits.paidPerActorPerMinute, windowMs: 60_000 }),
+      pulse: new RateLimiter({ limit: limits.pulsePerActorPerMinute, windowMs: 60_000 }),
+    },
     logger: {
       error: (obj, msg) => {
         app.log.error(obj, msg);
@@ -182,7 +205,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     limiter: new RateLimiter({ limit: limits.activateGlobalPerMinute, windowMs: 60_000 }),
   });
   registerAuditRoutes(app, { pool });
-  registerStaticPages(app, { publicBaseUrl: config.publicBaseUrl, billingEnabled: false });
+  registerStaticPages(app, {
+    publicBaseUrl: config.publicBaseUrl,
+    billingEnabled: billing === 'enabled',
+  });
   // Shutdown: the HTTP server has already stopped accepting and drained (Fastify close); write what is buffered.
   app.addHook('onClose', async () => {
     await Promise.race([

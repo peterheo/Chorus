@@ -24,9 +24,9 @@ const scope: ChorusRequestScope = {
 describe('chorus tool definitions', () => {
   const tools = chorusTools(deps);
 
-  it('K11 tools.snapshot: exactly the 24 shipped tools (23 + whoami), with stable definitions', () => {
+  it('K11 tools.snapshot: exactly the 27 shipped tools (23 + whoami + 3 Arena), with stable definitions', () => {
     const definitions = tools.map((t) => t.definition).sort((a, b) => (a.name < b.name ? -1 : 1));
-    expect(definitions).toHaveLength(24);
+    expect(definitions).toHaveLength(27);
     expect(definitions).toMatchSnapshot();
   });
 
@@ -37,10 +37,32 @@ describe('chorus tool definitions', () => {
       expect(d.requiredCapability.resource).toEqual({ namespace: 'chorus', path: [] });
       expect(d.inputSchema).toMatchObject({ type: 'object', additionalProperties: false });
       expect(d.description.length).toBeGreaterThan(20);
-      // Mutations, and only mutations, carry an idempotency key.
+      // Mutations carry an idempotency key, except the paid tools: their own request_id is their idempotency.
       const required = (d.inputSchema as { required: string[] }).required;
-      expect(required.includes('idempotency_key')).toBe(d.readWrite === 'write');
+      const paid = d.name === 'chorus.create_action_board' || d.name === 'chorus.create_tasks';
+      expect(required.includes('idempotency_key')).toBe(d.readWrite === 'write' && !paid);
+      expect(required.includes('request_id')).toBe(paid);
     }
+  });
+
+  it('P10 arena.billing_switch (registration): billing on unregisters exactly the free create tools', () => {
+    const names = (billing: 'enabled' | 'disabled') =>
+      chorusTools({ ...deps, billing })
+        .map((t) => t.definition.name)
+        .sort();
+    const off = names('disabled');
+    const on = names('enabled');
+    for (const paid of ['chorus.create_action_board', 'chorus.create_tasks', 'chorus.room_pulse']) {
+      expect(off).toContain(paid);
+      expect(on).toContain(paid);
+    }
+    expect(off).toEqual(expect.arrayContaining(['chorus.create_session', 'chorus.create_task']));
+    expect(on).not.toContain('chorus.create_session');
+    expect(on).not.toContain('chorus.create_task');
+    expect(off.filter((n) => !on.includes(n))).toEqual([
+      'chorus.create_session',
+      'chorus.create_task',
+    ]);
   });
 
   it('K8 sharedos.arguments: missing, wrongly typed and unknown arguments are rejected by the parser', () => {
@@ -125,7 +147,9 @@ describe('chorus tool definitions', () => {
       expect(result).toMatchObject({ status: 'failed', error: { code, details: { n: 1 } } });
       if (result.status === 'failed') {
         expect(result.error.retryable === true).toBe(
-          code === 'temporarily_unavailable' || code === 'payment_not_found',
+          code === 'temporarily_unavailable' ||
+            code === 'payment_not_found' ||
+            code === 'rate_limited',
         );
       }
     }

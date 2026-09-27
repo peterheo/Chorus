@@ -27,9 +27,18 @@ describe('config.startup_guards (unit)', () => {
       leaseDurationSeconds: 900,
       gitCommit: 'unknown',
       sharednetBaseUrl: 'https://www.sharednet.ai',
+      billing: 'disabled',
     });
     expect(config.secretsKey).toHaveLength(32);
     expect(config.secretsKeyId).toMatch(/^[0-9a-f]{8}$/);
+  });
+
+  it('CHORUS_BILLING accepts exactly enabled or disabled (default disabled)', () => {
+    expect(loadConfig({ ...base, CHORUS_BILLING: 'enabled' }).billing).toBe('enabled');
+    expect(loadConfig({ ...base, CHORUS_BILLING: 'disabled' }).billing).toBe('disabled');
+    for (const bad of ['', 'true', 'ENABLED', '1', 'on']) {
+      expect(problem({ ...base, CHORUS_BILLING: bad })).toMatch(/CHORUS_BILLING/);
+    }
   });
 
   it('requires PUBLIC_BASE_URL (https, no trailing slash) in production', () => {

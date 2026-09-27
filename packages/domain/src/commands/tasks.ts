@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
-import { runCommand, type CommandContext } from '../command.ts';
+import {
+  runCommand,
+  type CommandContext,
+  type CommandTx,
+  type DomainEventDraft,
+} from '../command.ts';
 import { ChorusError } from '../errors.ts';
 import type { Uuid } from '../ids.ts';
 import { assertTaskTransition } from '../transitions.ts';
@@ -58,10 +63,19 @@ export type LeaseResponse = {
 // create_task
 // --------------------------------------------------------------------------------------------------
 
-export async function createTask(
-  ctx: CommandContext,
-  input: unknown,
-): Promise<{ task: TaskSummary }> {
+export type CreateTaskParams = {
+  sessionId: Uuid;
+  boardId: Uuid;
+  title: string;
+  body: string;
+  criteria: string[];
+  priority: number;
+  requestedReview: boolean | undefined;
+  shareable: boolean;
+};
+
+/** Validates the input of `create_task` (shape and limits only; no I/O). */
+export function parseCreateTask(input: unknown): CreateTaskParams {
   const raw = requireObject(input, [
     'session_id',
     'board_id',
@@ -86,6 +100,107 @@ export async function createTask(
       ? undefined
       : optionalBoolean(raw['review_required'], 'review_required', true);
   const shareable = optionalBoolean(raw['shareable'], 'shareable', false);
+  return { sessionId, boardId, title, body, criteria, priority, requestedReview, shareable };
+}
+
+/**
+ * The write half of `create_task`, callable inside another command's transaction (the paid `create_tasks`
+ * delivery, once per task). The command must be scoped to `params.sessionId`. The public command journals
+ * exactly the events returned here.
+ */
+export async function createTaskInTx(
+  tx: CommandTx,
+  params: CreateTaskParams,
+): Promise<{ result: { task: TaskSummary }; events: DomainEventDraft[] }> {
+  const { sessionId, boardId, title, body, criteria, priority, requestedReview, shareable } =
+    params;
+  const session = requireSession(tx);
+  const reviewRequired = requestedReview ?? session.defaultReviewRequired;
+  const board = await tx.db.query(
+    'SELECT 1 FROM projects WHERE workspace_id = $1 AND id = $2 AND session_id = $3',
+    [tx.workspaceId, boardId, sessionId],
+  );
+  if (board.rowCount === 0) throw new ChorusError('not_found', 'Not found.');
+
+  const { rows } = await tx.db.query<{ id: Uuid; created_at: Date; updated_at: Date }>(
+    `INSERT INTO work_items
+           (workspace_id, session_id, board_id, kind, home_room_id, title, body, state, priority,
+            creator_actor_id)
+         VALUES ($1, $2, $3, 'task', $4, $5, $6, 'ready', $7, $8)
+         RETURNING id, created_at, updated_at`,
+    [tx.workspaceId, sessionId, boardId, session.roomId, title, body, priority, tx.actorId],
+  );
+  const row = rows[0];
+  if (row === undefined) throw new ChorusError('internal_error', 'Task insert returned no row.');
+  await tx.db.query(
+    `INSERT INTO task_details
+           (workspace_id, session_id, item_id, acceptance_criteria, criteria_revision, review_required,
+            shareable, claim_policy)
+         VALUES ($1, $2, $3, $4::jsonb, 1, $5, $6, $7)`,
+    [
+      tx.workspaceId,
+      sessionId,
+      row.id,
+      JSON.stringify(criteria),
+      reviewRequired,
+      shareable,
+      session.defaultClaimPolicy,
+    ],
+  );
+  await tx.db.query(
+    `INSERT INTO task_criteria_revisions
+           (workspace_id, session_id, task_id, criteria_revision, acceptance_criteria, created_by)
+         VALUES ($1, $2, $3, 1, $4::jsonb, $5)`,
+    [tx.workspaceId, sessionId, row.id, JSON.stringify(criteria), tx.actorId],
+  );
+  await tx.db.query(
+    `INSERT INTO task_leases (workspace_id, session_id, task_id, fence) VALUES ($1, $2, $3, 0)`,
+    [tx.workspaceId, sessionId, row.id],
+  );
+  return {
+    result: {
+      task: {
+        id: row.id,
+        session_id: sessionId,
+        board_id: boardId,
+        room_id: session.roomId,
+        title,
+        state: 'ready',
+        version: 1,
+        owner_actor_id: null,
+        review_required: reviewRequired,
+        shareable,
+        criteria_count: criteria.length,
+        priority,
+        created_at: iso(row.created_at) ?? '',
+        updated_at: iso(row.updated_at) ?? '',
+      },
+    },
+    events: [
+      {
+        roomId: session.roomId,
+        aggregateId: row.id,
+        aggregateVersion: 1,
+        eventType: 'task.created',
+        payload: {
+          title,
+          criteria_count: criteria.length,
+          review_required: reviewRequired,
+          shareable,
+          board_id: boardId,
+        },
+      },
+    ],
+  };
+}
+
+export async function createTask(
+  ctx: CommandContext,
+  input: unknown,
+): Promise<{ task: TaskSummary }> {
+  const params = parseCreateTask(input);
+  const { sessionId, boardId, title, body, criteria, priority, requestedReview, shareable } =
+    params;
 
   return runCommand(ctx, {
     type: 'task.create',
@@ -104,87 +219,7 @@ export async function createTask(
       requireAction(tx, 'create_item');
       return Promise.resolve();
     },
-    handle: async (tx) => {
-      const session = requireSession(tx);
-      const reviewRequired = requestedReview ?? session.defaultReviewRequired;
-      const board = await tx.db.query(
-        'SELECT 1 FROM projects WHERE workspace_id = $1 AND id = $2 AND session_id = $3',
-        [tx.workspaceId, boardId, sessionId],
-      );
-      if (board.rowCount === 0) throw new ChorusError('not_found', 'Not found.');
-
-      const { rows } = await tx.db.query<{ id: Uuid; created_at: Date; updated_at: Date }>(
-        `INSERT INTO work_items
-           (workspace_id, session_id, board_id, kind, home_room_id, title, body, state, priority,
-            creator_actor_id)
-         VALUES ($1, $2, $3, 'task', $4, $5, $6, 'ready', $7, $8)
-         RETURNING id, created_at, updated_at`,
-        [tx.workspaceId, sessionId, boardId, session.roomId, title, body, priority, tx.actorId],
-      );
-      const row = rows[0];
-      if (row === undefined)
-        throw new ChorusError('internal_error', 'Task insert returned no row.');
-      await tx.db.query(
-        `INSERT INTO task_details
-           (workspace_id, session_id, item_id, acceptance_criteria, criteria_revision, review_required,
-            shareable, claim_policy)
-         VALUES ($1, $2, $3, $4::jsonb, 1, $5, $6, $7)`,
-        [
-          tx.workspaceId,
-          sessionId,
-          row.id,
-          JSON.stringify(criteria),
-          reviewRequired,
-          shareable,
-          session.defaultClaimPolicy,
-        ],
-      );
-      await tx.db.query(
-        `INSERT INTO task_criteria_revisions
-           (workspace_id, session_id, task_id, criteria_revision, acceptance_criteria, created_by)
-         VALUES ($1, $2, $3, 1, $4::jsonb, $5)`,
-        [tx.workspaceId, sessionId, row.id, JSON.stringify(criteria), tx.actorId],
-      );
-      await tx.db.query(
-        `INSERT INTO task_leases (workspace_id, session_id, task_id, fence) VALUES ($1, $2, $3, 0)`,
-        [tx.workspaceId, sessionId, row.id],
-      );
-      return {
-        result: {
-          task: {
-            id: row.id,
-            session_id: sessionId,
-            board_id: boardId,
-            room_id: session.roomId,
-            title,
-            state: 'ready',
-            version: 1,
-            owner_actor_id: null,
-            review_required: reviewRequired,
-            shareable,
-            criteria_count: criteria.length,
-            priority,
-            created_at: iso(row.created_at) ?? '',
-            updated_at: iso(row.updated_at) ?? '',
-          },
-        },
-        events: [
-          {
-            roomId: session.roomId,
-            aggregateId: row.id,
-            aggregateVersion: 1,
-            eventType: 'task.created',
-            payload: {
-              title,
-              criteria_count: criteria.length,
-              review_required: reviewRequired,
-              shareable,
-              board_id: boardId,
-            },
-          },
-        ],
-      };
-    },
+    handle: (tx) => createTaskInTx(tx, params),
   });
 }
 

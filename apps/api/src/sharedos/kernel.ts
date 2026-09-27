@@ -2,6 +2,7 @@ import { SharedOSKernel } from '@aicoo/sharedos';
 import type pg from 'pg';
 import { createPgAuditSink, type AuditLogger } from './audit-sink.ts';
 import { createChorusGrantSource } from './grant-source.ts';
+import type { ToolDeps } from './tools/define.ts';
 import { chorusTools } from './tools/index.ts';
 
 export interface ChorusKernelDeps {
@@ -9,6 +10,9 @@ export interface ChorusKernelDeps {
   readonly pool: pg.Pool;
   readonly leaseDurationSeconds: number;
   readonly gitCommit: string;
+  readonly arena?: ToolDeps['arena'];
+  readonly limits?: ToolDeps['limits'];
+  readonly billing?: ToolDeps['billing'];
   readonly logger: AuditLogger & { warn?: (obj: Record<string, unknown>, msg: string) => void };
 }
 
@@ -29,6 +33,9 @@ export function createChorusKernel(deps: ChorusKernelDeps): {
     pool: deps.pool,
     leaseDurationSeconds: deps.leaseDurationSeconds,
     gitCommit: deps.gitCommit,
+    ...(deps.arena === undefined ? {} : { arena: deps.arena }),
+    ...(deps.limits === undefined ? {} : { limits: deps.limits }),
+    ...(deps.billing === undefined ? {} : { billing: deps.billing }),
     logger: deps.logger,
   })) {
     kernel.registerTool(tool);

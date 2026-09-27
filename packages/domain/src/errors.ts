@@ -52,7 +52,11 @@ export class ChorusError extends Error {
 
   /** A retry of the same request can succeed for these (a payment not yet visible in the ledger, an outage). */
   get retryable(): boolean {
-    return this.code === 'temporarily_unavailable' || this.code === 'payment_not_found';
+    return (
+      this.code === 'temporarily_unavailable' ||
+      this.code === 'payment_not_found' ||
+      this.code === 'rate_limited'
+    );
   }
 }
 
