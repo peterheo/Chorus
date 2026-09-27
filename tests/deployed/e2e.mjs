@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createPublicKey, randomUUID, verify } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -594,6 +594,7 @@ async function runConversationStep(ctx, step, runId, ids) {
     const task = delivered.result?.tasks?.[0];
     check(typeof task?.id === 'string', 'conversation_task_missing');
     ids.tasks.push(task.id);
+    ctx.conversationTaskId = task.id;
 
     const linked = await toolOk(
       ctx.clients.C,
@@ -670,6 +671,560 @@ async function runConversationStep(ctx, step, runId, ids) {
   });
 }
 
+/** Fixed E11 room texts. Seat B is addressed by its member id, which the engine resolves exactly (spec §3). */
+export function coordinationScript(memberIds) {
+  return {
+    scan: [
+      { seat: 'A', key: 'handoff', content: `${memberIds.B}, could you check the backup job?` },
+      { seat: 'B', key: 'accept', content: "I'm on it." },
+      { seat: 'A', key: 'claim_pos', content: 'The deploy is green.' },
+      { seat: 'D', key: 'claim_neg', content: 'The deploy is not green.' },
+      { seat: 'C', key: 'dependency', content: `Blocked on ${memberIds.B}'s backup check.` },
+    ],
+    assist: [
+      { seat: 'A', key: 'claim_pos', content: 'The staging cache is warm.' },
+      { seat: 'D', key: 'claim_neg', content: 'The staging cache is not warm.' },
+    ],
+  };
+}
+
+/** RFC 8785 for the JSON values a receipt holds (strings, integers, booleans, null, arrays, objects). */
+export function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Checks a receipt envelope offline against a PEM public key: the JCS hash and the Ed25519 signature. */
+export function verifyReceiptLocally(envelope, publicKeyPem) {
+  try {
+    const canonical = canonicalJson(envelope.receipt);
+    const digest = createHash('sha256').update(canonical).digest('hex');
+    return (
+      envelope.alg === 'Ed25519' &&
+      digest === envelope.jcs_sha256 &&
+      verify(
+        null,
+        Buffer.from(canonical),
+        createPublicKey(publicKeyPem),
+        Buffer.from(envelope.signature, 'base64url'),
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** The same envelope with `receipt.result.content_sha256` altered; hash and signature are left as issued. */
+export function tamperedReceipt(envelope) {
+  const copy = JSON.parse(JSON.stringify(envelope));
+  const current = copy.receipt.result.content_sha256;
+  copy.receipt.result.content_sha256 = current === '0'.repeat(64) ? 'f'.repeat(64) : '0'.repeat(64);
+  return copy;
+}
+
+/** Which private values (ids, names, titles) appear in a room text. Returns only the matches' indexes. */
+export function leakedValues(text, privateValues) {
+  const lower = text.toLowerCase();
+  return privateValues
+    .map((value, index) => ({ value, index }))
+    .filter(({ value }) => typeof value === 'string' && value.length >= 4)
+    .filter(({ value }) => lower.includes(value.toLowerCase()))
+    .map(({ index }) => index);
+}
+
+async function roomMessagesAfter(sharednetUrl, roomId, token, after) {
+  const messages = [];
+  let cursor = after;
+  for (let page = 0; page < 3; page += 1) {
+    const { body } = await responseJson(
+      `${sharednetUrl}/api/v1/rooms/${encodeURIComponent(roomId)}/messages?after=${String(cursor)}&limit=100&order=asc`,
+      { headers: { authorization: `Bearer ${token}`, accept: 'application/json' } },
+      [200],
+    );
+    check(Array.isArray(body?.items), 'sharednet_messages_contract');
+    for (const item of body.items) {
+      if (!Number.isSafeInteger(item?.sequence) || item.sequence <= cursor) continue;
+      messages.push({
+        id: item.id,
+        sequence: item.sequence,
+        member_id: item.sender?.member_id ?? null,
+        text: typeof item.content === 'string' ? item.content : '',
+      });
+      cursor = item.sequence;
+    }
+    if (body.has_more !== true) break;
+  }
+  return messages;
+}
+
+const COORDINATION_GROUPS = [
+  'claims',
+  'commitments',
+  'conflicts',
+  'decisions',
+  'dependencies',
+  'handoffs',
+  'questions',
+];
+
+async function coordinationStatus(client, sessionId) {
+  const status = await toolOk(client, 'chorus.coordination_status', {
+    session_id: sessionId,
+    include_closed: true,
+  });
+  check(
+    status.inferred === true &&
+      status.coverage === 'scanned_windows_only' &&
+      Number.isSafeInteger(status.cursor) &&
+      typeof status.ready_to_close === 'boolean' &&
+      Array.isArray(status.signals) &&
+      COORDINATION_GROUPS.every((group) => Array.isArray(status.objects?.[group])),
+    'coordination_status_contract',
+  );
+  return status;
+}
+
+const sourcedBy = (objects, messageId) =>
+  objects.filter((object) => object.sources?.[0]?.message_id === messageId);
+
+async function setCoordinationMode(client, sessionId, mode) {
+  const session = await toolOk(client, 'chorus.get_session', { session_id: sessionId });
+  check(Number.isSafeInteger(session.version), 'session_version_missing');
+  return toolOk(
+    client,
+    'chorus.set_coordination_mode',
+    { session_id: sessionId, mode, expected_version: session.version },
+    true,
+  );
+}
+
+/**
+ * E11 (CC-2 spec §5, §7–§10): conversation coordination on E10's session. Seats post fixed short texts; the
+ * evidence holds only refs, kinds, statuses, counts and ids, never room text, tokens or receipt signatures.
+ * Spends no credits.
+ */
+async function runCoordinationStep(ctx, step, runId, ids) {
+  const { sessionId } = ctx;
+  const members = Object.fromEntries(
+    ['A', 'B', 'C', 'D'].map((label) => [label, ctx.seats[label].member_id]),
+  );
+  const script = coordinationScript(members);
+
+  await step('E11a', 'Scan a scripted conversation into coordination objects', async () => {
+    check(members.B.length <= 40, 'coordination_member_id_not_addressable');
+    const posted = {};
+    for (const line of script.scan) {
+      posted[line.key] = await postRoomMessageRecord(
+        ctx.sharednetUrl,
+        ctx.roomId,
+        ctx.seats[line.seat].token,
+        line.content,
+      );
+    }
+    const from = posted.handoff.sequence;
+    const to = posted.dependency.sequence;
+    check(to > from && to - from < 200, 'coordination_window_invalid');
+    const window = { session_id: sessionId, from_sequence: from, to_sequence: to };
+    const scanned = await toolOk(ctx.clients.C, 'chorus.scan_conversation', window, true);
+    const applied = scanned.coordination;
+    check(
+      Number.isSafeInteger(applied?.applied_messages) &&
+        applied.applied_messages >= script.scan.length &&
+        applied.skipped_before_cursor === 0 &&
+        Number.isSafeInteger(applied.new_objects) &&
+        Number.isSafeInteger(applied.transitions),
+      'coordination_scan_contract',
+    );
+
+    const status = await coordinationStatus(ctx.clients.C, sessionId);
+    const { objects } = status;
+    check(status.cursor >= to, 'coordination_cursor_behind');
+    const handoffs = sourcedBy(objects.handoffs, posted.handoff.id);
+    check(
+      handoffs.length === 1 &&
+        handoffs[0].status === 'accepted' &&
+        handoffs[0].author?.member_id === members.A &&
+        handoffs[0].targets?.some((target) => target.member_id === members.B),
+      'coordination_handoff_missing',
+    );
+    const handoff = handoffs[0];
+    const commitments = objects.commitments.filter(
+      (object) =>
+        object.owner?.member_id === members.B && (object.related ?? []).includes(handoff.ref),
+    );
+    check(
+      commitments.length === 1 && commitments[0].status === 'open',
+      'coordination_commitment_missing',
+    );
+    const commitment = commitments[0];
+    const claimPos = sourcedBy(objects.claims, posted.claim_pos.id);
+    const claimNeg = sourcedBy(objects.claims, posted.claim_neg.id);
+    check(
+      claimPos.length === 1 &&
+        claimNeg.length === 1 &&
+        claimPos[0].status === 'active' &&
+        claimNeg[0].status === 'active' &&
+        claimPos[0].polarity === 'pos' &&
+        claimNeg[0].polarity === 'neg',
+      'coordination_claims_missing',
+    );
+    const claimRefs = [claimPos[0].ref, claimNeg[0].ref];
+    const conflicts = objects.conflicts.filter(
+      (object) =>
+        object.status === 'detected' && claimRefs.every((ref) => object.related?.includes(ref)),
+    );
+    check(conflicts.length === 1, 'coordination_conflict_missing');
+    const conflict = conflicts[0];
+    check(
+      status.signals.some(
+        (signal) => signal.kind === 'conflict' && signal.refs?.includes(conflict.ref),
+      ),
+      'coordination_conflict_signal_missing',
+    );
+    const dependencies = sourcedBy(objects.dependencies, posted.dependency.id);
+    check(
+      dependencies.length === 1 &&
+        dependencies[0].status === 'waiting' &&
+        dependencies[0].author?.member_id === members.C &&
+        dependencies[0].related?.includes(commitment.ref),
+      'coordination_dependency_missing',
+    );
+
+    const rescanned = await toolOk(ctx.clients.C, 'chorus.scan_conversation', window, true);
+    check(
+      rescanned.coordination?.applied_messages === 0 &&
+        rescanned.coordination.skipped_before_cursor >= script.scan.length &&
+        rescanned.coordination.transitions === 0,
+      'coordination_rescan_changed_state',
+    );
+    ctx.coordination = {
+      window,
+      handoff: handoff.ref,
+      commitment: commitment.ref,
+      conflict: conflict.ref,
+      dependency: dependencies[0].ref,
+    };
+    return {
+      ids: {
+        window: { from_sequence: from, to_sequence: to },
+        refs: {
+          handoff: handoff.ref,
+          commitment: commitment.ref,
+          conflict: conflict.ref,
+          dependency: dependencies[0].ref,
+        },
+      },
+      applied_messages: applied.applied_messages,
+      signal_kinds: status.signals.map((signal) => signal.kind),
+    };
+  });
+
+  await step('E11b', 'Resolve a commitment and unblock its dependency', async () => {
+    const { commitment, dependency } = ctx.coordination;
+    await toolError(
+      ctx.clients.C,
+      'chorus.update_conversation_object',
+      {
+        session_id: sessionId,
+        ref: commitment,
+        action: 'resolve',
+        idempotency_key: randomUUID(),
+      },
+      'action_forbidden',
+    );
+    const updated = await toolOk(
+      ctx.clients.B,
+      'chorus.update_conversation_object',
+      { session_id: sessionId, ref: commitment, action: 'resolve', reason: `${runId} E11b` },
+      true,
+    );
+    check(
+      updated.object?.ref === commitment && updated.object.status === 'completed',
+      'coordination_resolve_contract',
+    );
+    const status = await coordinationStatus(ctx.clients.C, sessionId);
+    const waiting = status.objects.dependencies.find((object) => object.ref === dependency);
+    check(waiting?.status === 'resolved', 'coordination_dependency_not_resolved');
+    check(
+      status.signals.some(
+        (signal) => signal.kind === 'dependency_resolved' && signal.refs?.includes(dependency),
+      ),
+      'coordination_dependency_signal_missing',
+    );
+    return { ids: { refs: { commitment, dependency } } };
+  });
+
+  await step('E11c', 'Surface coordination next actions in the room pulse', async () => {
+    const pulse = await toolOk(ctx.clients.B, 'chorus.room_pulse', { session_id: sessionId });
+    const session = (pulse.sessions ?? []).find((item) => item.session_id === sessionId);
+    const kinds = (session?.next_actions ?? [])
+      .map((action) => action.kind)
+      .filter((kind) => typeof kind === 'string' && kind.startsWith('conversation_'));
+    check(kinds.length >= 1, 'coordination_pulse_action_missing');
+    check((session.next_actions ?? []).length <= 10, 'coordination_pulse_over_limit');
+    return { conversation_action_kinds: [...new Set(kinds)].sort() };
+  });
+
+  const privateValues = async () => {
+    const values = [ctx.sessionId, ctx.session2Id, ctx.boardId, ...ids.tasks];
+    for (const id of [ctx.sessionId, ctx.session2Id]) {
+      const session = await toolOk(ctx.clients.A, 'chorus.get_session', { session_id: id });
+      values.push(session.name);
+    }
+    for (const taskId of ids.tasks) {
+      const task = await toolOk(ctx.clients.B, 'chorus.get_task', {
+        session_id: sessionId,
+        task_id: taskId,
+      });
+      values.push(task.title);
+    }
+    const summary = await toolOk(ctx.clients.B, 'chorus.board_summary', { session_id: sessionId });
+    for (const board of summary.boards ?? []) {
+      values.push(board.name, ...(board.recent_done ?? []).map((item) => item.title));
+    }
+    return values;
+  };
+
+  if (!ctx.assistMode) {
+    await step('E11d', 'Post one assist note for a fresh conflict', async () => ({
+      skip: 'E2E_ASSIST not set',
+    }));
+  } else {
+    await step('E11d', 'Post one assist note for a fresh conflict', async () => {
+      // The scanned conflict was never posted (mode was off); settle it so only the fresh pair is announced.
+      await toolOk(
+        ctx.clients.A,
+        'chorus.update_conversation_object',
+        { session_id: sessionId, ref: ctx.coordination.conflict, action: 'resolve' },
+        true,
+      );
+      const secrets = await privateValues();
+      const seatIds = new Set(Object.values(members));
+      let restored = false;
+      let posts = [];
+      let failure;
+      try {
+        await setCoordinationMode(ctx.clients.A, sessionId, 'assist');
+        const first = {};
+        for (const line of script.assist) {
+          first[line.key] = await postRoomMessageRecord(
+            ctx.sharednetUrl,
+            ctx.roomId,
+            ctx.seats[line.seat].token,
+            line.content,
+          );
+        }
+        const after = first.claim_pos.sequence;
+        const readPosts = async () =>
+          (await roomMessagesAfter(ctx.sharednetUrl, ctx.roomId, ctx.seats.A.token, after)).filter(
+            (message) => !seatIds.has(message.member_id) && message.text.startsWith('[chorus] '),
+          );
+        const deadline = Date.now() + 60_000;
+        const isConflictPost = (message) => message.text.startsWith('[chorus] Resolve conflict ');
+        while (Date.now() < deadline) {
+          posts = await readPosts();
+          if (posts.some(isConflictPost)) break;
+          await new Promise((resolve) => setTimeout(resolve, 3_000));
+        }
+        check(posts.some(isConflictPost), 'assist_post_missing');
+        await new Promise((resolve) => setTimeout(resolve, 10_000));
+        posts = await readPosts();
+        check(posts.filter(isConflictPost).length === 1, 'assist_post_not_exactly_once');
+        check(
+          posts.every((message) => leakedValues(message.text, secrets).length === 0),
+          'assist_post_leaks_session_data',
+        );
+      } catch (error) {
+        failure = error;
+      } finally {
+        try {
+          await setCoordinationMode(ctx.clients.A, sessionId, 'off');
+          restored = true;
+        } catch (error) {
+          failure ??= error;
+        }
+      }
+      if (failure !== undefined) throw failure;
+      check(restored, 'assist_mode_not_restored');
+      return {
+        chorus_posts: posts.length,
+        conflict_posts: 1,
+        sample: '[chorus] Resolve conflict …',
+        leak_checked_values: secrets.length,
+      };
+    });
+  }
+
+  await step('E11e', 'Verify a signed completion receipt', async () => {
+    const taskId = ctx.conversationTaskId;
+    check(UUID.test(taskId ?? ''), 'receipt_task_missing');
+    const target = { session_id: sessionId, task_id: taskId };
+    const probe = await ctx.clients.B.call('chorus.get_receipt', target);
+    if (probe.isError) {
+      if (
+        probe.errorCode === 'temporarily_unavailable' &&
+        probe.data.error?.details?.cause === 'receipts_disabled'
+      ) {
+        return { skip: 'receipts_disabled', ids: { task_id: taskId } };
+      }
+      check(
+        probe.errorCode === 'invalid_transition' &&
+          probe.data.error?.details?.reason === 'not_done',
+        `receipt_probe_${probe.errorCode ?? 'missing'}`,
+      );
+    }
+    let task = await toolOk(ctx.clients.B, 'chorus.get_task', target);
+    let digest;
+    if (task.state !== 'done') {
+      check(task.state === 'ready', 'receipt_task_not_ready');
+      const lease = await claimTask(ctx.clients.B, sessionId, task);
+      const content = `# ${runId}\n\nThe conversation task is complete.\n`;
+      digest = createHash('sha256').update(Buffer.from(content, 'utf8')).digest('hex');
+      const mapping = (task.acceptance_criteria ?? []).map((_, criterion) => ({
+        criterion,
+        note: 'Verified.',
+      }));
+      const submitted = await submitTask(ctx.clients.B, sessionId, taskId, lease, content, mapping);
+      check(submitted.content_sha256 === digest, 'receipt_submit_digest');
+      task = await toolOk(ctx.clients.B, 'chorus.get_task', target);
+      if (task.state !== 'done') {
+        const requested = await toolOk(
+          ctx.clients.B,
+          'chorus.request_review',
+          {
+            ...target,
+            expected_version: submitted.version,
+            revision: 1,
+            reviewer_actor_id: ctx.actors.C.actor_id,
+          },
+          true,
+        );
+        const verdict = await toolOk(
+          ctx.clients.C,
+          'chorus.review',
+          {
+            session_id: sessionId,
+            review_id: requested.review.id,
+            expected_version: requested.review.version,
+            verdict: 'approved',
+            content_sha256: digest,
+          },
+          true,
+        );
+        check(verdict.task?.state === 'done', 'receipt_task_not_completed');
+      }
+    }
+    const envelope = await toolOk(ctx.clients.B, 'chorus.get_receipt', target);
+    const receipt = envelope.receipt;
+    check(
+      envelope.alg === 'Ed25519' &&
+        /^[0-9a-f]{16}$/u.test(envelope.key_id ?? '') &&
+        /^[0-9a-f]{64}$/u.test(envelope.jcs_sha256 ?? '') &&
+        /^[A-Za-z0-9_-]{86}$/u.test(envelope.signature ?? '') &&
+        receipt?.v === 1 &&
+        receipt.type === 'chorus.task_completion' &&
+        receipt.issuer === ctx.baseUrl &&
+        receipt.server_commit === ctx.expectedCommit &&
+        receipt.sharednet_room_id === ctx.roomId &&
+        receipt.session_id === sessionId &&
+        receipt.task?.id === taskId &&
+        receipt.result?.submitted_by?.actor_id === ctx.actors.B.actor_id &&
+        (digest === undefined || receipt.result.content_sha256 === digest) &&
+        (receipt.review === null ||
+          (receipt.review?.verdict === 'approved' &&
+            receipt.review.reviewer?.actor_id === ctx.actors.C.actor_id)),
+      'receipt_envelope_contract',
+    );
+    const { body: key } = await responseJson(
+      `${ctx.baseUrl}/v1/keys/${encodeURIComponent(envelope.key_id)}`,
+      { headers: { accept: 'application/json' } },
+      [200],
+    );
+    check(
+      key?.key_id === envelope.key_id &&
+        key.alg === 'Ed25519' &&
+        /^[A-Za-z0-9_-]{43}$/u.test(key.public_key_raw_b64 ?? '') &&
+        typeof key.public_key_pem === 'string',
+      'receipt_key_contract',
+    );
+    check(verifyReceiptLocally(envelope, key.public_key_pem), 'receipt_local_verify_failed');
+    const verifyUrl = `${ctx.baseUrl}/v1/receipts/verify`;
+    const verifyInit = (body) => ({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: json(body),
+    });
+    const { body: verified } = await responseJson(verifyUrl, verifyInit(envelope), [200]);
+    check(verified?.valid === true && verified.key_id === envelope.key_id, 'receipt_not_valid');
+    const tampered = tamperedReceipt(envelope);
+    check(!verifyReceiptLocally(tampered, key.public_key_pem), 'receipt_tamper_verified_locally');
+    const { body: rejected } = await responseJson(verifyUrl, verifyInit(tampered), [200]);
+    check(rejected?.valid === false, 'receipt_tamper_accepted');
+    return {
+      ids: { task_id: taskId, key_id: key.key_id },
+      review_present: receipt.review !== null,
+      verify: { valid: true, tampered_valid: false, tampered_reason: rejected.reason ?? null },
+    };
+  });
+
+  await step('E11f', 'Check board summary counts', async () => {
+    const summary = await toolOk(ctx.clients.B, 'chorus.board_summary', { session_id: sessionId });
+    const board = (summary.boards ?? []).find((item) => item.board_id === ctx.boardId);
+    const bucketKeys = ['blocked', 'done', 'in_progress', 'ready', 'review'];
+    check(
+      board !== undefined &&
+        json(Object.keys(board.counts ?? {}).sort()) === json(bucketKeys) &&
+        Object.values(board.counts).every((count) => Number.isSafeInteger(count) && count >= 0) &&
+        Array.isArray(board.recent_done) &&
+        board.recent_done.length <= 5,
+      'board_summary_contract',
+    );
+    const known = { ready: 0, in_progress: 0, review: 0, done: 0 };
+    const doneIds = [];
+    for (const taskId of ids.tasks) {
+      const task = await toolOk(ctx.clients.B, 'chorus.get_task', {
+        session_id: sessionId,
+        task_id: taskId,
+      });
+      if (task.state in known) known[task.state] += 1;
+      if (task.state === 'done') doneIds.push(taskId);
+    }
+    // Run one completed its E6 task on this board, so done holds at least one task this run did not create.
+    check(
+      Object.entries(known).every(([state, count]) => board.counts[state] >= count) &&
+        board.counts.done >= known.done + 1 &&
+        board.counts.blocked <= board.counts.ready + board.counts.in_progress + board.counts.review,
+      'board_summary_counts_inconsistent',
+    );
+    const recent = new Set(board.recent_done.map((item) => item.id));
+    check(
+      doneIds.every((id) => recent.has(id)) || board.recent_done.length === 5,
+      'board_summary_recent_done_missing',
+    );
+    const single = await toolOk(ctx.clients.B, 'chorus.board_summary', {
+      session_id: sessionId,
+      board_id: ctx.boardId,
+    });
+    check(
+      single.boards?.length === 1 && json(single.boards[0].counts) === json(board.counts),
+      'board_summary_filter',
+    );
+    await toolError(
+      ctx.clients.B,
+      'chorus.board_summary',
+      { session_id: sessionId, board_id: randomUUID() },
+      'not_found',
+    );
+    return { ids: { board_id: ctx.boardId }, counts: board.counts, known_tasks: known };
+  });
+}
+
 async function writePageExamples(runId, calls, identifiers) {
   const outputPath = resolve(ROOT, 'tests/deployed/out', `page-examples-${runId}.json`);
   await mkdir(dirname(outputPath), { recursive: true });
@@ -686,6 +1241,8 @@ export async function runE2E() {
   const paidMode = process.env.E2E_PAID === '1';
   const pageExamplesEnabled = process.env.E2E_PAGE_EXAMPLES === '1';
   const conversationMode = process.env.E2E_CONVERSATION === '1';
+  const coordinationMode = process.env.E2E_COORDINATION === '1';
+  const assistMode = process.env.E2E_ASSIST === '1';
   const paidSessionId = process.env.E2E_SESSION_ID;
   const paidSession2Id = process.env.E2E_SESSION2_ID;
   const paidBoardId = process.env.E2E_BOARD_ID;
@@ -710,6 +1267,11 @@ export async function runE2E() {
   }
   check(!pageExamplesEnabled || !paidMode, 'page_examples_requires_unpaid_run');
   check(!conversationMode || paidMode, 'conversation_requires_paid_run');
+  check(
+    !coordinationMode || (paidMode && conversationMode),
+    'coordination_requires_conversation_run',
+  );
+  check(!assistMode || coordinationMode, 'assist_requires_coordination_run');
 
   const absoluteSeatsPath = resolve(seatsPath);
   const relativeSeatsPath = relative(ROOT, absoluteSeatsPath);
@@ -755,6 +1317,7 @@ export async function runE2E() {
   };
   const ctx = {
     baseUrl,
+    expectedCommit,
     roomId,
     sharednetUrl,
     seats,
@@ -767,6 +1330,8 @@ export async function runE2E() {
     boardId: paidMode ? paidBoardId : undefined,
     paidMode,
     conversationMode,
+    coordinationMode,
+    assistMode,
     pageExamplesEnabled,
     e6Calls: [],
   };
@@ -777,20 +1342,25 @@ export async function runE2E() {
     const startedAt = new Date().toISOString();
     const start = Date.now();
     try {
-      const details = (await run()) ?? {};
+      const { skip, ...details } = (await run()) ?? {};
       const record = {
         id,
         name,
         started_at: startedAt,
         ms: Date.now() - start,
         pass: true,
+        ...(skip === undefined ? {} : { skipped: true, skip_reason: skip }),
         error_code_sources: ctx.errorCodeObservations
           .filter((observation) => observation.step_id === id)
           .map(({ tool, code, source }) => ({ tool, code, source })),
         ...details,
       };
       evidence.steps.push(record);
-      process.stdout.write(`${id} PASS ${name} (${record.ms} ms)\n`);
+      process.stdout.write(
+        skip === undefined
+          ? `${id} PASS ${name} (${record.ms} ms)\n`
+          : `${id} SKIP ${name} (${skip})\n`,
+      );
       return details;
     } catch (error) {
       const record = {
@@ -968,6 +1538,7 @@ export async function runE2E() {
     if (paidMode) {
       await runPaidSteps(ctx, step, runId, ids);
       if (conversationMode) await runConversationStep(ctx, step, runId, ids);
+      if (coordinationMode) await runCoordinationStep(ctx, step, runId, ids);
     } else {
       await step('E5', 'Check session visibility and joining', async () => {
         const principalId = await sharedNetCurrent(sharednetUrl, seats.A.token, seats.A.member_id);
