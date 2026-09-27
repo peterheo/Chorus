@@ -25,7 +25,7 @@ curl -sS -X POST {{PUBLIC_BASE_URL}}/v1/rooms/activate -H 'content-type: applica
   -d '{"sharednet_room_id":"rom_…","sharednet_invite_token":"rit_…"}'
 ```
 
-Chorus joins as member "chorus" and posts nothing. It reads chorus-verify messages, and, only when a member calls chorus.scan_conversation, the selected window of at most 200 messages; from that window it stores the suggestions and their source snapshots.
+Chorus joins as member "chorus" and posts nothing by default. It reads chorus-verify messages, and scans only the selected window of at most 200 messages when a member calls chorus.scan_conversation, storing suggestions and their source snapshots. If a session administrator turns on coordination mode `observe` or `assist`, Chorus reads every new room message for that session. In `assist` it posts at most 3 short coordination notes per 5 minutes, containing only what was said in the room.
 
 ## 5. Enroll
 
@@ -39,7 +39,7 @@ Then post the `post_this_message` value from the start response, exactly, from t
 ```sh
 curl -sS -X POST https://www.sharednet.ai/api/v1/rooms/rom_…/messages \
   -H "Authorization: Bearer $SHAREDNET_MEMBER_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"content":"chorus-verify cvn_…"}'
+  -d '{"content":"chorus-verify cvn_… (Chorus enrollment proof, safe to ignore)"}'
 ```
 
 Then poll every 3 s:
@@ -76,6 +76,10 @@ The reviewer: `chorus.list_my_reviews` → `chorus.get_result` → `chorus.revie
 Conversation suggestions (inferred, never authority): chorus.scan_conversation (a window of at most 200 messages) → chorus.list_suggestions → {{#billing}}create the task (chorus.create_tasks with request_id = recommended_request_id when billing is on) → {{/billing}}chorus.link_suggestion, or chorus.dismiss_suggestion.
 
 `from_sequence` and `to_sequence` are SharedNet message sequence numbers from the room messages API. `chorus.list_suggestions` accepts states `open`, `linked`, or `dismissed`, and kinds `question` or `commitment`.
+
+Coordination (inferred, never authority): `chorus.coordination_status(session_id, include_closed?)` reads a session's inferred questions, commitments, handoffs, decisions, claims, conflicts and dependencies, and its current signals: `conflict`, `decision_contradicted`, `duplicate_commitments`, `dependency_resolved`, `dependency_deadlock`, `unanswered_question`, `missing_acknowledgement`, `stale_commitment`, `ready_to_close`. `chorus.update_conversation_object(session_id, ref, action, reason?)` resolves, ignores, or reopens one inferred item; only that item's author, owner, a named target, or a session manager may change it. With coordination mode off, coverage includes only scanned windows; Chorus reads and posts nothing beyond an explicit `chorus.scan_conversation` call.
+
+`chorus.set_coordination_mode(session_id, mode, expected_version)` is administrator-only. The mode is `off`, `observe`, or `assist`. Enabling `observe` or `assist` starts from the room's latest sequence, so earlier messages are not re-announced.
 
 
 E6 request/response examples from a passing deployed run (IDs and times are placeholders):

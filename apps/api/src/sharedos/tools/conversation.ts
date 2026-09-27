@@ -1,17 +1,22 @@
 import {
   ChorusError,
+  applyMessages,
+  coordinationStatus,
   dismissSuggestion,
+  evaluate,
   linkSuggestion,
   listSuggestions,
   loadConversationSeat,
   recordScan,
   rulesV1,
+  updateConversationObject,
   type Suggestion,
   type Uuid,
 } from '@chorus/domain';
 import { fetchConversationWindow } from '../../conversation/fetch.ts';
+import { noteRoomSenders, roomRoster } from '../../room-roster.ts';
 import { openSecret } from '../../secrets.ts';
-import { I, S, SA, type ChorusToolSpec } from './define.ts';
+import { B, I, S, SA, type ChorusToolSpec } from './define.ts';
 
 const session = (args: Record<string, unknown>): string[] => [
   'sessions',
@@ -118,6 +123,10 @@ export const conversationTools: readonly ChorusToolSpec[] = [
         toSequence: to,
       });
       const extracted = rulesV1.extract(fetched.messages, { excludeMemberIds: [seat.memberId] });
+      // CC-2 (spec §9, rev 1.4): the room roster lets the engine resolve names. It is refreshed from this
+      // window and read BEFORE the scan transaction (it is in-memory; see room-roster.ts).
+      noteRoomSenders(seat.externalRoomId, fetched.messages);
+      const roster = roomRoster(seat.externalRoomId, [seat.memberId]);
       const recorded = await recordScan(command, {
         session_id: sessionId,
         from_sequence: from,
@@ -125,12 +134,14 @@ export const conversationTools: readonly ChorusToolSpec[] = [
         cutoff_sequence: fetched.cutoffSequence,
         messages: fetched.messages,
         extracted,
+        coordination: { apply: applyMessages, excludeMemberIds: [seat.memberId], roster },
       });
       return {
         scan: recorded.scan,
         suggestions: recorded.suggestions.map(toToolSuggestion),
         source_boundary: `Only messages ${String(from)}–${String(to)} of this room were examined; nothing else was read.`,
         coverage: 'selected_conversation_window',
+        ...(recorded.coordination === undefined ? {} : { coordination: recorded.coordination }),
       };
     },
   },
@@ -199,6 +210,46 @@ export const conversationTools: readonly ChorusToolSpec[] = [
         ...(input['reason'] === undefined ? {} : { reason: input['reason'] as string }),
       });
       return { suggestion: toToolSuggestion(result.suggestion) };
+    },
+  },
+  {
+    name: 'chorus.coordination_status',
+    description:
+      "Reads the session's inferred coordination state (questions, commitments, handoffs, decisions, claims, conflicts, dependencies) and its current signals. Inferred from scanned room windows only; it never changes canonical work.",
+    action: 'read',
+    write: false,
+    props: { session_id: S, include_closed: B },
+    required: ['session_id'],
+    path: session,
+    run: ({ read, input }) =>
+      coordinationStatus(
+        read,
+        {
+          session_id: input['session_id'] as Uuid,
+          ...(input['include_closed'] === undefined
+            ? {}
+            : { include_closed: input['include_closed'] as boolean }),
+        },
+        evaluate,
+      ),
+  },
+  {
+    name: 'chorus.update_conversation_object',
+    description:
+      "Corrects one inferred coordination item (a question, commitment, handoff, decision, claim, conflict or dependency): resolve it, ignore it, or reopen it. Allowed for the item's author, owner or targets, or a session manager.",
+    action: 'link_message',
+    write: true,
+    props: { session_id: S, ref: S, action: S, reason: S },
+    required: ['session_id', 'ref', 'action'],
+    path: session,
+    run: async ({ input, command }) => {
+      const result = await updateConversationObject(command, {
+        session_id: input['session_id'] as Uuid,
+        ref: input['ref'] as string,
+        action: input['action'] as 'resolve' | 'ignore' | 'reopen',
+        ...(input['reason'] === undefined ? {} : { reason: input['reason'] as string }),
+      });
+      return { object: result.object };
     },
   },
 ];

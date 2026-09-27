@@ -1,7 +1,36 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`chorus tool definitions > K11 tools.snapshot: exactly the 31 shipped tools (23 + whoami + 3 Arena + 4 conversation), with stable definitions 1`] = `
+exports[`chorus tool definitions > K11 tools.snapshot: exactly the 36 shipped tools, with stable definitions 1`] = `
 [
+  {
+    "description": "Returns task counts and the five most recently completed tasks on boards in a session.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "board_id": {
+          "type": "string",
+        },
+        "session_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.board_summary",
+    "namespace": "chorus",
+    "readWrite": "read",
+    "requiredCapability": {
+      "action": "read",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
   {
     "description": "Claims a ready task and takes a lease with a fence token, at the task version you expect. Fails if someone else owns it.",
     "inputSchema": {
@@ -71,6 +100,35 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 31 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "complete",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Reads the session's inferred coordination state (questions, commitments, handoffs, decisions, claims, conflicts, dependencies) and its current signals. Inferred from scanned room windows only; it never changes canonical work.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "include_closed": {
+          "type": "boolean",
+        },
+        "session_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.coordination_status",
+    "namespace": "chorus",
+    "readWrite": "read",
+    "requiredCapability": {
+      "action": "read",
       "resource": {
         "namespace": "chorus",
         "path": [],
@@ -387,6 +445,36 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 31 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "link_message",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Returns a signed, verifiable completion receipt for a completed task.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string",
+        },
+        "task_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+        "task_id",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.get_receipt",
+    "namespace": "chorus",
+    "readWrite": "read",
+    "requiredCapability": {
+      "action": "read",
       "resource": {
         "namespace": "chorus",
         "path": [],
@@ -1096,10 +1184,51 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 31 shipped to
     "source": "host",
   },
   {
-    "description": "Changes a session policy (name, discoverability, join and claim policy, review settings) at the session version you expect. Requires the administrator role.",
+    "description": "Sets a session’s room-message coordination mode. Requires an administrator and the latest session version.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "expected_version": {
+          "type": "integer",
+        },
+        "idempotency_key": {
+          "type": "string",
+        },
+        "mode": {
+          "type": "string",
+        },
+        "session_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+        "mode",
+        "expected_version",
+        "idempotency_key",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.set_coordination_mode",
+    "namespace": "chorus",
+    "readWrite": "write",
+    "requiredCapability": {
+      "action": "administer",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Changes a session policy (name, discoverability, join and claim policy, review settings, coordination mode) at the session version you expect. Requires the administrator role. coordination_mode is 'off' (default), 'observe' (Chorus reads every new room message into the inferred coordination state) or 'assist' (also posts a few rate-limited coordination notes built only from room content).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "coordination_mode": {
+          "type": "string",
+        },
         "default_claim_policy": {
           "type": "string",
         },
@@ -1215,6 +1344,47 @@ exports[`chorus tool definitions > K11 tools.snapshot: exactly the 31 shipped to
     "readWrite": "write",
     "requiredCapability": {
       "action": "submit_result",
+      "resource": {
+        "namespace": "chorus",
+        "path": [],
+      },
+    },
+    "source": "host",
+  },
+  {
+    "description": "Corrects one inferred coordination item (a question, commitment, handoff, decision, claim, conflict or dependency): resolve it, ignore it, or reopen it. Allowed for the item's author, owner or targets, or a session manager.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+        },
+        "idempotency_key": {
+          "type": "string",
+        },
+        "reason": {
+          "type": "string",
+        },
+        "ref": {
+          "type": "string",
+        },
+        "session_id": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "session_id",
+        "ref",
+        "action",
+        "idempotency_key",
+      ],
+      "type": "object",
+    },
+    "name": "chorus.update_conversation_object",
+    "namespace": "chorus",
+    "readWrite": "write",
+    "requiredCapability": {
+      "action": "link_message",
       "resource": {
         "namespace": "chorus",
         "path": [],

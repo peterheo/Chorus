@@ -8,6 +8,7 @@ import {
   removeMember,
   revokeRole,
   setSessionPolicy,
+  setCoordinationMode,
 } from '@chorus/domain';
 import { B, I, S, SA, type ChorusToolSpec } from './define.ts';
 
@@ -22,6 +23,8 @@ const POLICY = {
   default_claim_policy: S,
   manager_review_allowed: B,
   default_review_required: B,
+  // CC-2 (spec §9/§10): 'off' | 'observe' | 'assist'. Off by default; the domain enforces the enum.
+  coordination_mode: S,
 };
 
 export const sessionTools: readonly ChorusToolSpec[] = [
@@ -92,13 +95,24 @@ export const sessionTools: readonly ChorusToolSpec[] = [
   {
     name: 'chorus.set_session_policy',
     description:
-      'Changes a session policy (name, discoverability, join and claim policy, review settings) at the session version you expect. Requires the administrator role.',
+      "Changes a session policy (name, discoverability, join and claim policy, review settings, coordination mode) at the session version you expect. Requires the administrator role. coordination_mode is 'off' (default), 'observe' (Chorus reads every new room message into the inferred coordination state) or 'assist' (also posts a few rate-limited coordination notes built only from room content).",
     action: 'administer',
     write: true,
     props: { session_id: S, expected_version: I, ...POLICY },
     required: ['session_id', 'expected_version'],
     path: session,
     run: ({ command, input }) => setSessionPolicy(command, input),
+  },
+  {
+    name: 'chorus.set_coordination_mode',
+    description:
+      'Sets a session’s room-message coordination mode. Requires an administrator and the latest session version.',
+    action: 'administer',
+    write: true,
+    props: { session_id: S, mode: S, expected_version: I },
+    required: ['session_id', 'mode', 'expected_version'],
+    path: session,
+    run: ({ command, input }) => setCoordinationMode(command, input),
   },
   {
     name: 'chorus.remove_member',

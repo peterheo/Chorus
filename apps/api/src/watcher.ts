@@ -1,4 +1,5 @@
 import type pg from 'pg';
+import { CoordinationFollower, type CoordinationDeps } from './coordination-follow.ts';
 import { openSecret } from './secrets.ts';
 import {
   SharedNetAuthError,
@@ -8,10 +9,18 @@ import {
 } from './sharednet/client.ts';
 
 /**
+ * Fixed, self-describing text after the nonce in an issued challenge, so the enroller (which issues it)
+ * and the watcher (which accepts it) cannot drift.
+ */
+export const PROOF_SUFFIX = '(Chorus enrollment proof, safe to ignore)';
+
+/**
  * The SharedNet room watcher (WP3 rev 3 section 6.3, rev 4 section 6). For every ACTIVE bound room it
  * long-polls the room with Chorus's own service seat and turns exactly one kind of message into an
- * effect: a challenge `chorus-verify cvn_<22>` posted by the claimed member. Everything else is ignored
- * and never stored.
+ * effect: a challenge `chorus-verify cvn_<22>` posted by the claimed member, optionally followed by one
+ * space and exactly PROOF_SUFFIX. Chorus issues the suffixed form so other people in the room can tell
+ * what the message is; the bare form stays accepted for challenges issued before the suffix existed. Any
+ * other trailing text is rejected. Everything else is ignored and never stored.
  *
  * Identity comes only from the server-assigned sender fields. The cursor is persisted and monotonic, so a
  * restart resumes where it stopped and duplicate delivery is harmless (verification is a no-op for
@@ -23,7 +32,18 @@ import {
  * ex-holder that lost the lock can never move the cursor. A second process simply does not consume that
  * room until the lock frees (failover).
  */
-export const PROOF_MESSAGE = /^chorus-verify (cvn_[A-Za-z0-9_-]{22})$/;
+export const PROOF_MESSAGE = new RegExp(
+  `^chorus-verify (cvn_[A-Za-z0-9_-]{22})(?: ${escapeRegExp(PROOF_SUFFIX)})?$`,
+);
+
+/** The exact text an enrollee is asked to post for `nonce` (the suffixed form of PROOF_MESSAGE). */
+export function proofMessage(nonce: string): string {
+  return `chorus-verify ${nonce} ${PROOF_SUFFIX}`;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 export interface WatcherLogger {
   info: (obj: Record<string, unknown>, msg: string) => void;
@@ -43,6 +63,13 @@ export interface WatcherOptions {
   readonly minPollIntervalMs?: number;
   /** Backoff ceiling. Default 30 s. */
   readonly maxBackoffMs?: number;
+  /**
+   * The coordination engine (spec §10). When present, every page is also followed into the room's sessions in
+   * `observe`/`assist` mode, and `assist` signals are posted; when absent, follow does nothing.
+   */
+  readonly coordination?: CoordinationDeps;
+  /** The clock for assist rate limits (tests inject one). Default `Date.now`. */
+  readonly now?: () => number;
 }
 
 interface WatchedRoom {
@@ -62,7 +89,10 @@ const ignoreError = (): void => undefined;
 const UNLOCK_SQL = `SELECT pg_advisory_unlock(hashtextextended('chorus:room-consumer:' || $1::text, 0))`;
 
 export class RoomWatcher {
-  private readonly options: Required<Omit<WatcherOptions, 'logger'>> & { logger: WatcherLogger };
+  private readonly options: Required<Omit<WatcherOptions, 'logger' | 'coordination' | 'now'>> & {
+    logger: WatcherLogger;
+  };
+  private readonly follower: CoordinationFollower | undefined;
   private readonly running = new Map<string, Promise<void>>();
   /** Rooms whose consumer lease this instance holds RIGHT NOW (lock taken and epoch claimed, connection alive). */
   private readonly held = new Set<string>();
@@ -81,6 +111,16 @@ export class RoomWatcher {
       logger: noopLogger,
       ...options,
     };
+    this.follower =
+      options.coordination === undefined
+        ? undefined
+        : new CoordinationFollower({
+            pool: options.pool,
+            client: options.client,
+            engine: options.coordination,
+            logger: this.options.logger,
+            now: options.now ?? Date.now,
+          });
   }
 
   /** Rooms this instance currently consumes (holds the consumer lease for). */
@@ -268,6 +308,11 @@ export class RoomWatcher {
           return;
         }
         for (const message of page.messages) await this.handleMessage(room, message);
+        // Follow after enrollment, before the cursor moves: a crash here redelivers the page, and the per-session
+        // engine cursor makes the replay a no-op. It never throws, so it cannot hold up the room.
+        if (this.follower !== undefined && page.messages.length > 0) {
+          await this.follower.step(room, token, page.messages, signal);
+        }
         const highest = page.messages.at(-1)?.sequence ?? after;
         await pool.query('SELECT chorus_watcher_advance($1, $2, $3, $4, true, NULL)', [
           room.workspace_id,

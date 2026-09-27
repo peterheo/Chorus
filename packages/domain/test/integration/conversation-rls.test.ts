@@ -111,3 +111,134 @@ describe('chorus_conversation_seat: hostile pg_temp shadowing (real PostgreSQL, 
     }
   });
 });
+
+/** CC-2d: the watcher's one follow definer (0010). The meta-test in `rls.test.ts` covers its search_path and ACL. */
+describe('chorus_coordination_apply: follow targets only, hostile pg_temp shadowing (real PostgreSQL)', () => {
+  let f: Fixture;
+  beforeAll(async () => {
+    f = await createFixture({ poolMax: 8 });
+  });
+  afterAll(async () => {
+    await f.close();
+  });
+
+  const db = () => f.db.url.split('/').pop() ?? '';
+  type Row = { session_id: string; coordination_mode: string; acting_actor_id: string };
+  const targets = async (
+    ws: string,
+    room: string,
+    forge?: (c: import('pg').PoolClient) => Promise<void>,
+  ) => {
+    const client = await f.pool.connect();
+    try {
+      await client.query('BEGIN');
+      if (forge !== undefined) await forge(client);
+      return (
+        await client.query<Row>('SELECT * FROM chorus_coordination_apply($1, $2)', [ws, room])
+      ).rows;
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release(true);
+    }
+  };
+
+  it('returns exactly the following sessions of an active SharedNet room, each with a live administrator', async () => {
+    const ws = await f.workspace(`follow-${rid('', 6)}`);
+    await f.owner(`UPDATE rooms SET provider = 'sharednet', external_room_id = $2 WHERE id = $1`, [
+      ws.roomId,
+      `rom_${rid('Follow', 8)}`,
+    ]);
+    const admin = await f.actor(ws, 'follow-admin');
+    const mode = (id: string, m: string) =>
+      f.owner('UPDATE sessions SET coordination_mode = $2 WHERE id = $1', [id, m]);
+    const observe = await f.session(admin, { discoverable: false });
+    const assist = await f.session(admin);
+    const off = await f.session(admin);
+    const archived = await f.session(admin);
+    const orphan = await f.session(admin);
+    await mode(observe.id, 'observe');
+    await mode(assist.id, 'assist');
+    await mode(archived.id, 'assist');
+    await mode(orphan.id, 'assist');
+    await f.owner(`UPDATE sessions SET state = 'archived' WHERE id = $1`, [archived.id]);
+    // The orphan's only administrator left the session: no RLS context exists for it, so it is not followed.
+    await f.owner('UPDATE session_members SET removed_at = now() WHERE session_id = $1', [
+      orphan.id,
+    ]);
+    // A participant-only member is never the acting context.
+    const participant = await f.actor(ws, 'follow-participant');
+    await f.join(assist, participant);
+    expect(off.id).toBeDefined();
+
+    const rows = await targets(ws.id, ws.roomId);
+    expect(rows.map((r) => [r.session_id, r.coordination_mode, r.acting_actor_id]).sort()).toEqual(
+      [
+        [observe.id, 'observe', admin.id],
+        [assist.id, 'assist', admin.id],
+      ].sort(),
+    );
+
+    // An administrator who has left the ROOM is no context either (chorus_my_sessions()'s own rule).
+    await f.owner('UPDATE room_members SET removed_at = now() WHERE actor_id = $1', [admin.id]);
+    expect(await targets(ws.id, ws.roomId)).toEqual([]);
+    await f.owner('UPDATE room_members SET removed_at = NULL WHERE actor_id = $1', [admin.id]);
+
+    // The wrong workspace for the room, an unknown room, or a room out of service: nothing.
+    const other = await f.workspace(`follow-other-${rid('', 6)}`);
+    expect(await targets(other.id, ws.roomId)).toEqual([]);
+    expect(await targets(ws.id, randomUUID())).toEqual([]);
+    await f.owner(`UPDATE rooms SET activation_state = 'degraded' WHERE id = $1`, [ws.roomId]);
+    expect(await targets(ws.id, ws.roomId)).toEqual([]);
+    await f.owner(`UPDATE rooms SET activation_state = 'active' WHERE id = $1`, [ws.roomId]);
+
+    // Arguments are validated inside.
+    await expect(targets(ws.id, null as unknown as string)).rejects.toMatchObject({
+      code: '22023',
+    });
+    await expect(targets(null as unknown as string, ws.roomId)).rejects.toMatchObject({
+      code: '22023',
+    });
+
+    // Forged temp tables cannot add a session, an administrator or a room.
+    await f.owner(`GRANT TEMPORARY ON DATABASE ${db()} TO chorus_app`);
+    try {
+      const forged = await targets(ws.id, ws.roomId, async (client) => {
+        const forgedSession = randomUUID();
+        await client.query(
+          `CREATE TEMP TABLE sessions (id uuid, workspace_id uuid, room_id uuid, state text, coordination_mode text)`,
+        );
+        await client.query(
+          `CREATE TEMP TABLE session_members (workspace_id uuid, session_id uuid, actor_id uuid, roles text[], joined_at timestamptz DEFAULT now(), removed_at timestamptz)`,
+        );
+        await client.query(
+          `CREATE TEMP TABLE rooms (id uuid, workspace_id uuid, provider text, activation_state text)`,
+        );
+        await client.query(
+          `CREATE TEMP TABLE room_members (workspace_id uuid, room_id uuid, actor_id uuid, removed_at timestamptz)`,
+        );
+        await client.query(
+          `INSERT INTO pg_temp.sessions VALUES ($1, $2, $3, 'active', 'assist'), ($4, $2, $3, 'active', 'assist')`,
+          [forgedSession, ws.id, ws.roomId, off.id],
+        );
+        await client.query(
+          `INSERT INTO pg_temp.session_members (workspace_id, session_id, actor_id, roles)
+           VALUES ($1, $2, $3, ARRAY['participant', 'administrator']), ($1, $4, $3, ARRAY['participant', 'administrator'])`,
+          [ws.id, forgedSession, participant.id, off.id],
+        );
+        await client.query(`INSERT INTO pg_temp.rooms VALUES ($1, $2, 'sharednet', 'active')`, [
+          ws.roomId,
+          ws.id,
+        ]);
+        await client.query(`INSERT INTO pg_temp.room_members VALUES ($1, $2, $3, NULL)`, [
+          ws.id,
+          ws.roomId,
+          participant.id,
+        ]);
+      });
+      expect(forged.map((r) => r.session_id).sort()).toEqual([observe.id, assist.id].sort());
+      expect(forged.every((r) => r.acting_actor_id === admin.id)).toBe(true);
+    } finally {
+      await f.owner(`REVOKE TEMPORARY ON DATABASE ${db()} FROM chorus_app`);
+    }
+  });
+});

@@ -1,0 +1,466 @@
+{
+  "continuation": [
+    {
+      "message_id": "e45",
+      "sequence": 45,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "Bob, can you rotate the API keys?",
+      "reply_to_message_id": null,
+      "note": "handoff to bob"
+    },
+    {
+      "message_id": "e46",
+      "sequence": 46,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "ok",
+      "reply_to_message_id": "e45",
+      "note": "handoff accepted: the target acknowledges by replying"
+    },
+    {
+      "message_id": "e47",
+      "sequence": 47,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "Dave, could you check the nightly export?",
+      "reply_to_message_id": null,
+      "note": "handoff to dave"
+    },
+    {
+      "message_id": "e48",
+      "sequence": 48,
+      "sender_member_id": "i_dave",
+      "sender_principal_id": "p_i_dave",
+      "sender_name": "dave",
+      "content": "Sure",
+      "reply_to_message_id": null,
+      "note": "handoff accepted: the target's next message is an acknowledgement replying to nothing"
+    },
+    {
+      "message_id": "e49",
+      "sequence": 49,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "Carol, can you update the status page?",
+      "reply_to_message_id": null,
+      "note": "handoff to carol"
+    },
+    {
+      "message_id": "e50",
+      "sequence": 50,
+      "sender_member_id": "i_carol",
+      "sender_principal_id": "p_i_carol",
+      "sender_name": "carol",
+      "content": "I can't take it, no bandwidth.",
+      "reply_to_message_id": "e49",
+      "note": "handoff declined by the target"
+    },
+    {
+      "message_id": "e51",
+      "sequence": 51,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "Done, keys rotated.",
+      "reply_to_message_id": "e46",
+      "note": "commitment completed by a reply to it; its handoff completes"
+    },
+    {
+      "message_id": "e52",
+      "sequence": 52,
+      "sender_member_id": "i_dave",
+      "sender_principal_id": "p_i_dave",
+      "sender_name": "dave",
+      "content": "Bob, please take over my C8.",
+      "reply_to_message_id": null,
+      "note": "take over: C8 withdrawn as transferred, handoff to bob"
+    },
+    {
+      "message_id": "e53",
+      "sequence": 53,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "Will do.",
+      "reply_to_message_id": null,
+      "note": "take-over handoff accepted (next message)"
+    },
+    {
+      "message_id": "e54",
+      "sequence": 54,
+      "sender_member_id": "i_carol",
+      "sender_principal_id": "p_i_carol",
+      "sender_name": "carol",
+      "content": "Dave, what is the rollback plan?",
+      "reply_to_message_id": null,
+      "note": "targeted question"
+    },
+    {
+      "message_id": "e55",
+      "sequence": 55,
+      "sender_member_id": "i_dave",
+      "sender_principal_id": "p_i_dave",
+      "sender_name": "dave",
+      "content": "Got it.",
+      "reply_to_message_id": "e54",
+      "note": "question acknowledged by its target"
+    },
+    {
+      "message_id": "e56",
+      "sequence": 56,
+      "sender_member_id": "i_dave",
+      "sender_principal_id": "p_i_dave",
+      "sender_name": "dave",
+      "content": "We restore from the nightly snapshot.",
+      "reply_to_message_id": "e54",
+      "note": "question answered by a plain reply"
+    },
+    {
+      "message_id": "e57",
+      "sequence": 57,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "Why does the export job crash at midnight?",
+      "reply_to_message_id": null,
+      "note": "question"
+    },
+    {
+      "message_id": "e58",
+      "sequence": 58,
+      "sender_member_id": "i_carol",
+      "sender_principal_id": "p_i_carol",
+      "sender_name": "carol",
+      "content": "I'll investigate the export crash.",
+      "reply_to_message_id": "e57",
+      "note": "a commitment replying to a question acknowledges it"
+    },
+    {
+      "message_id": "e59",
+      "sequence": 59,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "Never mind, it was the cron schedule.",
+      "reply_to_message_id": "e57",
+      "note": "question withdrawn by its author"
+    },
+    {
+      "message_id": "e60",
+      "sequence": 60,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "What is the rollback plan, dave?",
+      "reply_to_message_id": null,
+      "note": "repeated question: related to the answered Q6"
+    },
+    {
+      "message_id": "e61",
+      "sequence": 61,
+      "sender_member_id": "i_carol",
+      "sender_principal_id": "p_i_carol",
+      "sender_name": "carol",
+      "content": "C10 is done.",
+      "reply_to_message_id": null,
+      "note": "commitment completed by ref"
+    },
+    {
+      "message_id": "e62",
+      "sequence": 62,
+      "sender_member_id": "i_dave",
+      "sender_principal_id": "p_i_dave",
+      "sender_name": "dave",
+      "content": "Finished the report.",
+      "reply_to_message_id": null,
+      "note": "the owner's only open commitment completes"
+    },
+    {
+      "message_id": "e63",
+      "sequence": 63,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "Decision: the retry backoff is 5 seconds.",
+      "reply_to_message_id": null,
+      "note": "decision supersedes D1 (same subject)"
+    },
+    {
+      "message_id": "e64",
+      "sequence": 64,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "The retry backoff is 3 seconds.",
+      "reply_to_message_id": null,
+      "note": "claim contradicting the active decision"
+    },
+    {
+      "message_id": "e65",
+      "sequence": 65,
+      "sender_member_id": "i_carol",
+      "sender_principal_id": "p_i_carol",
+      "sender_name": "carol",
+      "content": "Decision: the payments queue is fine in staging.",
+      "reply_to_message_id": null,
+      "note": "a decision on the subject resolves conflict X1"
+    },
+    {
+      "message_id": "e66",
+      "sequence": 66,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "The login page is broken on mobile.",
+      "reply_to_message_id": null,
+      "note": "claim"
+    },
+    {
+      "message_id": "e67",
+      "sequence": 67,
+      "sender_member_id": "i_dave",
+      "sender_principal_id": "p_i_dave",
+      "sender_name": "dave",
+      "content": "The login page is not broken on mobile.",
+      "reply_to_message_id": null,
+      "note": "opposite claim: conflict"
+    },
+    {
+      "message_id": "e68",
+      "sequence": 68,
+      "sender_member_id": "i_dave",
+      "sender_principal_id": "p_i_dave",
+      "sender_name": "dave",
+      "content": "Scratch that, ignore my last.",
+      "reply_to_message_id": "e67",
+      "note": "claim retracted by its author: the conflict resolves"
+    },
+    {
+      "message_id": "e69",
+      "sequence": 69,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "The search index is stale.",
+      "reply_to_message_id": null,
+      "note": "claim"
+    },
+    {
+      "message_id": "e70",
+      "sequence": 70,
+      "sender_member_id": "i_carol",
+      "sender_principal_id": "p_i_carol",
+      "sender_name": "carol",
+      "content": "The search index is not stale.",
+      "reply_to_message_id": null,
+      "note": "opposite claim: conflict"
+    },
+    {
+      "message_id": "e71",
+      "sequence": 71,
+      "sender_member_id": "i_carol",
+      "sender_principal_id": "p_i_carol",
+      "sender_name": "carol",
+      "content": "The search index is stale after the reindex.",
+      "reply_to_message_id": null,
+      "note": "same author, same subject: supersedes K11, the conflict resolves"
+    },
+    {
+      "message_id": "e72",
+      "sequence": 72,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "The cache is warm if the job ran.",
+      "reply_to_message_id": null,
+      "note": "conditional claim"
+    },
+    {
+      "message_id": "e73",
+      "sequence": 73,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "The cache is not warm.",
+      "reply_to_message_id": null,
+      "note": "§6 negative: unconditional vs conditional, no conflict"
+    },
+    {
+      "message_id": "e74",
+      "sequence": 74,
+      "sender_member_id": "i_carol",
+      "sender_principal_id": "p_i_carol",
+      "sender_name": "carol",
+      "content": "Maybe the cache is not warm.",
+      "reply_to_message_id": null,
+      "note": "§6 negative: hedged, no conflict"
+    },
+    {
+      "message_id": "e75",
+      "sequence": 75,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "Dave, can you review the backup script?",
+      "reply_to_message_id": null,
+      "note": "handoff to dave"
+    },
+    {
+      "message_id": "e76",
+      "sequence": 76,
+      "sender_member_id": "i_dave",
+      "sender_principal_id": "p_i_dave",
+      "sender_name": "dave",
+      "content": "ok",
+      "reply_to_message_id": "e73",
+      "note": "§6 negative: ok replying to an unrelated message does not accept"
+    },
+    {
+      "message_id": "e77",
+      "sequence": 77,
+      "sender_member_id": "i_carol",
+      "sender_principal_id": "p_i_carol",
+      "sender_name": "carol",
+      "content": "I'll review the migration PR.",
+      "reply_to_message_id": null,
+      "note": "commitment"
+    },
+    {
+      "message_id": "e78",
+      "sequence": 78,
+      "sender_member_id": "i_carol",
+      "sender_principal_id": "p_i_carol",
+      "sender_name": "carol",
+      "content": "I'm blocked on C9.",
+      "reply_to_message_id": null,
+      "note": "dependency by ref"
+    },
+    {
+      "message_id": "e79",
+      "sequence": 79,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "Waiting on carol's review.",
+      "reply_to_message_id": null,
+      "note": "dependency on carol's latest open commitment: deadlock"
+    },
+    {
+      "message_id": "e80",
+      "sequence": 80,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "C9 is done.",
+      "reply_to_message_id": null,
+      "note": "blocker completes: the dependency resolves, the handoff completes"
+    },
+    {
+      "message_id": "e81",
+      "sequence": 81,
+      "sender_member_id": "i_dave",
+      "sender_principal_id": "p_i_dave",
+      "sender_name": "dave",
+      "content": "Blocked on the vendor.",
+      "reply_to_message_id": null,
+      "note": "no blocker found: no dependency"
+    },
+    {
+      "message_id": "e82",
+      "sequence": 82,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "I'll update the deployment runbook for staging.",
+      "reply_to_message_id": null,
+      "note": "commitment"
+    },
+    {
+      "message_id": "e83",
+      "sequence": 83,
+      "sender_member_id": "i_dave",
+      "sender_principal_id": "p_i_dave",
+      "sender_name": "dave",
+      "content": "I'll update the staging deployment runbook.",
+      "reply_to_message_id": null,
+      "note": "similar commitment by another owner: duplicate"
+    }
+  ],
+  "closing": [
+    {
+      "message_id": "z1",
+      "sequence": 1,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "I'll check the worker logs.",
+      "reply_to_message_id": null,
+      "note": "commitment"
+    },
+    {
+      "message_id": "z2",
+      "sequence": 2,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "Bob, can you restart the worker?",
+      "reply_to_message_id": null,
+      "note": "handoff to bob"
+    },
+    {
+      "message_id": "z3",
+      "sequence": 3,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "On it.",
+      "reply_to_message_id": null,
+      "note": "accepted (next message)"
+    },
+    {
+      "message_id": "z4",
+      "sequence": 4,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "Done with C1.",
+      "reply_to_message_id": null,
+      "note": "completed by ref"
+    },
+    {
+      "message_id": "z5",
+      "sequence": 5,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "Restarted, all done.",
+      "reply_to_message_id": null,
+      "note": "the only open commitment completes, and its handoff"
+    },
+    {
+      "message_id": "z6",
+      "sequence": 6,
+      "sender_member_id": "i_alice",
+      "sender_principal_id": "p_i_alice",
+      "sender_name": "alice",
+      "content": "Is the worker healthy now?",
+      "reply_to_message_id": null,
+      "note": "question"
+    },
+    {
+      "message_id": "z7",
+      "sequence": 7,
+      "sender_member_id": "i_bob",
+      "sender_principal_id": "p_i_bob",
+      "sender_name": "bob",
+      "content": "Yes, healthy again.",
+      "reply_to_message_id": "z6",
+      "note": "answered by reply: everything settled"
+    }
+  ]
+}

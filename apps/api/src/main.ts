@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { applyMessages, evaluate } from '@chorus/domain';
 import pg from 'pg';
 import { buildApp } from './app.ts';
 import { ConfigError, loadConfig } from './config.ts';
@@ -29,6 +30,7 @@ async function main(): Promise<void> {
     pool,
     secretsKey: config.secretsKey,
     client: sharednetClient,
+    coordination: { apply: applyMessages, evaluate },
     logger: {
       info: (obj, msg) => {
         app.log.info(obj, msg);

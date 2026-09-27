@@ -3,7 +3,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { SHAREDNET_ROOM, startStack, type Stack } from '../helpers/stack.ts';
+import type pg from 'pg';
+import { SHAREDNET_ROOM, startStack, type Agent, type Stack } from '../helpers/stack.ts';
 
 interface ToolCall {
   readonly isError: boolean;
@@ -44,6 +45,8 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
   let stack: Stack;
   let caller: Client;
   let worker: Client;
+  let callerAgent: Agent;
+  let workerAgent: Agent;
   let callerActorId: string;
   let sessionId: string;
   let boardId: string;
@@ -51,6 +54,7 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
   beforeAll(async () => {
     stack = await startStack();
     const c = stack.agent('C');
+    callerAgent = c;
     const cEnrolled = await stack.enroll(c);
     callerActorId = cEnrolled.actorId;
     caller = await connect(stack, cEnrolled.token);
@@ -64,6 +68,7 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
     boardId = (created.data['board'] as { id: string }).id;
 
     const b = stack.agent('B');
+    workerAgent = b;
     const bEnrolled = await stack.enroll(b);
     worker = await connect(stack, bEnrolled.token);
     const joined = await write(worker, 'chorus.join_session', { session_id: sessionId });
@@ -89,19 +94,39 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
   });
 
   it('CC1: scans, explicitly links a suggestion, and completes the normal task lifecycle', async () => {
-    let activeConnections = 0;
+    // The probe must see only connections held BY THE SCAN REQUEST. Counting pool-wide acquire/release was flaky:
+    // the watcher (its rescan, enrollment expiry and the cursor advance that the posts below wake it for) and
+    // the audit sink's background batches share the pool and may hold a connection at the moment of the fetch.
+    // None of them ever acts as the caller, while every domain transaction of the scan (withReadTx, runCommand)
+    // sets the caller's RLS context first. So a connection counts as held by the scan from the moment it sets
+    // chorus.actor_id to the caller until it is released.
+    const heldByCaller = new Set<pg.PoolClient>();
+    const patched = new Set<pg.PoolClient>();
     let heldConnectionDuringFetch = false;
-    const acquired = () => {
-      activeConnections += 1;
+    const acquired = (client: pg.PoolClient) => {
+      if (patched.has(client)) return;
+      patched.add(client);
+      const query = client.query.bind(client) as (...args: unknown[]) => unknown;
+      client.query = ((...args: unknown[]) => {
+        const [text, values] = args;
+        if (
+          typeof text === 'string' &&
+          text.includes("set_config('chorus.actor_id'") &&
+          Array.isArray(values) &&
+          values.includes(callerActorId)
+        )
+          heldByCaller.add(client);
+        return query(...args);
+      }) as pg.PoolClient['query'];
     };
-    const released = () => {
-      activeConnections -= 1;
+    const released = (_error: Error | undefined, client: pg.PoolClient) => {
+      heldByCaller.delete(client);
     };
     stack.pool.on('acquire', acquired);
     stack.pool.on('release', released);
     const connectSpy = vi.spyOn(stack.pool, 'connect');
     stack.fake.onMessagesRequest = () => {
-      heldConnectionDuringFetch = activeConnections > 0;
+      heldConnectionDuringFetch ||= heldByCaller.size > 0;
     };
     const a = stack.agent('A');
     const question = stack.fake.post(SHAREDNET_ROOM, {
@@ -135,6 +160,8 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
     stack.fake.onMessagesRequest = undefined;
     stack.pool.off('acquire', acquired);
     stack.pool.off('release', released);
+    // The wrapper is an own property over pg's prototype method: deleting it restores the original.
+    for (const client of patched) delete (client as { query?: unknown }).query;
     connectSpy.mockRestore();
     expect(scanned.data).toMatchObject({
       scan: {
@@ -329,6 +356,99 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
       [sessionId],
     );
     expect(after).toEqual(before);
+  });
+
+  it('CC-2c wiring: coordination_status/update_conversation_object over a scanned conflict, and room_pulse surfaces it for an involved caller', async () => {
+    const claimA = stack.fake.post(SHAREDNET_ROOM, {
+      memberId: callerAgent.memberId,
+      principalId: callerAgent.principalId,
+      name: callerAgent.name,
+      content: 'The staging deploy works fine.',
+    });
+    const claimB = stack.fake.post(SHAREDNET_ROOM, {
+      memberId: workerAgent.memberId,
+      principalId: workerAgent.principalId,
+      name: workerAgent.name,
+      content: 'The staging deploy does not work fine.',
+    });
+    const scanned = await write(caller, 'chorus.scan_conversation', {
+      session_id: sessionId,
+      from_sequence: claimA.sequence,
+      to_sequence: claimB.sequence,
+    });
+    expect(scanned.isError, JSON.stringify(scanned.data)).toBe(false);
+    expect(scanned.data['coordination']).toMatchObject({
+      applied_messages: 2,
+      skipped_before_cursor: 0,
+      new_objects: 3, // two claims plus the detected conflict
+    });
+
+    const status = await call(caller, 'chorus.coordination_status', { session_id: sessionId });
+    expect(status.isError, JSON.stringify(status.data)).toBe(false);
+    const objects = status.data['objects'] as {
+      claims: Record<string, unknown>[];
+      conflicts: { ref: string; status: string }[];
+    };
+    expect(objects.claims).toHaveLength(2);
+    expect(objects.conflicts).toHaveLength(1);
+    const conflictRef = objects.conflicts[0]?.ref;
+    expect(status.data['signals']).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'conflict',
+          refs: expect.arrayContaining([conflictRef]) as unknown as string[],
+        }),
+      ]),
+    );
+    expect(status.data).toMatchObject({ inferred: true, coverage: 'scanned_windows_only' });
+
+    // The signal names both claim authors, including the caller, so it surfaces in their own pulse.
+    const pulse = await call(caller, 'chorus.room_pulse', { session_id: sessionId });
+    const pulseSession = (
+      pulse.data['sessions'] as { session_id: string; next_actions: Record<string, unknown>[] }[]
+    ).find((s) => s.session_id === sessionId);
+    expect(pulseSession?.next_actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'conversation_conflict', item_id: conflictRef }),
+      ]),
+    );
+
+    // update_conversation_object: the caller created the session (a manager), so they may resolve it even
+    // though they are not the conflict object's own recorded author.
+    const resolved = await write(caller, 'chorus.update_conversation_object', {
+      session_id: sessionId,
+      ref: conflictRef,
+      action: 'resolve',
+    });
+    expect(resolved.data).toMatchObject({ object: { ref: conflictRef, status: 'resolved' } });
+
+    // Resolving an already-resolved item is rejected.
+    const already = await write(caller, 'chorus.update_conversation_object', {
+      session_id: sessionId,
+      ref: conflictRef,
+      action: 'resolve',
+    });
+    expect(already.data).toMatchObject({ code: 'invalid_transition' });
+
+    // A non-manager, non-involved third party cannot act on it (it's already resolved, but a fresh open
+    // item on a different actor's behalf would hit the same authorization check first).
+    const outsider = stack.agent('outsider-update');
+    const outsiderEnrolled = await stack.enroll(outsider);
+    const outsiderClient = await connect(stack, outsiderEnrolled.token);
+    try {
+      const joinedOutsider = await write(outsiderClient, 'chorus.join_session', {
+        session_id: sessionId,
+      });
+      expect(joinedOutsider.isError, JSON.stringify(joinedOutsider.data)).toBe(false);
+      const forbidden = await write(outsiderClient, 'chorus.update_conversation_object', {
+        session_id: sessionId,
+        ref: conflictRef,
+        action: 'reopen',
+      });
+      expect(forbidden.data).toMatchObject({ code: 'action_forbidden' });
+    } finally {
+      await outsiderClient.close();
+    }
   });
 
   it('CC8: room text cannot invoke tools or decide suggestions', async () => {

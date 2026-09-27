@@ -1,0 +1,442 @@
+[
+  {
+    "message_id": "m1",
+    "sequence": 1,
+    "sender_member_id": "i_alice",
+    "sender_principal_id": "p_i_alice",
+    "sender_name": "alice",
+    "content": "Can someone check why the deploy fails?",
+    "reply_to_message_id": null,
+    "expect_events": ["question"]
+  },
+  {
+    "message_id": "m2",
+    "sequence": 2,
+    "sender_member_id": "i_alice",
+    "sender_principal_id": "p_i_alice",
+    "sender_name": "alice",
+    "content": "Dave, could you check the database backup job?",
+    "reply_to_message_id": null,
+    "expect_events": ["handoff"]
+  },
+  {
+    "message_id": "m3",
+    "sequence": 3,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "I can take over C1 for you.",
+    "reply_to_message_id": null,
+    "expect_events": ["handoff"]
+  },
+  {
+    "message_id": "m4",
+    "sequence": 4,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "I'll investigate the deploy failure.",
+    "reply_to_message_id": null,
+    "expect_events": ["commitment"]
+  },
+  {
+    "message_id": "m5",
+    "sequence": 5,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "I'll write the docs if I have time today.",
+    "reply_to_message_id": null,
+    "expect_events": ["commitment"]
+  },
+  {
+    "message_id": "m6",
+    "sequence": 6,
+    "sender_member_id": "i_dave",
+    "sender_principal_id": "p_i_dave",
+    "sender_name": "dave",
+    "content": "I'm on it, will report back.",
+    "reply_to_message_id": null,
+    "expect_events": ["commitment"]
+  },
+  {
+    "message_id": "m7",
+    "sequence": 7,
+    "sender_member_id": "i_dave",
+    "sender_principal_id": "p_i_dave",
+    "sender_name": "dave",
+    "content": "ok",
+    "reply_to_message_id": "m2",
+    "expect_events": ["acknowledgement"]
+  },
+  {
+    "message_id": "m8",
+    "sequence": 8,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "Q1: the retry logic had a bug.",
+    "reply_to_message_id": null,
+    "expect_events": ["answer"]
+  },
+  {
+    "message_id": "m9",
+    "sequence": 9,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "re Q1 confirmed, same root cause.",
+    "reply_to_message_id": null,
+    "expect_events": ["answer"]
+  },
+  {
+    "message_id": "m10",
+    "sequence": 10,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "Still working on the deploy fix, halfway through.",
+    "reply_to_message_id": null,
+    "expect_events": ["status_update"]
+  },
+  {
+    "message_id": "m11",
+    "sequence": 11,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "Done, merged the fix.",
+    "reply_to_message_id": "m4",
+    "expect_events": ["completion"]
+  },
+  {
+    "message_id": "m12",
+    "sequence": 12,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "Scratch that, never mind the docs.",
+    "reply_to_message_id": null,
+    "expect_events": ["withdrawal"]
+  },
+  {
+    "message_id": "m13",
+    "sequence": 13,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "I can't take this, no bandwidth this week.",
+    "reply_to_message_id": null,
+    "expect_events": ["decline"]
+  },
+  {
+    "message_id": "m14",
+    "sequence": 14,
+    "sender_member_id": "i_alice",
+    "sender_principal_id": "p_i_alice",
+    "sender_name": "alice",
+    "content": "Decision: the retry backoff is 3 seconds.",
+    "reply_to_message_id": null,
+    "expect_events": ["decision"]
+  },
+  {
+    "message_id": "m15",
+    "sequence": 15,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "Agreed: let's ship it tomorrow morning.",
+    "reply_to_message_id": null,
+    "expect_events": ["decision"]
+  },
+  {
+    "message_id": "m16",
+    "sequence": 16,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "The payments queue works fine in staging.",
+    "reply_to_message_id": null,
+    "expect_events": ["claim"]
+  },
+  {
+    "message_id": "m17",
+    "sequence": 17,
+    "sender_member_id": "i_dave",
+    "sender_principal_id": "p_i_dave",
+    "sender_name": "dave",
+    "content": "The payments queue does not work fine in staging.",
+    "reply_to_message_id": null,
+    "expect_events": ["claim"]
+  },
+  {
+    "message_id": "m18",
+    "sequence": 18,
+    "sender_member_id": "i_alice",
+    "sender_principal_id": "p_i_alice",
+    "sender_name": "alice",
+    "content": "I think the cache layer works well.",
+    "reply_to_message_id": null,
+    "expect_events": ["claim"]
+  },
+  {
+    "message_id": "m19",
+    "sequence": 19,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "The cron job runs fine if the network is stable.",
+    "reply_to_message_id": null,
+    "expect_events": []
+  },
+  {
+    "message_id": "m20",
+    "sequence": 20,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "Waiting on C1 before I can start the report.",
+    "reply_to_message_id": null,
+    "expect_events": ["dependency"]
+  },
+  {
+    "message_id": "m21",
+    "sequence": 21,
+    "sender_member_id": "i_dave",
+    "sender_principal_id": "p_i_dave",
+    "sender_name": "dave",
+    "content": "I'm blocked on bob's task.",
+    "reply_to_message_id": null,
+    "expect_events": ["dependency"]
+  },
+  {
+    "message_id": "m22",
+    "sequence": 22,
+    "sender_member_id": "i_dave",
+    "sender_principal_id": "p_i_dave",
+    "sender_name": "dave",
+    "content": "I'm waiting for someone to reply, no one owns it yet.",
+    "reply_to_message_id": null,
+    "expect_events": ["dependency"]
+  },
+  {
+    "message_id": "m23",
+    "sequence": 23,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "I can't look at it this week.",
+    "reply_to_message_id": null,
+    "expect_events": []
+  },
+  {
+    "message_id": "m24",
+    "sequence": 24,
+    "sender_member_id": "i_alice",
+    "sender_principal_id": "p_i_alice",
+    "sender_name": "alice",
+    "content": "Thanks everyone for the update today.",
+    "reply_to_message_id": null,
+    "expect_events": []
+  },
+  {
+    "message_id": "m25",
+    "sequence": 25,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "Is the staging box back up yet?",
+    "reply_to_message_id": "m1",
+    "expect_events": ["question"]
+  },
+  {
+    "message_id": "m26",
+    "sequence": 26,
+    "sender_member_id": "i_alice",
+    "sender_principal_id": "p_i_alice",
+    "sender_name": "alice",
+    "content": "@carol could you review the release notes?",
+    "reply_to_message_id": null,
+    "expect_events": ["handoff"]
+  },
+  {
+    "message_id": "m27",
+    "sequence": 27,
+    "sender_member_id": "i_dave",
+    "sender_principal_id": "p_i_dave",
+    "sender_name": "dave",
+    "content": "This relates to Q1 and C1 both.",
+    "reply_to_message_id": null,
+    "expect_events": []
+  },
+  {
+    "message_id": "m28",
+    "sequence": 28,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "I've got this, no need to worry.",
+    "reply_to_message_id": null,
+    "expect_events": ["commitment"]
+  },
+  {
+    "message_id": "m29",
+    "sequence": 29,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "Leave it to me, I will sort the deploy out.",
+    "reply_to_message_id": null,
+    "expect_events": ["commitment"]
+  },
+  {
+    "message_id": "m30",
+    "sequence": 30,
+    "sender_member_id": "i_dave",
+    "sender_principal_id": "p_i_dave",
+    "sender_name": "dave",
+    "content": "Frank, could you check the logs?",
+    "reply_to_message_id": null,
+    "expect_events": ["question"]
+  },
+  {
+    "message_id": "m31",
+    "sequence": 31,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "I'll fix the login redirect bug. The current behavior is not correct in staging.",
+    "reply_to_message_id": null,
+    "expect_events": ["commitment", "claim"]
+  },
+  {
+    "message_id": "m32",
+    "sequence": 32,
+    "sender_member_id": "i_dave",
+    "sender_principal_id": "p_i_dave",
+    "sender_name": "dave",
+    "content": "Not me, I already have too much on my plate this week.",
+    "reply_to_message_id": null,
+    "expect_events": ["decline"]
+  },
+  {
+    "message_id": "m33",
+    "sequence": 33,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "Withdrawing my earlier commitment on the docs.",
+    "reply_to_message_id": null,
+    "expect_events": ["withdrawal"]
+  },
+  {
+    "message_id": "m34",
+    "sequence": 34,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "Backup job ✅",
+    "reply_to_message_id": null,
+    "expect_events": ["completion"]
+  },
+  {
+    "message_id": "m35",
+    "sequence": 35,
+    "sender_member_id": "i_dave",
+    "sender_principal_id": "p_i_dave",
+    "sender_name": "dave",
+    "content": "The report is in progress, nearly there.",
+    "reply_to_message_id": null,
+    "expect_events": ["status_update"]
+  },
+  {
+    "message_id": "m36",
+    "sequence": 36,
+    "sender_member_id": "i_alice",
+    "sender_principal_id": "p_i_alice",
+    "sender_name": "alice",
+    "content": "The monitoring dashboard does show the right numbers.",
+    "reply_to_message_id": null,
+    "expect_events": ["claim"]
+  },
+  {
+    "message_id": "m37",
+    "sequence": 37,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "The staging box seems slow today, right?",
+    "reply_to_message_id": null,
+    "expect_events": ["question"]
+  },
+  {
+    "message_id": "m38",
+    "sequence": 38,
+    "sender_member_id": "i_dave",
+    "sender_principal_id": "p_i_dave",
+    "sender_name": "dave",
+    "content": "Will do.",
+    "reply_to_message_id": null,
+    "expect_events": ["acknowledgement"]
+  },
+  {
+    "message_id": "m39",
+    "sequence": 39,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "Got it.",
+    "reply_to_message_id": null,
+    "expect_events": ["acknowledgement"]
+  },
+  {
+    "message_id": "m40",
+    "sequence": 40,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "Acknowledged.",
+    "reply_to_message_id": null,
+    "expect_events": ["acknowledgement"]
+  },
+  {
+    "message_id": "m41",
+    "sequence": 41,
+    "sender_member_id": "i_alice",
+    "sender_principal_id": "p_i_alice",
+    "sender_name": "alice",
+    "content": "Decided: C1 owns the retry logic going forward.",
+    "reply_to_message_id": null,
+    "expect_events": ["decision"]
+  },
+  {
+    "message_id": "m42",
+    "sequence": 42,
+    "sender_member_id": "i_carol",
+    "sender_principal_id": "p_i_carol",
+    "sender_name": "carol",
+    "content": "This depends on the vendor contract being signed.",
+    "reply_to_message_id": null,
+    "expect_events": ["dependency"]
+  },
+  {
+    "message_id": "m43",
+    "sequence": 43,
+    "sender_member_id": "i_alice",
+    "sender_principal_id": "p_i_alice",
+    "sender_name": "alice",
+    "content": "carol, please review C2 today.",
+    "reply_to_message_id": null,
+    "expect_events": ["handoff"]
+  },
+  {
+    "message_id": "m44",
+    "sequence": 44,
+    "sender_member_id": "i_bob",
+    "sender_principal_id": "p_i_bob",
+    "sender_name": "bob",
+    "content": "Q3 is still open.",
+    "reply_to_message_id": null,
+    "expect_events": ["claim"]
+  }
+]

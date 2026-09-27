@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type pg from 'pg';
 import type { SharedOSKernel, ToolResult } from '@aicoo/sharedos';
-import { removeMember, revokeRole, type Uuid } from '@chorus/domain';
+import { removeMember, revokeRole, setCoordinationMode, type Uuid } from '@chorus/domain';
 import {
   createFixture,
   type Actor,
@@ -15,7 +15,7 @@ import { createChorusGrantSource } from '../../src/sharedos/grant-source.ts';
 import { createChorusKernel } from '../../src/sharedos/kernel.ts';
 import { runInRequestScope, type ChorusRequestScope } from '../../src/sharedos/request-scope.ts';
 
-const noopLogger = { error: () => undefined };
+const noopLogger = { error: vi.fn() };
 
 describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
   let f: Fixture;
@@ -84,6 +84,7 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     'chorus.grant_role',
     'chorus.revoke_role',
     'chorus.set_session_policy',
+    'chorus.set_coordination_mode',
     'chorus.remove_member',
   ];
 
@@ -102,6 +103,8 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
         'chorus.list_work',
         'chorus.review',
         'chorus.leave_session',
+        'chorus.coordination_status',
+        'chorus.update_conversation_object',
       ]),
     );
     expect(asParticipant).not.toContain('chorus.complete');
@@ -111,7 +114,7 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     expect(asAdmin).toEqual(
       expect.arrayContaining([...ADMIN_ONLY, 'chorus.complete', 'chorus.create_board']),
     );
-    expect(asAdmin).toHaveLength(31); // 24 + room_pulse, create_action_board, create_tasks, and 4 conversation tools
+    expect(asAdmin).toHaveLength(36); // 27 + room_pulse, create_action_board, create_tasks, and 6 conversation tools
 
     expect(await toolNames(roomOnly)).toEqual([
       'chorus.create_action_board',
@@ -124,6 +127,210 @@ describe('SharedOS host: kernel level (real PostgreSQL, as chorus_app)', () => {
     // A stranger to the room sees nothing at all.
     const stranger = await f.actor(ws, 'k1-stranger', { inRoom: false });
     expect(await toolNames(stranger)).toEqual([]);
+  });
+
+  it('CC-2d-1 coordination mode is administrator-only and starts at the watcher checkpoint', async () => {
+    const admin = await f.actor(ws, 'coordination-mode-admin');
+    const session = await f.session(admin);
+    const participant = await f.actor(ws, 'coordination-mode-participant');
+    await f.join(session, participant);
+    const sealedMemberId = 'i_SealedSeatMember01';
+    const ciphertext = Buffer.from('sealed-token-sentinel');
+    const nonce = Buffer.from('nonce-secret');
+    const assertNoSeatData = (value: unknown) => {
+      const json = JSON.stringify(value);
+      for (const forbidden of [
+        'token_ciphertext',
+        'token_nonce',
+        'key_id',
+        'deadbeef',
+        sealedMemberId,
+        ...[ciphertext, nonce].flatMap((buffer) => [
+          buffer.toString(),
+          buffer.toString('hex'),
+          buffer.toString('base64'),
+          JSON.stringify(buffer),
+          JSON.stringify([...buffer]),
+        ]),
+      ]) {
+        expect(json).not.toContain(forbidden);
+      }
+    };
+    await f.owner(
+      "UPDATE rooms SET provider = 'sharednet', external_room_id = 'rom_ModeTest01' WHERE id = $1",
+      [session.roomId],
+    );
+    await f.owner(
+      `INSERT INTO sharednet_seats
+         (workspace_id, room_id, member_id, principal_id, token_ciphertext, token_nonce, key_id)
+       VALUES ($1, $2, $3, 'p_SealedPrincipal01', $4, $5, 'deadbeef')`,
+      [ws.id, session.roomId, sealedMemberId, ciphertext, nonce],
+    );
+    await f.owner(
+      'INSERT INTO sharednet_cursors (workspace_id, room_id, last_sequence) VALUES ($1, $2, 42)',
+      [ws.id, session.roomId],
+    );
+
+    expect(
+      await call(participant, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'observe',
+        expected_version: 2,
+      }),
+    ).toMatchObject({ status: 'denied' });
+
+    const replayKey = randomUUID();
+    const replayTrace = randomUUID();
+    const observeArgs = {
+      session_id: session.id,
+      mode: 'observe',
+      expected_version: 2,
+      idempotency_key: replayKey,
+    };
+    const observeResult = await call(admin, 'chorus.set_coordination_mode', observeArgs, {
+      traceId: replayTrace,
+    });
+    const observe = okOutput(observeResult);
+    assertNoSeatData(observeResult);
+    const stale = await call(admin, 'chorus.set_coordination_mode', {
+      session_id: session.id,
+      mode: 'assist',
+      expected_version: 2,
+    });
+    expect(stale).toMatchObject({ status: 'failed', error: { code: 'version_conflict' } });
+    assertNoSeatData(stale);
+    await audit.flush();
+    assertNoSeatData(noopLogger.error.mock.calls);
+
+    const cursor = async () =>
+      Number(
+        (
+          await f.owner<{ cursor: string }>(
+            'SELECT cursor FROM conversation_engine_state WHERE session_id = $1',
+            [session.id],
+          )
+        )[0]?.cursor,
+      );
+    expect(await cursor()).toBe(42);
+
+    await f.owner('UPDATE sharednet_cursors SET last_sequence = 57 WHERE room_id = $1', [
+      session.roomId,
+    ]);
+    const replay = okOutput(
+      await call(admin, 'chorus.set_coordination_mode', observeArgs, { traceId: replayTrace }),
+    );
+    expect(replay).toEqual(observe);
+    expect(await cursor()).toBe(42);
+    const [replayedSession] = await f.owner<{ version: number }>(
+      'SELECT version FROM sessions WHERE id = $1',
+      [session.id],
+    );
+    expect(replayedSession?.version).toBe(3);
+    const [record] = await f.owner<{ command_type: string }>(
+      'SELECT command_type FROM commands WHERE idempotency_key = $1',
+      [replayKey],
+    );
+    expect(record?.command_type).toBe('session.set_coordination_mode');
+    expect(
+      await call(admin, 'chorus.set_session_policy', {
+        session_id: session.id,
+        coordination_mode: 'observe',
+        expected_version: 2,
+        idempotency_key: replayKey,
+      }),
+    ).toMatchObject({ status: 'failed', error: { code: 'idempotency_conflict' } });
+    okOutput(
+      await call(admin, 'chorus.set_session_policy', {
+        session_id: session.id,
+        coordination_mode: 'assist',
+        expected_version: 3,
+      }),
+    );
+    expect(await cursor()).toBe(57);
+
+    await f.owner('UPDATE conversation_engine_state SET cursor = 120 WHERE session_id = $1', [
+      session.id,
+    ]);
+    await f.owner('UPDATE sharednet_cursors SET last_sequence = 100 WHERE room_id = $1', [
+      session.roomId,
+    ]);
+    okOutput(
+      await call(admin, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'observe',
+        expected_version: 4,
+      }),
+    );
+    expect(await cursor()).toBe(120);
+
+    await f.owner('UPDATE sharednet_cursors SET last_sequence = 80 WHERE room_id = $1', [
+      session.roomId,
+    ]);
+    okOutput(
+      await call(admin, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'off',
+        expected_version: 5,
+      }),
+    );
+    expect(await cursor()).toBe(120);
+    const [row] = await f.owner<{ coordination_mode: string }>(
+      'SELECT coordination_mode FROM sessions WHERE id = $1',
+      [session.id],
+    );
+    expect(row?.coordination_mode).toBe('off');
+    expect(
+      await call(admin, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'invalid',
+        expected_version: 6,
+      }),
+    ).toMatchObject({ status: 'failed', error: { code: 'invalid_request' } });
+    await audit.flush();
+    assertNoSeatData(noopLogger.error.mock.calls);
+  });
+
+  it('CC-2d-1 off creates no state, missing checkpoints start at zero, and invalid IDs never reach SQL', async () => {
+    const isolated = await f.workspace('mode-no-checkpoint');
+    const admin = await f.actor(isolated, 'mode-no-checkpoint-admin');
+    const session = await f.session(admin);
+    okOutput(
+      await call(admin, 'chorus.set_coordination_mode', {
+        session_id: session.id,
+        mode: 'off',
+        expected_version: 2,
+      }),
+    );
+    expect(
+      await f.count('SELECT count(*) AS n FROM conversation_engine_state WHERE session_id = $1', [
+        session.id,
+      ]),
+    ).toBe(0);
+    okOutput(
+      await call(admin, 'chorus.set_session_policy', {
+        session_id: session.id,
+        coordination_mode: 'observe',
+        expected_version: 3,
+      }),
+    );
+    const [state] = await f.owner<{ cursor: string }>(
+      'SELECT cursor FROM conversation_engine_state WHERE session_id = $1',
+      [session.id],
+    );
+    expect(Number(state?.cursor)).toBe(0);
+    const connect = vi.spyOn(f.pool, 'connect');
+    try {
+      await expect(
+        setCoordinationMode(admin.ctx(), {
+          session_id: 'not-a-uuid',
+          mode: 'observe',
+          expected_version: 4,
+        }),
+      ).rejects.toMatchObject({ code: 'invalid_request' });
+      expect(connect).not.toHaveBeenCalled();
+    } finally {
+      connect.mockRestore();
+    }
   });
 
   it('K2 sharedos.enforcement.cross_session: another session is denied by SharedOS before any domain call', async () => {

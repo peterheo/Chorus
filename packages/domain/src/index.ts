@@ -58,6 +58,7 @@ export {
   removeMember,
   revokeRole,
   setSessionPolicy,
+  setCoordinationMode,
   type CreateSessionParams,
   type MemberRemoved,
   type PolicyChanged,
@@ -90,6 +91,8 @@ export {
   type SessionDetail,
   type SessionListing,
   getTask,
+  boardSummary,
+  type BoardSummary,
   listMyReviews,
   listWork,
   type ListWorkResponse,
@@ -153,3 +156,47 @@ export {
   type ConversationDigestSource,
   type ConversationDigestTopSuggestion,
 } from './conversation/digest.ts';
+export {
+  EMPTY_STATE,
+  OBJECT_STATUSES,
+  REF_PREFIX,
+  RESOLVED_STATUS,
+  UNSETTLED_STATUSES,
+  type ApplyContext,
+  type ApplyMessages,
+  type ApplyResult,
+  type CoordObject,
+  type CoordState,
+  type Evaluate,
+  type Member,
+  type MessageSource,
+  type ObjectKind,
+  type RefPrefix,
+  type Signal,
+  type SignalKind,
+  type Transition,
+} from './coordination/types.ts';
+export {
+  applyScanToCoordination,
+  loadCoordState,
+  type CoordinationApplied,
+  type CoordinationEngine,
+} from './coordination/store.ts';
+export {
+  coordinationStatus,
+  updateConversationObject,
+  type CoordinationStatus,
+  type UpdateAction,
+  type UpdateConversationObjectResult,
+} from './coordination/commands.ts';
+export type {
+  CoordEvent,
+  CoordEventType,
+  ContentTokens,
+  ExtractEvents,
+  Jaccard,
+} from './coordination/events.ts';
+export { STOPWORDS, contentTokens, jaccard } from './coordination/similarity.ts';
+export { applyMessages, createEngine } from './coordination/engine.ts';
+export { extractEvents } from './coordination/extract.ts';
+export { evaluate } from './coordination/rules.ts';
