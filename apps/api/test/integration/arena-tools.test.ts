@@ -412,7 +412,7 @@ describe('Arena tools through the SharedOS kernel (real PostgreSQL as chorus_app
       coverage: string;
       sessions: { session_id: string; counts: { ready_unowned: number } }[];
     };
-    expect(out.coverage).toBe('chorus_state_only');
+    expect(out.coverage).toBe('chorus_state_and_stored_conversation_suggestions');
     expect(out.sessions.find((s) => s.session_id === w.session.id)?.counts.ready_unowned).toBe(1);
     expect(typeof out['audit_trace_id' as never]).toBe('string');
     // One session filter works; a session the caller is not in is not_found (and reveals nothing).

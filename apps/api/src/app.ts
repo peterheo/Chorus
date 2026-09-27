@@ -22,6 +22,7 @@ export interface AppLimits {
   readonly activateGlobalPerMinute: number;
   readonly paidPerActorPerMinute: number;
   readonly pulsePerActorPerMinute: number;
+  readonly conversationScanPerActorPerMinute: number;
 }
 
 const DEFAULT_LIMITS: AppLimits = {
@@ -32,6 +33,7 @@ const DEFAULT_LIMITS: AppLimits = {
   activateGlobalPerMinute: 10,
   paidPerActorPerMinute: 30,
   pulsePerActorPerMinute: 10,
+  conversationScanPerActorPerMinute: 6,
 };
 
 export interface AppOptions {
@@ -179,10 +181,18 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     leaseDurationSeconds: config.leaseDurationSeconds,
     gitCommit: config.gitCommit,
     billing,
+    sharednet: {
+      baseUrl: sharednetBaseUrl.replace(/\/$/, ''),
+      secretsKey: options.sharednet.secretsKey,
+    },
     arena,
     limits: {
       paid: new RateLimiter({ limit: limits.paidPerActorPerMinute, windowMs: 60_000 }),
       pulse: new RateLimiter({ limit: limits.pulsePerActorPerMinute, windowMs: 60_000 }),
+      conversation: new RateLimiter({
+        limit: limits.conversationScanPerActorPerMinute,
+        windowMs: 60_000,
+      }),
     },
     logger: {
       error: (obj, msg) => {

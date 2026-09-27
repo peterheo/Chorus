@@ -1,5 +1,6 @@
 import type { ToolHandler } from '@aicoo/sharedos';
 import { arenaTools } from './arena.ts';
+import { conversationTools } from './conversation.ts';
 import { defineChorusTool, type ToolDeps } from './define.ts';
 import { roomTools } from './room.ts';
 import { sessionTools } from './session.ts';
@@ -13,7 +14,7 @@ const FREE_CREATE_TOOLS: ReadonlySet<string> = new Set([
 
 /** Every `chorus.*` tool (P1 domain commands and reads, plus the Arena tools; nothing is stubbed). */
 export function chorusTools(deps: ToolDeps): ToolHandler[] {
-  return [...roomTools, ...sessionTools, ...workTools, ...arenaTools]
+  return [...roomTools, ...sessionTools, ...workTools, ...arenaTools, ...conversationTools]
     .filter((spec) => deps.billing !== 'enabled' || !FREE_CREATE_TOOLS.has(spec.name))
     .map((spec) => defineChorusTool(spec, deps));
 }

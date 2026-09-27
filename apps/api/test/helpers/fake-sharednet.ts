@@ -6,6 +6,7 @@ export interface FakeMessage {
   sequence: number;
   senderPrincipalId: string;
   senderMemberId: string;
+  senderName: string;
   senderAgentId?: string | null;
   content: string;
 }
@@ -43,6 +44,19 @@ export class FakeSharedNet {
   joinFailWith: number | undefined;
   /** When set, every wait answers with this HTTP status (e.g. 401 to simulate a revoked seat). */
   failWith: number | undefined;
+  /** When set, conversation message reads answer with this HTTP status. */
+  messagesFailWith: number | undefined;
+  /** When true, conversation message items omit the sender contract. */
+  breakMessagesContract = false;
+  /** Every conversation message page requested by a client. */
+  readonly messageRequests: {
+    roomId: string;
+    after: number;
+    limit: number;
+    order: string | null;
+  }[] = [];
+  /** Synchronous probe run while the API's fetch is in flight. */
+  onMessagesRequest: (() => void) | undefined;
   /** When true, items are returned without sender fields (a contract violation). */
   breakContract = false;
   private server: Server | undefined;
@@ -70,6 +84,7 @@ export class FakeSharedNet {
       memberId: string;
       principalId: string;
       content: string;
+      name?: string;
       sequence?: number;
       agentId?: string;
     },
@@ -82,6 +97,7 @@ export class FakeSharedNet {
       sequence,
       senderPrincipalId: message.principalId,
       senderMemberId: message.memberId,
+      senderName: message.name ?? 'n',
       senderAgentId: message.agentId ?? null,
       content: message.content,
     };
@@ -139,6 +155,54 @@ export class FakeSharedNet {
         return;
       }
       const match = /^\/api\/v1\/rooms\/([^/]+)\/wait$/.exec(url.pathname);
+      const messagesMatch = /^\/api\/v1\/rooms\/([^/]+)\/messages$/.exec(url.pathname);
+      if (req.method === 'GET' && messagesMatch?.[1] !== undefined) {
+        const roomId = decodeURIComponent(messagesMatch[1]);
+        const messageRoom = this.rooms.get(roomId);
+        if (messageRoom === undefined) return void res.writeHead(404).end();
+        if (this.messagesFailWith !== undefined)
+          return void res.writeHead(this.messagesFailWith).end();
+        if (req.headers.authorization !== `Bearer ${messageRoom.seatToken}`)
+          return void res.writeHead(401).end();
+        const after = Number(url.searchParams.get('after') ?? '0');
+        const limit = Number(url.searchParams.get('limit') ?? '50');
+        const order = url.searchParams.get('order');
+        this.onMessagesRequest?.();
+        this.messageRequests.push({ roomId, after, limit, order });
+        const all = messageRoom.messages.filter((message) => message.sequence > after);
+        const page = all.slice(0, limit);
+        const items = page.map((message) =>
+          this.breakMessagesContract
+            ? {
+                id: message.id,
+                sequence: message.sequence,
+                content: message.content,
+                type: 'message',
+              }
+            : {
+                id: message.id,
+                room_id: roomId,
+                sequence: message.sequence,
+                sender_principal_id: message.senderPrincipalId,
+                sender_instance_id: message.senderMemberId,
+                sender: {
+                  member_id: message.senderMemberId,
+                  kind: 'guest',
+                  name: message.senderName,
+                },
+                type: 'message',
+                content: message.content,
+                reply_to_message_id: null,
+                created_at: new Date().toISOString(),
+              },
+        );
+        json(200, {
+          items,
+          next_cursor: page.at(-1)?.sequence ?? null,
+          has_more: all.length > page.length,
+        });
+        return;
+      }
       const room =
         match?.[1] === undefined ? undefined : this.rooms.get(decodeURIComponent(match[1]));
       if (room === undefined) {

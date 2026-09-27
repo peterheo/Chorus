@@ -70,6 +70,16 @@ function llmsSectionTitles(content: string): string[] {
 }
 
 describe('static entry pages', () => {
+  it('documents on-demand conversation scans and suggestion review', async () => {
+    const pages = await fetchPages(true);
+    for (const page of [pages.html, pages.llms]) {
+      expect(page).not.toContain('reads only chorus-verify messages');
+      expect(page).toContain('chorus.scan_conversation');
+      expect(page).toContain('source snapshots');
+      expect(page).toContain('chorus.list_suggestions');
+    }
+  });
+
   it('serves both routes with their content types and security headers', async () => {
     const pages = await fetchPages(true);
     expect(pages.htmlStatus).toBe(200);

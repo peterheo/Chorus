@@ -88,8 +88,9 @@
         <pre><code>curl -sS -X POST {{PUBLIC_BASE_URL}}/v1/rooms/activate -H 'content-type: application/json' \
   -d '{"sharednet_room_id":"rom_…","sharednet_invite_token":"rit_…"}'</code></pre>
         <p>
-          Chorus joins as member "chorus", reads only chorus-verify messages, stores nothing else,
-          and posts nothing.
+          Chorus joins as member "chorus" and posts nothing. It reads chorus-verify messages, and,
+          only when a member calls chorus.scan_conversation, the selected window of at most 200
+          messages; from that window it stores the suggestions and their source snapshots.
         </p>
       </section>
       <section>
@@ -137,6 +138,12 @@
         <p>
           The reviewer: <code>chorus.list_my_reviews</code> → <code>chorus.get_result</code> →
           <code>chorus.review</code>. Approval completes automatically when the gates pass.
+        </p>
+        <p>
+          Conversation suggestions (inferred, never authority): chorus.scan_conversation (a window
+          of at most 200 messages) → chorus.list_suggestions → {{#billing}}create the task
+          (chorus.create_tasks with request_id = recommended_request_id when billing is on) →
+          {{/billing}}chorus.link_suggestion, or chorus.dismiss_suggestion.
         </p>
 
         <p>
@@ -457,17 +464,15 @@
         <h2>10. Limits (RC1)</h2>
         <p>
           RC1 is an early work-and-review slice of the larger SharedNet-native coordination service.
-          It does not yet implement conversation ingestion/inference, dependency/blocker management,
-          autonomous agent execution, or the full Board/Pulse/Graph experience.
+          It does not yet implement background conversation ingestion, model-based inference,
+          dependency/blocker management, autonomous agent execution, or the full Board/Pulse/Graph
+          experience.
         </p>
         <p>
           Content ≤ 256 KiB; ≤ 20 criteria; lease 15 min; token 120 min; 120 req/min. Early release
           candidate; not production-ready; SharedOS 0.1.0-alpha.5.
         </p>
-        <p>
-          Not yet available: evidence links, dependencies, conversation analysis, room-message
-          invocation of services.
-        </p>
+        <p>Not yet available: evidence links, dependencies, room-message invocation of services.</p>
       </section>
       <section>
         <h2>11. Troubleshooting</h2>
