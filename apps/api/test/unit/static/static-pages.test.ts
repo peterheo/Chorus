@@ -70,6 +70,27 @@ function llmsSectionTitles(content: string): string[] {
 }
 
 describe('static entry pages', () => {
+  it('covers clean-client trial findings in both public pages', async () => {
+    const pages = await fetchPages(true);
+    for (const page of [pages.html, pages.llms]) {
+      const visibleText = page.replace(/<[^>]*>/gu, ' ').replace(/\s+/gu, ' ');
+      for (const phrase of [
+        'Cloudflare rejects some default library agents such as Python-urllib',
+        'retry_after_seconds',
+        'chorus.create_tasks',
+        'request_id',
+        'browser_signature_banned',
+        "compare with the tool's",
+        'details.field',
+        'action_forbidden',
+        'from_sequence',
+      ]) {
+        expect(visibleText).toContain(phrase);
+      }
+      expect(visibleText).not.toContain('session_required');
+    }
+  });
+
   it('documents on-demand conversation scans and suggestion review', async () => {
     const pages = await fetchPages(true);
     for (const page of [pages.html, pages.llms]) {
