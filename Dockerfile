@@ -1,9 +1,10 @@
 FROM node:24-slim AS base
 
-RUN corepack enable && corepack prepare pnpm@12.6.0 --activate
+WORKDIR /app
+COPY package.json ./
+RUN corepack enable
 
 FROM base AS build
-WORKDIR /app
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY apps/api/package.json ./apps/api/package.json

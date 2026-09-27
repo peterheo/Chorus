@@ -8,21 +8,21 @@
 
 ## 2. Configure
 
-Copy `.env.prod.example` to `.env.prod`. Replace the `CHANGE_ME_` placeholders with unique values. Generate `CHORUS_SECRETS_KEY` with:
+Copy `.env.prod.example` to `.env.prod` and `.env.compose.example` to `.env.compose`. Replace the `CHANGE_ME_` placeholders with unique values. Generate `CHORUS_SECRETS_KEY` with:
 
 ```sh
 openssl rand -base64 32
 ```
 
-Use long random hexadecimal values for both database passwords so they are safe in the connection URL. Load the compose interpolation values in the shell used for the commands below:
+Use long random hexadecimal values for both database passwords so they are safe in the connection URL. Load the Compose-only values in the shell used for the commands below:
 
 ```sh
 set -a
-. ./.env.prod
+. ./.env.compose
 set +a
 ```
 
-Keep `.env.prod` private. The API reads `DATABASE_URL_APP`; Compose uses the owner password only for PostgreSQL and the migration job.
+Keep both files private. Compose passes `.env.prod` to the API, which reads `DATABASE_URL_APP`. `.env.compose` supplies interpolation values only to PostgreSQL and the one-shot migration job; its passwords are not passed into the API container.
 
 ## 3. Build
 

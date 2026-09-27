@@ -112,6 +112,7 @@ jobs:
         run: |
           test "$(docker exec api id -u)" != "0"
           docker exec api test ! -e /app/apps/api/test
+          docker exec api sh -c 'test -z "${POSTGRES_PASSWORD:-}" && test -z "${CHORUS_APP_PASSWORD:-}"'
       - name: Stop API gracefully
         run: timeout 15s docker stop -t 15 api
       - name: Verify shutdown log
