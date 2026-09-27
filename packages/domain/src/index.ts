@@ -175,6 +175,19 @@ export {
   type SignalKind,
   type Transition,
 } from './coordination/types.ts';
+export {
+  applyScanToCoordination,
+  loadCoordState,
+  type CoordinationApplied,
+  type CoordinationEngine,
+} from './coordination/store.ts';
+export {
+  coordinationStatus,
+  updateConversationObject,
+  type CoordinationStatus,
+  type UpdateAction,
+  type UpdateConversationObjectResult,
+} from './coordination/commands.ts';
 export type {
   CoordEvent,
   CoordEventType,
@@ -182,3 +195,6 @@ export type {
   ExtractEvents,
   Jaccard,
 } from './coordination/events.ts';
+export { STOPWORDS, contentTokens, jaccard } from './coordination/similarity.ts';
+export { createEngine } from './coordination/engine.ts';
+export { evaluate } from './coordination/rules.ts';

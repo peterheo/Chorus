@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import type pg from 'pg';
 import { SHAREDNET_ROOM, startStack, type Stack } from '../helpers/stack.ts';
 
 interface ToolCall {
@@ -89,19 +90,39 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
   });
 
   it('CC1: scans, explicitly links a suggestion, and completes the normal task lifecycle', async () => {
-    let activeConnections = 0;
+    // The probe must see only connections held BY THE SCAN REQUEST. Counting pool-wide acquire/release was flaky:
+    // the watcher (its rescan, enrollment expiry and the cursor advance that the posts below wake it for) and
+    // the audit sink's background batches share the pool and may hold a connection at the moment of the fetch.
+    // None of them ever acts as the caller, while every domain transaction of the scan (withReadTx, runCommand)
+    // sets the caller's RLS context first. So a connection counts as held by the scan from the moment it sets
+    // chorus.actor_id to the caller until it is released.
+    const heldByCaller = new Set<pg.PoolClient>();
+    const patched = new Set<pg.PoolClient>();
     let heldConnectionDuringFetch = false;
-    const acquired = () => {
-      activeConnections += 1;
+    const acquired = (client: pg.PoolClient) => {
+      if (patched.has(client)) return;
+      patched.add(client);
+      const query = client.query.bind(client) as (...args: unknown[]) => unknown;
+      client.query = ((...args: unknown[]) => {
+        const [text, values] = args;
+        if (
+          typeof text === 'string' &&
+          text.includes("set_config('chorus.actor_id'") &&
+          Array.isArray(values) &&
+          values.includes(callerActorId)
+        )
+          heldByCaller.add(client);
+        return query(...args);
+      }) as pg.PoolClient['query'];
     };
-    const released = () => {
-      activeConnections -= 1;
+    const released = (_error: Error | undefined, client: pg.PoolClient) => {
+      heldByCaller.delete(client);
     };
     stack.pool.on('acquire', acquired);
     stack.pool.on('release', released);
     const connectSpy = vi.spyOn(stack.pool, 'connect');
     stack.fake.onMessagesRequest = () => {
-      heldConnectionDuringFetch = activeConnections > 0;
+      heldConnectionDuringFetch ||= heldByCaller.size > 0;
     };
     const a = stack.agent('A');
     const question = stack.fake.post(SHAREDNET_ROOM, {
@@ -135,6 +156,8 @@ describe('conversation tools over /mcp with a real database and fake SharedNet m
     stack.fake.onMessagesRequest = undefined;
     stack.pool.off('acquire', acquired);
     stack.pool.off('release', released);
+    // The wrapper is an own property over pg's prototype method: deleting it restores the original.
+    for (const client of patched) delete (client as { query?: unknown }).query;
     connectSpy.mockRestore();
     expect(scanned.data).toMatchObject({
       scan: {

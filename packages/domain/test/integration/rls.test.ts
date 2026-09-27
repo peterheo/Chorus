@@ -33,6 +33,10 @@ const READABLE = [
   'payment_verification_failures',
   'conversation_scans',
   'conversation_suggestions',
+  'conversation_engine_state',
+  'conversation_objects',
+  'conversation_transitions',
+  'conversation_posts',
 ] as const;
 /** Tables with no privileges for the runtime role at all. */
 const NO_ACCESS = [
@@ -48,6 +52,7 @@ const DEFINERS = [
   'chorus_activate_room',
   'chorus_arena_payee',
   'chorus_conversation_seat',
+  'chorus_coordination_apply',
   'chorus_create_session',
   'chorus_enroll_complete',
   'chorus_enroll_start',
@@ -148,6 +153,24 @@ describe('row-level security and definer functions, as the runtime role chorus_a
        VALUES ($1, $2, 'question', $3, 'Who owns this?', 'high', 'msg_RlsSeed01', 1, 'i_RlsSeed01',
                'p_RlsSeed01', 'seed', 'Who owns this?', $4, false, 'Answer it.', $5, $5)`,
       [w.ws.id, w.session.id, sha256(`${w.session.id}-rls-seed`), sha256('Who owns this?'), scanId],
+    );
+    await f.owner(
+      `INSERT INTO conversation_engine_state (workspace_id, session_id, cursor) VALUES ($1, $2, 1)`,
+      [w.ws.id, w.session.id],
+    );
+    await f.owner(
+      `INSERT INTO conversation_objects (workspace_id, session_id, ref, kind, status, body, created_seq, touched_seq)
+       VALUES ($1, $2, 'Q1', 'question', 'open', '{"ref":"Q1"}'::jsonb, 1, 1)`,
+      [w.ws.id, w.session.id],
+    );
+    await f.owner(
+      `INSERT INTO conversation_transitions (workspace_id, session_id, ref, from_status, to_status, cause, reason)
+       VALUES ($1, $2, 'Q1', NULL, 'open', 'message', 'seed')`,
+      [w.ws.id, w.session.id],
+    );
+    await f.owner(
+      `INSERT INTO conversation_posts (workspace_id, session_id, signal_key, message_id) VALUES ($1, $2, $3, 'msg_RlsSeed02')`,
+      [w.ws.id, w.session.id, sha256(`${w.session.id}-post`)],
     );
   }
 
