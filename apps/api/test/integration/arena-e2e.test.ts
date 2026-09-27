@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { MCP_INSTRUCTIONS_BILLING } from '../../src/instructions.ts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -93,6 +94,8 @@ describe('Arena over /mcp: the real SDK client against the app with billing enab
     }
     expect(names).not.toContain('chorus.create_tasks');
     expect(names).not.toContain('chorus.create_session');
+    // The instructions a billing-on server sends never point at the unregistered free create tools.
+    expect(client.getInstructions()).toBe(MCP_INSTRUCTIONS_BILLING);
     expect(names).not.toContain('chorus.create_task');
 
     // The buyer creates an action board: first a quote…

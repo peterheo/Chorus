@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { MCP_INSTRUCTIONS } from '../../src/instructions.ts';
+import {
+  MCP_INSTRUCTIONS,
+  MCP_INSTRUCTIONS_BILLING,
+  mcpInstructions,
+} from '../../src/instructions.ts';
 import { parseInstance, parseJoin, SharedNetContractError } from '../../src/sharednet/client.ts';
 
 const token = `sni_${'a'.repeat(32)}`;
@@ -83,5 +87,16 @@ describe('MCP instructions', () => {
       expect(MCP_INSTRUCTIONS).toContain(`chorus.${tool}`);
     }
     expect(MCP_INSTRUCTIONS).toContain('every call takes a session_id except');
+  });
+
+  it('with billing on, names only registered tools and the paid way to create', () => {
+    expect(mcpInstructions('disabled')).toBe(MCP_INSTRUCTIONS);
+    expect(mcpInstructions('enabled')).toBe(MCP_INSTRUCTIONS_BILLING);
+    expect(MCP_INSTRUCTIONS_BILLING).toMatchSnapshot();
+    expect(MCP_INSTRUCTIONS_BILLING).not.toMatch(/chorus\.create_(session|task)(?![a-z_])/u);
+    for (const tool of ['create_action_board', 'create_tasks', 'room_pulse', 'join_session']) {
+      expect(MCP_INSTRUCTIONS_BILLING).toContain(`chorus.${tool}`);
+    }
+    expect(MCP_INSTRUCTIONS_BILLING).toContain('details.instruction');
   });
 });

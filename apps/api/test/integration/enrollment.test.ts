@@ -343,6 +343,19 @@ describe('automated in-room enrollment (real PostgreSQL, fake SharedNet)', () =>
         display_name: 'x',
         extra: 1,
       },
+      // Control and bidirectional formatting characters could spoof how the name renders to others.
+      ...[
+        'alice\nbob',
+        'alice\tbob',
+        'alice\u0000',
+        'evil\u202Egnp.exe',
+        'a\u2066b\u2069',
+        'a\u200Fb',
+      ].map((display_name) => ({
+        sharednet_room_id: 'rom_TestRoom01',
+        member_id: 'i_abcdef123',
+        display_name,
+      })),
     ]) {
       const response = await post(bad);
       expect(response.status, JSON.stringify(bad)).toBe(400);
