@@ -9,6 +9,7 @@ export interface FakeMessage {
   senderName: string;
   senderAgentId?: string | null;
   content: string;
+  replyTo?: string | null;
 }
 
 interface FakeRoom {
@@ -57,6 +58,17 @@ export class FakeSharedNet {
   }[] = [];
   /** Synchronous probe run while the API's fetch is in flight. */
   onMessagesRequest: (() => void) | undefined;
+  /** Every message POSTed by a seat (`POST /api/v1/rooms/{id}/messages`), in order, including replays. */
+  readonly sent: {
+    roomId: string;
+    content: string;
+    replyTo: unknown;
+    idempotencyKey: string | undefined;
+    messageId: string;
+  }[] = [];
+  /** When set, message posts answer with this HTTP status (and post nothing). */
+  postFailWith: number | undefined;
+  private readonly idempotent = new Map<string, FakeMessage>();
   /** When true, items are returned without sender fields (a contract violation). */
   breakContract = false;
   private server: Server | undefined;
@@ -87,6 +99,7 @@ export class FakeSharedNet {
       name?: string;
       sequence?: number;
       agentId?: string;
+      replyTo?: string | null;
     },
   ): FakeMessage {
     const room = this.rooms.get(roomId);
@@ -100,6 +113,7 @@ export class FakeSharedNet {
       senderName: message.name ?? 'n',
       senderAgentId: message.agentId ?? null,
       content: message.content,
+      replyTo: message.replyTo ?? null,
     };
     room.messages.push(posted);
     room.messages.sort((a, b) => a.sequence - b.sequence);
@@ -156,6 +170,44 @@ export class FakeSharedNet {
       }
       const match = /^\/api\/v1\/rooms\/([^/]+)\/wait$/.exec(url.pathname);
       const messagesMatch = /^\/api\/v1\/rooms\/([^/]+)\/messages$/.exec(url.pathname);
+      if (req.method === 'POST' && messagesMatch?.[1] !== undefined) {
+        const roomId = decodeURIComponent(messagesMatch[1]);
+        let raw = '';
+        req.on('data', (c: Buffer) => (raw += c.toString('utf8')));
+        req.on('end', () => {
+          const target = this.rooms.get(roomId);
+          if (target === undefined) return void res.writeHead(404).end();
+          if (this.postFailWith !== undefined) return void res.writeHead(this.postFailWith).end();
+          const seat = bearer === undefined ? undefined : this.identities.get(bearer);
+          if (seat === undefined || bearer !== target.seatToken)
+            return void res.writeHead(401).end();
+          const body = JSON.parse(raw) as { content: string; reply_to_message_id?: unknown };
+          const key = req.headers['idempotency-key'];
+          const idempotencyKey = typeof key === 'string' ? key : undefined;
+          const replay =
+            idempotencyKey === undefined ? undefined : this.idempotent.get(idempotencyKey);
+          const message =
+            replay ??
+            this.post(roomId, {
+              memberId: seat.memberId,
+              principalId: seat.principalId,
+              name: 'chorus',
+              content: body.content,
+              replyTo:
+                typeof body.reply_to_message_id === 'string' ? body.reply_to_message_id : null,
+            });
+          if (idempotencyKey !== undefined) this.idempotent.set(idempotencyKey, message);
+          this.sent.push({
+            roomId,
+            content: body.content,
+            replyTo: body.reply_to_message_id,
+            idempotencyKey,
+            messageId: message.id,
+          });
+          json(201, { id: message.id, sequence: message.sequence });
+        });
+        return;
+      }
       if (req.method === 'GET' && messagesMatch?.[1] !== undefined) {
         const roomId = decodeURIComponent(messagesMatch[1]);
         const messageRoom = this.rooms.get(roomId);
@@ -232,8 +284,10 @@ export class FakeSharedNet {
                   sender_principal_id: m.senderPrincipalId,
                   sender_agent_id: m.senderAgentId ?? null,
                   sender_instance_id: m.senderMemberId,
-                  sender: { member_id: m.senderMemberId, kind: 'guest', name: 'n' },
+                  sender: { member_id: m.senderMemberId, kind: 'guest', name: m.senderName },
+                  type: 'message',
                   content: m.content,
+                  reply_to_message_id: m.replyTo ?? null,
                   created_at: new Date().toISOString(),
                 },
           );

@@ -1,4 +1,5 @@
 import type pg from 'pg';
+import { CoordinationFollower, type CoordinationDeps } from './coordination-follow.ts';
 import { openSecret } from './secrets.ts';
 import {
   SharedNetAuthError,
@@ -62,6 +63,13 @@ export interface WatcherOptions {
   readonly minPollIntervalMs?: number;
   /** Backoff ceiling. Default 30 s. */
   readonly maxBackoffMs?: number;
+  /**
+   * The coordination engine (spec §10). When present, every page is also followed into the room's sessions in
+   * `observe`/`assist` mode, and `assist` signals are posted; when absent, follow does nothing.
+   */
+  readonly coordination?: CoordinationDeps;
+  /** The clock for assist rate limits (tests inject one). Default `Date.now`. */
+  readonly now?: () => number;
 }
 
 interface WatchedRoom {
@@ -81,7 +89,10 @@ const ignoreError = (): void => undefined;
 const UNLOCK_SQL = `SELECT pg_advisory_unlock(hashtextextended('chorus:room-consumer:' || $1::text, 0))`;
 
 export class RoomWatcher {
-  private readonly options: Required<Omit<WatcherOptions, 'logger'>> & { logger: WatcherLogger };
+  private readonly options: Required<Omit<WatcherOptions, 'logger' | 'coordination' | 'now'>> & {
+    logger: WatcherLogger;
+  };
+  private readonly follower: CoordinationFollower | undefined;
   private readonly running = new Map<string, Promise<void>>();
   /** Rooms whose consumer lease this instance holds RIGHT NOW (lock taken and epoch claimed, connection alive). */
   private readonly held = new Set<string>();
@@ -100,6 +111,16 @@ export class RoomWatcher {
       logger: noopLogger,
       ...options,
     };
+    this.follower =
+      options.coordination === undefined
+        ? undefined
+        : new CoordinationFollower({
+            pool: options.pool,
+            client: options.client,
+            engine: options.coordination,
+            logger: this.options.logger,
+            now: options.now ?? Date.now,
+          });
   }
 
   /** Rooms this instance currently consumes (holds the consumer lease for). */
@@ -287,6 +308,11 @@ export class RoomWatcher {
           return;
         }
         for (const message of page.messages) await this.handleMessage(room, message);
+        // Follow after enrollment, before the cursor moves: a crash here redelivers the page, and the per-session
+        // engine cursor makes the replay a no-op. It never throws, so it cannot hold up the room.
+        if (this.follower !== undefined && page.messages.length > 0) {
+          await this.follower.step(room, token, page.messages, signal);
+        }
         const highest = page.messages.at(-1)?.sequence ?? after;
         await pool.query('SELECT chorus_watcher_advance($1, $2, $3, $4, true, NULL)', [
           room.workspace_id,
