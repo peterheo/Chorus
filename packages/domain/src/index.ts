@@ -173,3 +173,10 @@ export {
   type SignalKind,
   type Transition,
 } from './coordination/types.ts';
+export type {
+  CoordEvent,
+  CoordEventType,
+  ContentTokens,
+  ExtractEvents,
+  Jaccard,
+} from './coordination/events.ts';
