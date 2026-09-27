@@ -22,7 +22,7 @@ set -a
 set +a
 ```
 
-Keep both files private. Compose passes `.env.prod` to the API, which reads `DATABASE_URL_APP`. `.env.compose` supplies interpolation values only to PostgreSQL and the one-shot migration job; its passwords are not passed into the API container.
+Keep both files private. Compose passes `.env.prod` to the API, which reads `DATABASE_URL_APP`. Set `CHORUS_APP_PASSWORD` in `.env.compose` to the same password inside `DATABASE_URL_APP` in `.env.prod`. `.env.compose` supplies interpolation values only to PostgreSQL and the one-shot migration job; its passwords are not passed into the API container.
 
 ## 3. Build
 
