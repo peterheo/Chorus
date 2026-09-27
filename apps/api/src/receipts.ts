@@ -41,6 +41,18 @@ function quoteJcsString(value: string): string {
   return JSON.stringify(value);
 }
 
+/** Envelopes longer than this (base64url characters) are refused by the link check; real ones are ~3 KB. */
+const MAX_LINK_ENVELOPE = 8192;
+
+/**
+ * A public link that verifies the envelope and shows its receipt: the envelope travels in the URL, so a
+ * stranger can check a finished task without an account and without Chorus storing anything to share it.
+ */
+export function receiptVerifyUrl(publicBaseUrl: string, envelope: ReceiptEnvelope): string {
+  const encoded = Buffer.from(JSON.stringify(envelope)).toString('base64url');
+  return `${publicBaseUrl}/v1/receipts/verify?envelope=${encoded}`;
+}
+
 export function signReceipt(
   receipt: Record<string, unknown>,
   privateKey: KeyObject,
@@ -94,7 +106,7 @@ export async function getReceipt(
   issuer: string,
   privateKey: KeyObject | null,
   keyId: string | null,
-): Promise<ReceiptEnvelope> {
+): Promise<ReceiptEnvelope & { verify_url: string }> {
   if (privateKey === null || keyId === null) {
     throw new ChorusError('temporarily_unavailable', 'Receipts are disabled.', {
       details: { cause: 'receipts_disabled' },
@@ -206,7 +218,8 @@ export async function getReceipt(
       review,
       completed_at: row.completed_at.toISOString(),
     };
-    return signReceipt(receipt, privateKey, keyId);
+    const envelope = signReceipt(receipt, privateKey, keyId);
+    return { ...envelope, verify_url: receiptVerifyUrl(issuer, envelope) };
   });
 }
 
@@ -230,27 +243,65 @@ export function registerReceiptRoutes(
     });
   });
 
+  type Check =
+    | { valid: true; key_id: string }
+    | { valid: false; key_id: string | null; reason: 'unknown_key' | 'invalid_signature' };
+  const check = (envelope: unknown): Check => {
+    const keyId =
+      typeof envelope === 'object' && envelope !== null && !Array.isArray(envelope)
+        ? (envelope as { key_id?: unknown }).key_id
+        : undefined;
+    if (typeof keyId !== 'string' || deps.privateKey === null || keyId !== deps.keyId) {
+      return {
+        valid: false,
+        key_id: typeof keyId === 'string' ? keyId : null,
+        reason: 'unknown_key',
+      };
+    }
+    return verifyReceiptEnvelope(envelope, createPublicKey(deps.privateKey), deps.keyId)
+      ? { valid: true, key_id: keyId }
+      : { valid: false, key_id: keyId, reason: 'invalid_signature' };
+  };
+
   app.post('/v1/receipts/verify', async (request, reply) => {
     const decision = deps.limiter.hit('global');
     if (!decision.ok)
       return sendError(request, reply, 429, 'rate_limited', 'Too many requests.', {
         'retry-after': String(decision.retryAfterSeconds),
       });
-    const envelope: unknown = request.body;
-    const keyId =
-      typeof envelope === 'object' && envelope !== null && !Array.isArray(envelope)
-        ? (envelope as { key_id?: unknown }).key_id
-        : undefined;
-    if (typeof keyId !== 'string' || deps.privateKey === null || keyId !== deps.keyId) {
-      return reply.code(200).send({
-        valid: false,
-        key_id: typeof keyId === 'string' ? keyId : null,
-        reason: 'unknown_key',
+    return reply.code(200).send(check(request.body));
+  });
+
+  // The shareable form of the same check (`verify_url` from chorus.get_receipt). The receipt is echoed back
+  // only when its signature verifies, so the link never shows unsigned text as if Chorus had issued it.
+  app.get('/v1/receipts/verify', async (request, reply) => {
+    const decision = deps.limiter.hit('global');
+    if (!decision.ok)
+      return sendError(request, reply, 429, 'rate_limited', 'Too many requests.', {
+        'retry-after': String(decision.retryAfterSeconds),
       });
+    const encoded = (request.query as { envelope?: unknown }).envelope;
+    let envelope: unknown;
+    try {
+      if (
+        typeof encoded !== 'string' ||
+        encoded.length > MAX_LINK_ENVELOPE ||
+        !/^[A-Za-z0-9_-]+$/.test(encoded)
+      )
+        throw new TypeError('bad envelope');
+      envelope = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    } catch {
+      return sendError(
+        request,
+        reply,
+        400,
+        'invalid_request',
+        'envelope must be a base64url-encoded receipt envelope.',
+      );
     }
-    const valid = verifyReceiptEnvelope(envelope, createPublicKey(deps.privateKey), deps.keyId);
-    return reply
-      .code(200)
-      .send({ valid, key_id: keyId, ...(valid ? {} : { reason: 'invalid_signature' }) });
+    const result = check(envelope);
+    if (!result.valid) return reply.code(200).send(result);
+    const { receipt, key_id: keyId } = envelope as ReceiptEnvelope;
+    return reply.code(200).send({ ...result, key_url: `/v1/keys/${keyId}`, receipt, envelope });
   });
 }

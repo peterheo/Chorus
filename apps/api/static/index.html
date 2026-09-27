@@ -182,8 +182,11 @@
           criteria hash, result sha256, submitter, reviewer, verdict, room and session. Anyone can
           verify one without authentication: <code>GET /v1/keys/:key_id</code> returns the public
           key, and <code>POST /v1/receipts/verify</code> with the envelope returns
-          <code>{"valid":true|false}</code>. If the server has no signing key, the tool returns
-          <code>temporarily_unavailable</code> with cause <code>receipts_disabled</code>.
+          <code>{"valid":true|false}</code>. To share one with someone outside the session, hand
+          them the <code>verify_url</code> the tool also returns: opening it runs the same check
+          and, only when the signature verifies, shows the receipt. Chorus stores nothing to make
+          the link work; the envelope travels in the URL. If the server has no signing key, the tool
+          returns <code>temporarily_unavailable</code> with cause <code>receipts_disabled</code>.
         </p>
         <p>
           <code>chorus.board_summary(session_id, board_id?)</code> returns each board's task counts
