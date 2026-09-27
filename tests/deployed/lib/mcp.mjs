@@ -1,6 +1,6 @@
 import { fetchRetry, requireStatus } from './http.mjs';
 
-export async function connectMcp(baseUrl, token) {
+export async function connectMcp(baseUrl, token, onErrorCode) {
   let nextId = 1;
   const endpoint = `${baseUrl}/mcp`;
   const post = async (payload, expected = [200]) => {
@@ -59,10 +59,25 @@ export async function connectMcp(baseUrl, token) {
           }
         }
       }
+      const errorCode = result?.structuredContent?.error?.code ?? data?.error?.code ?? data?.code;
+      if (result?.isError === true && typeof onErrorCode === 'function') {
+        onErrorCode({
+          tool: name,
+          code: errorCode,
+          source:
+            result?.structuredContent?.error?.code !== undefined
+              ? 'structuredContent.error.code'
+              : data?.error?.code !== undefined
+                ? 'content.error.code'
+                : data?.code !== undefined
+                  ? 'content.code'
+                  : 'missing',
+        });
+      }
       return {
         isError: result?.isError === true,
         data: data ?? {},
-        errorCode: result?.structuredContent?.error?.code ?? data?.error?.code ?? data?.code,
+        errorCode,
       };
     },
   };

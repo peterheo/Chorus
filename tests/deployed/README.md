@@ -37,7 +37,7 @@ E2E_SEATS_FILE='/secure/path/chorus-seats.json' \
 node tests/deployed/e2e.mjs
 ```
 
-The first failing step stops the run; E9 records the IDs of created sessions and tasks without deleting evidence records. Every run writes `tests/deployed/out/evidence-<run id>.json`, which is ignored by Git. Evidence and stdout omit credentials, authorization headers, and result content. Each step prints one redacted pass/fail line. Exit status is zero only when all E0–E9 checks pass.
+The first failing step stops the run; E9 records the IDs of created sessions and tasks without deleting evidence records. Every run writes `tests/deployed/out/evidence-<run id>.json`, which is ignored by Git. Evidence and stdout omit credentials, authorization headers, and result content. Each step prints one redacted pass/fail line. Evidence records the error-code source for each MCP tool error seen in a step (`structuredContent.error.code`, `content.error.code`, `content.code`, or `missing`). Exit status is zero only when all E0–E9 checks pass.
 
 ## What the run proves
 

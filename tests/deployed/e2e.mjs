@@ -282,10 +282,20 @@ export async function runE2E() {
     steps: [],
   };
   const ids = { sessions: [], tasks: [], actors: [] };
-  const ctx = { baseUrl, roomId, sharednetUrl, seats, actors: {}, clients: {} };
+  const ctx = {
+    baseUrl,
+    roomId,
+    sharednetUrl,
+    seats,
+    actors: {},
+    clients: {},
+    errorCodeObservations: [],
+    currentStepId: null,
+  };
   let failure;
 
   const step = async (id, name, run) => {
+    ctx.currentStepId = id;
     const startedAt = new Date().toISOString();
     const start = Date.now();
     try {
@@ -296,6 +306,9 @@ export async function runE2E() {
         started_at: startedAt,
         ms: Date.now() - start,
         pass: true,
+        error_code_sources: ctx.errorCodeObservations
+          .filter((observation) => observation.step_id === id)
+          .map(({ tool, code, source }) => ({ tool, code, source })),
         ...details,
       };
       evidence.steps.push(record);
@@ -309,6 +322,9 @@ export async function runE2E() {
         ms: Date.now() - start,
         pass: false,
         error_code: errorCode(error),
+        error_code_sources: ctx.errorCodeObservations
+          .filter((observation) => observation.step_id === id)
+          .map(({ tool, code, source }) => ({ tool, code, source })),
         ...(error?.httpStatus === undefined ? {} : { http_status: error.httpStatus }),
       };
       evidence.steps.push(record);
@@ -425,7 +441,14 @@ export async function runE2E() {
     await step('E4', 'Check identity, expiry, and room tool discovery', async () => {
       for (const label of ['A', 'B', 'C', 'D']) {
         const actor = ctx.actors[label];
-        ctx.clients[label] = await connectMcp(baseUrl, actor.token);
+        ctx.clients[label] = await connectMcp(baseUrl, actor.token, ({ tool, code, source }) => {
+          ctx.errorCodeObservations.push({
+            step_id: ctx.currentStepId,
+            tool,
+            code: code ?? null,
+            source,
+          });
+        });
         const who = await toolOk(ctx.clients[label], 'chorus.whoami');
         check(who.server_commit === expectedCommit, `whoami_commit_${label}`);
         const expiry = Date.parse(who.token_expires_at);
