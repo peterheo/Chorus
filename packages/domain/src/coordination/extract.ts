@@ -43,6 +43,9 @@ const CLAIM =
 const NEGATIVE_CLAIM_VERB = /^(is not|are not|isn't|aren't|does not|do not|doesn't|don't|fails)$/i;
 const HEDGE = /\b(I think|maybe|probably|might|seems)\b/i;
 const TRAILING_CONDITION = /\s+((?:if|when|within|after|before|unless)\s+.+)$/i;
+const LEADING_CONDITION = /^((?:if|when|within|after|before|unless)\s+[^,]+),\s*(.+)$/i;
+/** A leading hedge ("I think the cache is slow") is not part of the claim's subject. */
+const LEADING_HEDGE = /^(?:I think|maybe|probably)(?:\s+that)?[,\s]+/i;
 const DEPENDENCY =
   /\b(?:blocked (?:on|by)|waiting (?:for|on)|can't (?:start|continue|move on) until|depends on)\b\s*(.*)$/i;
 /** `bob's task` → the possessive name and what follows, so the dependency blocker can be that member's work. */
@@ -83,6 +86,9 @@ function targetsIn(text: string, roster: readonly Member[]): Member[] {
 }
 
 function conditionsIn(text: string): { rest: string; conditions: string[] } {
+  const leading = LEADING_CONDITION.exec(text);
+  if (leading?.[1] !== undefined && leading[2] !== undefined)
+    return { rest: leading[2].trim(), conditions: [leading[1].trim()] };
   const match = TRAILING_CONDITION.exec(text);
   if (match?.[1] === undefined) return { rest: text, conditions: [] };
   return { rest: text.slice(0, match.index).trim(), conditions: [match[1].trim()] };
@@ -142,6 +148,7 @@ function matchSentence(
     return withType('handoff', {
       ...(isRequest ? { request: true } : {}),
       take_over: takeOver[2].toUpperCase(),
+      targets: targetsIn(plain, roster),
     });
   }
   if (isRequest) {
@@ -184,9 +191,12 @@ function matchSentence(
   }
   if (COMPLETION.test(plain)) return withType('completion');
   if (STATUS_UPDATE.test(plain)) return withType('status_update');
-  const claim = CLAIM.exec(plain);
+  // The condition clause is split off the WHOLE sentence first, so a verb inside it ("… runs fine if the
+  // network is stable") is never taken as the claim's verb.
+  const { rest: claimed, conditions } = conditionsIn(plain.replace(LEADING_HEDGE, ''));
+  const claim = CLAIM.exec(claimed);
   if (claim?.[1] !== undefined && claim[2] !== undefined && claim[3] !== undefined) {
-    const { rest: predicate, conditions } = conditionsIn(claim[3].trim());
+    const predicate = claim[3].trim();
     return withType('claim', {
       subject: claim[1].trim(),
       predicate,

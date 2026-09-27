@@ -137,6 +137,12 @@ export type Signal = {
 export type ApplyContext = {
   /** Members whose messages are never applied (the room's Chorus service seat). */
   readonly excludeMemberIds: readonly string[];
+  /**
+   * The room's known members, from the caller (additive, rev 1.4). The extractor's roster is this, plus every
+   * member on an object, plus the sender; object and sender names win over these. Without it, only members
+   * on objects (and the sender) can be addressed by name.
+   */
+  readonly roster?: readonly Member[];
 };
 
 export type ApplyResult = {

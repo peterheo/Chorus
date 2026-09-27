@@ -196,5 +196,6 @@ export type {
   Jaccard,
 } from './coordination/events.ts';
 export { STOPWORDS, contentTokens, jaccard } from './coordination/similarity.ts';
-export { createEngine } from './coordination/engine.ts';
+export { applyMessages, createEngine } from './coordination/engine.ts';
+export { extractEvents } from './coordination/extract.ts';
 export { evaluate } from './coordination/rules.ts';

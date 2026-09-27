@@ -9,6 +9,7 @@
  */
 import type { SourceMessage } from '../conversation/extract.ts';
 import type { CoordEvent, CoordEventType, ExtractEvents } from './events.ts';
+import { extractEvents } from './extract.ts';
 import { contentTokens, jaccard } from './similarity.ts';
 import {
   OBJECT_STATUSES,
@@ -95,14 +96,19 @@ function compact<T extends object>(fields: T): { [K in keyof T]?: Exclude<T[K], 
 }
 
 /**
- * The roster handed to the extractor: every member named on an object (author, owner, targets) plus the
- * sender, by member id, with the most recent name (the sender's own name wins). It is derived from the state
- * and the current message ONLY. Senders of earlier messages in the same call are deliberately NOT added: a
- * member who has only sent messages that created no object is not in the persisted state, so adding them
- * would make a batch resolve names that a message-by-message run cannot (see the roster test).
+ * The roster handed to the extractor, by member id: the caller's room roster (`ctx.roster`), then every member
+ * named on an object (author, owner, targets), then the sender; later names win (the sender's own name last).
+ * It depends only on the context, the state and the current message. Senders of earlier messages in the same
+ * call are deliberately NOT added: they are not in the persisted state, so adding them would make a batch
+ * resolve names that a message-by-message run cannot (see the roster tests).
  */
-export function rosterOf(state: CoordState, sender: Member): readonly Member[] {
+export function rosterOf(
+  state: CoordState,
+  sender: Member,
+  known: readonly Member[] = [],
+): readonly Member[] {
   const names = new Map<string, string>();
+  for (const member of known) names.set(member.member_id, member.name);
   for (const object of [...state.objects].sort(byObjectOrder)) {
     for (const member of [object.author, object.owner, ...object.targets]) {
       if (member !== undefined) names.set(member.member_id, member.name);
@@ -244,9 +250,9 @@ export function applyEvents(
    * replies to nothing, those for which this is the target's first message since the handoff (a pending
    * handoff's later sources are exactly its targets' messages, see the end of this function).
    */
-  const pendingFor = (event: CoordEvent): CoordObject[] => {
+  const pendingFor = (event: CoordEvent, nextMessage = true): CoordObject[] => {
     const direct = named(event).filter(pendingToSender);
-    if (direct.length > 0 || event.reply_to_message_id !== null) return direct;
+    if (direct.length > 0 || event.reply_to_message_id !== null || !nextMessage) return direct;
     return list().filter((object) => pendingToSender(object) && object.sources.length === 1);
   };
 
@@ -312,6 +318,9 @@ export function applyEvents(
         return;
       }
       case 'handoff': {
+        // A handoff needs exactly one resolved target; without one, nothing happens (not even a transfer).
+        const targets = event.targets.filter((target) => !same(target, sender));
+        if (targets.length !== 1) return;
         const taken = event.take_over === undefined ? undefined : get(event.take_over);
         const transferred = taken?.kind === 'commitment' ? taken : undefined;
         create(
@@ -319,7 +328,7 @@ export function applyEvents(
           {
             text: event.text,
             author: sender,
-            targets: event.targets.filter((target) => !same(target, sender)),
+            targets,
             related: transferred === undefined ? [] : [transferred.ref],
           },
           'handed off',
@@ -352,10 +361,15 @@ export function applyEvents(
             (object.kind === 'question' && same(object.author, sender) && isUnsettled(object)),
         );
         if (targets.length === 0) {
-          // Unnamed ("scratch that"): the sender's most recently created commitments and claims.
-          const candidates = list().filter(withdrawable);
-          const latest = Math.max(...candidates.map((object) => object.created_seq));
-          targets = candidates.filter((object) => object.created_seq === latest);
+          // Unnamed: the sender's open commitment or active claim whose text best matches the withdrawal
+          // (Jaccard > 0; ties → the newest). Nothing shares a word → nothing is withdrawn.
+          const words = contentTokens(event.text);
+          let best: { object: CoordObject; score: number } | undefined;
+          for (const object of list().filter(withdrawable)) {
+            const score = jaccard(contentTokens(object.text), words);
+            if (score > 0 && score >= (best?.score ?? 0)) best = { object, score };
+          }
+          targets = best === undefined ? [] : [best.object];
         }
         for (const object of targets) {
           setStatus(object.ref, object.kind === 'claim' ? 'retracted' : 'withdrawn', 'withdrawn');
@@ -374,7 +388,9 @@ export function applyEvents(
         return;
       }
       case 'commitment': {
-        const handoffs = named(event).filter(pendingToSender);
+        // Like an acknowledgement, a target's commitment accepts the handoffs it names, or, when it is their next
+        // message and names nothing ("I've got this"), the pending ones: rules-v2 extracts those as commitments.
+        const handoffs = pendingFor(event, event.refs.length === 0);
         for (const handoff of handoffs) accept(handoff);
         const questions = named(event).filter((object) => object.kind === 'question');
         if (handoffs.length === 0) {
@@ -521,6 +537,7 @@ export function conflicting(a: CoordObject, b: CoordObject): boolean {
 export function createEngine(extract: ExtractEvents): ApplyMessages {
   return (state, messages, ctx) => {
     const excluded = new Set(ctx.excludeMemberIds);
+    const known = (ctx.roster ?? []).filter((member) => !excluded.has(member.member_id));
     const transitions: Transition[] = [];
     let current: CoordState = { ...state, objects: [...state.objects].sort(byObjectOrder) };
     const ordered = [...messages].sort((a, b) => a.sequence - b.sequence);
@@ -533,7 +550,11 @@ export function createEngine(extract: ExtractEvents): ApplyMessages {
       const sender = { member_id: message.sender_member_id, name: message.sender_name };
       const { message_id, sequence, reply_to_message_id } = message;
       const facts = { message_id, sequence, sender, reply_to_message_id };
-      const result = applyEvents(current, facts, extract(message, rosterOf(current, sender)));
+      const result = applyEvents(
+        current,
+        facts,
+        extract(message, rosterOf(current, sender, known)),
+      );
       current = result.state;
       transitions.push(...result.transitions);
     }
@@ -543,3 +564,6 @@ export function createEngine(extract: ExtractEvents): ApplyMessages {
 
 const skipped = (message: SourceMessage, excluded: ReadonlySet<string>): boolean =>
   excluded.has(message.sender_member_id) || message.content.startsWith('chorus-verify ');
+
+/** The production engine: `createEngine` over the rules-v2 extractor. */
+export const applyMessages: ApplyMessages = createEngine(extractEvents);

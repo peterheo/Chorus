@@ -6,10 +6,12 @@ import {
   type ApplyMessages,
   type CoordState,
   type Evaluate,
+  type Member,
   type SignalKind,
   type SourceMessage,
   type Uuid,
 } from '@chorus/domain';
+import { roomRosters, type RoomRosters } from './room-roster.ts';
 import type { SharedNetClient, SharedNetMessage } from './sharednet/client.ts';
 
 /**
@@ -45,6 +47,8 @@ interface FollowerOptions {
   readonly engine: CoordinationDeps;
   readonly logger: { warn: (obj: Record<string, unknown>, msg: string) => void };
   readonly now: () => number;
+  /** Where the room's known members come from (`ApplyContext.roster`). Default: the process-wide rosters. */
+  readonly rosters?: RoomRosters;
 }
 
 /** The only kinds ever posted, in posting priority order (spec §10). */
@@ -123,6 +127,16 @@ export class CoordinationFollower {
     signal?: AbortSignal,
   ): Promise<void> {
     const { pool, logger } = this.options;
+    // Every sender on the page joins the room roster (in memory, before any transaction); the roster the
+    // engine gets never includes the Chorus seat.
+    const rosters = this.options.rosters ?? roomRosters;
+    rosters.note(
+      room.external_room_id,
+      page
+        .filter((m) => (m.type ?? 'message') === 'message')
+        .map((m) => ({ member_id: m.senderMemberId, name: m.senderName ?? '' })),
+    );
+    const roster = rosters.get(room.external_room_id, [room.member_id]);
     const fresh = page.filter(
       (m) => m.senderMemberId !== room.member_id && (m.type ?? 'message') === 'message',
     );
@@ -149,7 +163,7 @@ export class CoordinationFollower {
     const due: Due[] = [];
     for (const target of targets) {
       try {
-        due.push(...(await this.followSession(room, target, fresh)));
+        due.push(...(await this.followSession(room, target, fresh, roster)));
       } catch (error) {
         logger.warn(
           { room_id: room.room_id, session_id: target.session_id, error: (error as Error).name },
@@ -193,6 +207,7 @@ export class CoordinationFollower {
     room: FollowRoom,
     target: Target,
     fresh: readonly SharedNetMessage[],
+    roster: readonly Member[],
   ): Promise<Due[]> {
     const { engine } = this.options;
     const sessionId = target.session_id;
@@ -211,6 +226,7 @@ export class CoordinationFollower {
       await applyScanToCoordination(db, ws, sessionId, null, window, messages, {
         apply: engine.apply,
         excludeMemberIds: [room.member_id],
+        roster,
       });
       if (mode !== 'assist') return [];
       const state = await loadCoordState(db, ws, sessionId);
