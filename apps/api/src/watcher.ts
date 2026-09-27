@@ -63,6 +63,8 @@ const UNLOCK_SQL = `SELECT pg_advisory_unlock(hashtextextended('chorus:room-cons
 export class RoomWatcher {
   private readonly options: Required<Omit<WatcherOptions, 'logger'>> & { logger: WatcherLogger };
   private readonly running = new Map<string, Promise<void>>();
+  /** Rooms whose consumer lease this instance holds RIGHT NOW (lock taken and epoch claimed, connection alive). */
+  private readonly held = new Set<string>();
   /** Scans and expiries in flight; `stop()` waits for them so none can act on a closed pool. */
   private readonly inflight = new Set<Promise<unknown>>();
   private abort = new AbortController();
@@ -82,7 +84,7 @@ export class RoomWatcher {
 
   /** Rooms this instance currently consumes (holds the consumer lease for). */
   get consuming(): readonly string[] {
-    return [...this.running.keys()];
+    return [...this.held];
   }
 
   /** Starts the loops. Safe to call once; returns after the first scan has spawned its loops. */
@@ -149,16 +151,24 @@ export class RoomWatcher {
   /** Takes the consumer lease for the room (or returns quietly if another process holds it) and runs the loop. */
   private async consumeRoom(room: WatchedRoom): Promise<void> {
     const { pool, logger } = this.options;
+    const key = `${room.workspace_id}/${room.room_id}`;
+    // This room's own abort: the watcher's stop() and the loss of the lease connection both end its long-poll.
+    const roomAbort = new AbortController();
+    const onStop = (): void => roomAbort.abort();
+    if (this.abort.signal.aborted) onStop();
+    else this.abort.signal.addEventListener('abort', onStop, { once: true });
     const lock = await pool.connect();
     const lockState = { broken: false };
     lock.on('error', () => {
       lockState.broken = true;
+      this.held.delete(key);
+      roomAbort.abort();
     });
-    let held = false;
+    let gotLock = false;
     try {
       const got = await lock.query<{ got: boolean }>(LOCK_SQL, [room.room_id]);
-      held = got.rows[0]?.got === true;
-      if (!held) return; // another process consumes this room; retried on the next scan
+      gotLock = got.rows[0]?.got === true;
+      if (!gotLock) return; // another process consumes this room; retried on the next scan
       const epoch = Number(
         (
           await pool.query<{ e: string }>('SELECT chorus_watcher_claim_epoch($1, $2) AS e', [
@@ -167,19 +177,30 @@ export class RoomWatcher {
           ])
         ).rows[0]?.e,
       );
+      // Only now is the lease held; a lease connection that died meanwhile means it is not.
+      if (lockState.broken || roomAbort.signal.aborted) return;
+      this.held.add(key);
       logger.info({ room_id: room.room_id, epoch }, 'consuming room');
-      await this.watchRoom(room, epoch, async () => {
-        // The lease is only as good as its connection: if it died, another process may hold the lock now.
-        if (lockState.broken) return false;
-        try {
-          await lock.query('SELECT 1');
-          return true;
-        } catch {
-          return false;
-        }
-      });
+      await this.watchRoom(
+        room,
+        epoch,
+        async () => {
+          // The lease is only as good as its connection: if it died, another process may hold the lock now.
+          if (lockState.broken) return false;
+          try {
+            await lock.query('SELECT 1');
+            return true;
+          } catch {
+            this.held.delete(key);
+            return false;
+          }
+        },
+        roomAbort.signal,
+      );
     } finally {
-      if (held && !lockState.broken) {
+      this.held.delete(key); // synchronously, before any await: exit for any reason ends the lease
+      this.abort.signal.removeEventListener('abort', onStop);
+      if (gotLock && !lockState.broken) {
         await lock.query(UNLOCK_SQL, [room.room_id]).catch(() => undefined);
       }
       lock.release(lockState.broken ? true : undefined);
@@ -190,9 +211,9 @@ export class RoomWatcher {
     room: WatchedRoom,
     epoch: number,
     leaseHeld: () => Promise<boolean>,
+    signal: AbortSignal = this.abort.signal,
   ): Promise<void> {
     const { pool, client, secretsKey, logger, minPollIntervalMs, maxBackoffMs } = this.options;
-    const signal = this.abort.signal;
     const log = { room_id: room.room_id, sharednet_room_id: room.external_room_id };
     let token: string;
     try {
@@ -225,6 +246,11 @@ export class RoomWatcher {
       const started = Date.now();
       try {
         const page = await client.wait(room.external_room_id, token, after, signal);
+        // The long-poll can outlive the lease: never handle (or advance past) a page without it.
+        if (!(await leaseHeld())) {
+          logger.warn(log, 'consumer lease lost; stopping this loop');
+          return;
+        }
         for (const message of page.messages) await this.handleMessage(room, message);
         const highest = page.messages.at(-1)?.sequence ?? after;
         await pool.query('SELECT chorus_watcher_advance($1, $2, $3, $4, true, NULL)', [
@@ -240,7 +266,7 @@ export class RoomWatcher {
           if (elapsed < minPollIntervalMs) await sleep(minPollIntervalMs - elapsed, signal);
         }
       } catch (error) {
-        if (this.abort.signal.aborted) return;
+        if (signal.aborted) return; // stop(), or the lease connection died: not a watcher error
         if ((error as { code?: string }).code === 'CH003') {
           logger.warn(log, 'stale consumer epoch; another process took over this room');
           return;

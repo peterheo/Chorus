@@ -1,8 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import pg from 'pg';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RoomWatcher } from '../../src/watcher.ts';
-import { SharedNetClient } from '../../src/sharednet/client.ts';
+import { SharedNetClient, type SharedNetMessage } from '../../src/sharednet/client.ts';
 import { SHAREDNET_ROOM, startStack, type Stack } from '../helpers/stack.ts';
 
 describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
@@ -357,5 +357,159 @@ describe('room watcher (real PostgreSQL, fake SharedNet)', () => {
       await b.stop();
       await poolB.end();
     }
+  });
+
+  /** Everything the S1-2b tests need to drive a watcher's internals without widening its public surface. */
+  interface Internals {
+    handleMessage: (room: unknown, message: SharedNetMessage) => Promise<void>;
+    watchRoom: (
+      room: unknown,
+      epoch: number,
+      leaseHeld: () => Promise<boolean>,
+      signal?: AbortSignal,
+    ) => Promise<void>;
+  }
+  const internals = (w: RoomWatcher): Internals => w as unknown as Internals;
+  const lockHolders = () =>
+    s.owner<{ pid: number }>(
+      `SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+    );
+  const epoch = async () =>
+    Number(
+      (
+        await s.owner<{ e: string }>(
+          'SELECT consumer_epoch AS e FROM sharednet_cursors WHERE room_id = $1',
+          [s.roomId],
+        )
+      )[0]?.e,
+    );
+  const watcherOn = (pool: pg.Pool, rescanMs: number, client?: SharedNetClient) =>
+    new RoomWatcher({
+      pool,
+      secretsKey: s.secretsKey,
+      client: client ?? new SharedNetClient({ baseUrl: s.fake.url, timeoutMs: 5000 }),
+      rescanMs,
+      expireMs: 30_000,
+      minPollIntervalMs: 10,
+    });
+
+  it('watcher.consuming_is_held_only: consuming never counts a loop that does not hold the lease, even across a failover', async () => {
+    const poolB = new pg.Pool({ connectionString: s.db.appUrl, max: 5 });
+    poolB.on('error', () => undefined);
+    const a = watcherOn(s.pool, 20);
+    const b = watcherOn(poolB, 20);
+    const samples: number[] = [];
+    const sampler = setInterval(() => samples.push(a.consuming.length + b.consuming.length), 5);
+    try {
+      await a.start();
+      await b.start();
+      await s.waitFor('one consumer', () =>
+        Promise.resolve(a.consuming.length + b.consuming.length === 1),
+      );
+      await new Promise((r) => setTimeout(r, 1000)); // steady state: the loser retries every 20 ms
+      const firstEpoch = await epoch();
+      const [holder] = await lockHolders();
+      await s.owner('SELECT pg_terminate_backend($1)', [holder?.pid]);
+      await s.waitFor('a new epoch', async () => (await epoch()) > firstEpoch);
+      await new Promise((r) => setTimeout(r, 500)); // the whole failover window
+      expect(Math.max(...samples)).toBeLessThanOrEqual(1);
+      expect(samples).toContain(1); // the sampler really did see a consumer
+    } finally {
+      clearInterval(sampler);
+      await a.stop();
+      await b.stop();
+      await poolB.end();
+    }
+  });
+
+  it('watcher.lease_loss_aborts_wait: a dead lease connection ends the blocked long-poll at once and the old loop handles nothing', async () => {
+    // A's long-polls block until they are aborted (a 30 s server); B is a normal watcher that takes over.
+    const hangs: { startedAt: number; abortedAt?: number }[] = [];
+    const blockingFetch: typeof fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        const hang: { startedAt: number; abortedAt?: number } = { startedAt: Date.now() };
+        hangs.push(hang);
+        const fail = () => {
+          hang.abortedAt = Date.now();
+          reject(new DOMException('aborted', 'AbortError'));
+        };
+        if (init?.signal?.aborted === true) fail();
+        else init?.signal?.addEventListener('abort', fail, { once: true });
+      });
+    const poolB = new pg.Pool({ connectionString: s.db.appUrl, max: 5 });
+    poolB.on('error', () => undefined);
+    // rescanMs 60 s: after losing the lease A does not rescan, so the new holder is B.
+    const a = watcherOn(
+      s.pool,
+      60_000,
+      new SharedNetClient({ baseUrl: s.fake.url, timeoutMs: 30_000, fetchImpl: blockingFetch }),
+    );
+    const b = watcherOn(poolB, 20);
+    const handledByA = vi.spyOn(internals(a), 'handleMessage');
+    const handledByB = vi.spyOn(internals(b), 'handleMessage');
+    try {
+      await a.start();
+      await s.waitFor('A blocked in its long-poll', () =>
+        Promise.resolve(a.consuming.length === 1 && hangs.length === 1),
+      );
+      await b.start();
+      const firstEpoch = await epoch();
+      const [holder] = await lockHolders();
+      const killedAt = Date.now();
+      await s.owner('SELECT pg_terminate_backend($1)', [holder?.pid]);
+
+      // Within 1 s: A no longer counts as consuming and its blocked wait was aborted (not left for 30 s).
+      await s.waitFor('A gives up the lease and aborts its wait', () =>
+        Promise.resolve(a.consuming.length === 0 && hangs[0]?.abortedAt !== undefined),
+      );
+      expect((hangs[0]?.abortedAt ?? Infinity) - killedAt).toBeLessThan(1000);
+      const stopped = Date.now();
+      await a.stop();
+      expect(Date.now() - stopped).toBeLessThan(1000);
+
+      // B takes over with a new epoch; a proof posted now is verified by B, and A never handled anything.
+      await s.waitFor(
+        'B takes over',
+        async () => (await epoch()) > firstEpoch && b.consuming.length === 1,
+      );
+      const agent = s.agent('afterkill');
+      const started = await s.startEnrollment(agent);
+      s.post(agent, started.message);
+      await s.waitFor(
+        'verified by the new holder',
+        async () => (await enrollmentState(started.enrollmentId)) === 'verified',
+      );
+      expect(handledByA).not.toHaveBeenCalled();
+      expect(handledByB).toHaveBeenCalled();
+    } finally {
+      await a.stop();
+      await b.stop();
+      await poolB.end();
+    }
+  });
+
+  it('watcher.no_handle_without_lease: a page that returns after the lease is gone is neither handled nor advanced past', async () => {
+    const [room] = (await s.pool.query('SELECT * FROM chorus_watcher_rooms()')).rows as unknown[];
+    const page: SharedNetMessage[] = [1, 2].map((n) => ({
+      id: `msg_${String(n)}`,
+      sequence: n,
+      senderPrincipalId: 'p_someoneelse1',
+      senderMemberId: 'i_someoneelse1',
+      senderAgentId: null,
+      content: 'chorus-verify cvn_aaaaaaaaaaaaaaaaaaaaaa',
+    }));
+    const client = {
+      wait: () => Promise.resolve({ messages: page, hasMore: false }),
+    } as unknown as SharedNetClient;
+    const watcher = watcherOn(s.pool, 60_000, client);
+    const handled = vi.spyOn(internals(watcher), 'handleMessage');
+    const before = await cursor();
+    let calls = 0;
+    // The lease is held at the top of the loop, then gone by the time the page comes back.
+    const leaseHeld = () => Promise.resolve(++calls === 1);
+    await internals(watcher).watchRoom(room, 1, leaseHeld);
+    expect(calls).toBe(2);
+    expect(handled).not.toHaveBeenCalled();
+    expect(await cursor()).toBe(before);
   });
 });
