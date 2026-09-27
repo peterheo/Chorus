@@ -32,15 +32,17 @@ export function createFakeLedgerClient(
       pageNumber += 1;
       const failure = opts.pageFailures?.get(pageNumber);
       if (failure !== undefined) return Promise.reject(new LedgerUnavailableError(failure));
-      const start =
+      const beforeIndex =
         args.before === undefined
-          ? 0
-          : Math.max(0, ordered.findIndex((transfer) => transfer.id === args.before) + 1);
+          ? -1
+          : ordered.findIndex((transfer) => transfer.id === args.before);
+      const start =
+        args.before === undefined ? 0 : beforeIndex === -1 ? ordered.length : beforeIndex + 1;
       const items = ordered.slice(start, start + args.limit);
       const hasMore = start + items.length < ordered.length;
       return Promise.resolve({
         items,
-        next_cursor: items.at(-1)?.id ?? null,
+        next_cursor: hasMore ? (items.at(-1)?.id ?? null) : null,
         has_more: hasMore,
       });
     },
@@ -77,15 +79,14 @@ export async function startFakeLedgerServer(transfers: CreditTransfer[]): Promis
     }
     const limit = Number(url.searchParams.get('limit'));
     const before = url.searchParams.get('before');
-    const start =
-      before === null
-        ? 0
-        : Math.max(0, ordered.findIndex((transfer) => transfer.id === before) + 1);
+    const beforeIndex =
+      before === null ? -1 : ordered.findIndex((transfer) => transfer.id === before);
+    const start = before === null ? 0 : beforeIndex === -1 ? ordered.length : beforeIndex + 1;
     const items = ordered.slice(start, start + limit);
     const hasMore = start + items.length < ordered.length;
     writeJson(response, {
       items,
-      next_cursor: items.at(-1)?.id ?? null,
+      next_cursor: hasMore ? (items.at(-1)?.id ?? null) : null,
       has_more: hasMore,
     });
   });

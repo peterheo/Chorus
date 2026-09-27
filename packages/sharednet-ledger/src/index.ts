@@ -84,7 +84,10 @@ function parsePage(value: unknown): LedgerPage {
   if (
     !isRecord(value) ||
     !Array.isArray(value['items']) ||
-    !(value['next_cursor'] === null || typeof value['next_cursor'] === 'string') ||
+    !(
+      value['next_cursor'] === null ||
+      (typeof value['next_cursor'] === 'string' && beforePattern.test(value['next_cursor']))
+    ) ||
     typeof value['has_more'] !== 'boolean' ||
     !value['items'].every(isTransfer)
   ) {
@@ -189,15 +192,24 @@ export async function verifyPayment(
     !txnPattern.test(expectation.txnId) ||
     !Number.isInteger(expectation.amount) ||
     expectation.amount < 1 ||
-    !memberPattern.test(expectation.requesterMemberId)
+    !memberPattern.test(expectation.requesterMemberId) ||
+    !(expectation.quoteCreatedAt instanceof Date) ||
+    Number.isNaN(expectation.quoteCreatedAt.getTime())
   ) {
     throw new TypeError('Invalid payment expectation.');
   }
   const maxPages = options.maxPages ?? 5;
   const pageSize = options.pageSize ?? 100;
   const ageSlackMs = options.ageSlackMs ?? 60_000;
-  if (!Number.isInteger(maxPages) || maxPages < 1 || !Number.isInteger(pageSize) || pageSize < 1) {
-    throw new RangeError('maxPages and pageSize must be positive integers.');
+  if (
+    !Number.isInteger(maxPages) ||
+    maxPages < 1 ||
+    maxPages > 20 ||
+    !Number.isInteger(pageSize) ||
+    pageSize < 1 ||
+    pageSize > 100
+  ) {
+    throw new RangeError('maxPages must be from 1 through 20 and pageSize from 1 through 100.');
   }
   const oldestAllowed = expectation.quoteCreatedAt.getTime() - ageSlackMs;
   let before: string | undefined;

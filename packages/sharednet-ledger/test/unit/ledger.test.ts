@@ -124,7 +124,7 @@ describe('payment verification', () => {
     });
   });
 
-  it('finds a transfer on page 3 and uses the returned cursor', async () => {
+  it('finds a transfer on page 4', async () => {
     const transfers = [
       sampleTransfer({ id: 'txn_newest1', created_at: '2026-09-26T23:19:00.000Z' }),
       sampleTransfer({ id: 'txn_newest2', created_at: '2026-09-26T23:18:00.000Z' }),
@@ -208,6 +208,32 @@ describe('payment verification', () => {
     await expect(
       verifyPayment(createFakeLedgerClient([]), { ...expectation, amount: 0 }),
     ).rejects.toThrow(TypeError);
+    await expect(
+      verifyPayment(createFakeLedgerClient([]), {
+        ...expectation,
+        quoteCreatedAt: new Date(Number.NaN),
+      }),
+    ).rejects.toThrow(TypeError);
+  });
+
+  it('throws RangeError when pagination bounds are outside the accepted ranges', async () => {
+    const client = createFakeLedgerClient([]);
+    for (const options of [{ maxPages: 0 }, { maxPages: 21 }, { pageSize: 0 }, { pageSize: 101 }]) {
+      await expect(verifyPayment(client, expectation, options)).rejects.toThrow(RangeError);
+    }
+  });
+
+  it('returns a null cursor at the end and an empty page for an unknown cursor', async () => {
+    const client = createFakeLedgerClient([sampleTransfer()]);
+    const signal = new AbortController().signal;
+    await expect(client.listTransfers({ limit: 1 }, signal)).resolves.toEqual({
+      items: [sampleTransfer()],
+      next_cursor: null,
+      has_more: false,
+    });
+    await expect(
+      client.listTransfers({ limit: 1, before: 'txn_unknown123' }, signal),
+    ).resolves.toEqual({ items: [], next_cursor: null, has_more: false });
   });
 
   it('exports a fixture with the live contract field types', () => {
@@ -247,6 +273,7 @@ describe('payment verification', () => {
     await expect(limited.listTransfers({ limit: 1 }, signal)).rejects.toMatchObject({
       cause_code: 'rate_limited',
     });
+    await expect(limited.listTransfers({ limit: 1 }, signal)).rejects.not.toThrow(token);
     const serverError = errorClient(
       vi.fn(() => Promise.resolve(new Response(null, { status: 500 }))),
     );
@@ -254,6 +281,7 @@ describe('payment verification', () => {
       cause_code: 'http_status',
       http_status: 500,
     });
+    await expect(serverError.listTransfers({ limit: 1 }, signal)).rejects.not.toThrow(token);
     const offline = errorClient(vi.fn(() => Promise.reject(new Error(token))));
     await expect(offline.listTransfers({ limit: 1 }, signal)).rejects.toMatchObject({
       cause_code: 'network',
@@ -264,7 +292,7 @@ describe('payment verification', () => {
   it('maps a request that outlives timeoutMs to timeout', async () => {
     const client = createHttpLedgerClient({
       baseUrl: 'https://www.sharednet.ai',
-      token: 'token',
+      token: 'sni_TESTSECRET123',
       timeoutMs: 1,
       fetchImpl: (_input, init) =>
         new Promise<Response>((_resolve, reject) => {
@@ -285,6 +313,9 @@ describe('payment verification', () => {
     await expect(
       client.listTransfers({ limit: 1 }, new AbortController().signal),
     ).rejects.toMatchObject({ cause_code: 'timeout' });
+    await expect(
+      client.listTransfers({ limit: 1 }, new AbortController().signal),
+    ).rejects.not.toThrow('sni_TESTSECRET123');
   });
 
   it('conforms to the client interface', () => {

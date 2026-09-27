@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createServer } from 'node:http';
-import { createHttpLedgerClient } from '../../src/index.ts';
+import { createHttpLedgerClient, verifyPayment } from '../../src/index.ts';
 import { sampleTransfer, startFakeLedgerServer } from '../../src/testing.ts';
 
 describe('SharedNet ledger HTTP client', () => {
@@ -43,6 +43,71 @@ describe('SharedNet ledger HTTP client', () => {
     await expect(client.listTransfers({ limit: 1 }, controller.signal)).rejects.toMatchObject({
       cause_code: 'timeout',
     });
+  });
+
+  it('fails closed when the server returns a malformed next cursor', async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(
+        JSON.stringify({
+          items: [sampleTransfer({ id: 'txn_other123' })],
+          next_cursor: 'abc',
+          has_more: true,
+        }),
+      );
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        server.off('error', reject);
+        resolve();
+      });
+    });
+    const address = server.address();
+    if (address === null || typeof address === 'string') {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+      throw new Error('Malformed-cursor test server did not bind a TCP port.');
+    }
+    closeServer = () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    const client = createHttpLedgerClient({
+      baseUrl: `http://127.0.0.1:${String(address.port)}`,
+      token: 'token',
+    });
+    await expect(
+      verifyPayment(client, {
+        txnId: 'txn_GBpzWGoB3a',
+        payeePrincipalId: 'p_J6MlkeT8k1',
+        payeeMemberId: 'i_ovRvzoqpv3',
+        requesterMemberId: 'i_Gvf8qUNx92',
+        roomId: 'rom_9HSOHqg20Z',
+        amount: 1,
+        memo: 'chorus:v1:test:0a3ef77c-aa71-4327-8b71-7d37b69fee30',
+        quoteCreatedAt: new Date('2026-09-26T23:16:33.824Z'),
+      }),
+    ).resolves.toEqual({ status: 'unavailable', cause: 'contract_mismatch' });
+  });
+
+  it('returns null cursors at the end and empty pages for unknown cursors', async () => {
+    const server = await startFakeLedgerServer([sampleTransfer()]);
+    closeServer = server.close;
+    const client = createHttpLedgerClient({ baseUrl: server.url, token: 'token' });
+    await expect(
+      client.listTransfers({ limit: 1 }, new AbortController().signal),
+    ).resolves.toMatchObject({ next_cursor: null, has_more: false });
+    await expect(
+      client.listTransfers({ limit: 1, before: 'txn_unknown123' }, new AbortController().signal),
+    ).resolves.toEqual({ items: [], next_cursor: null, has_more: false });
   });
 
   it('maps a delayed server response to timeout and a closed server to network', async () => {
