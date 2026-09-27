@@ -46,6 +46,13 @@ export interface PurchaseRequest {
   /** The service input WITHOUT `request_id` and `payment_txn_id`. */
   readonly input: JsonValue;
   readonly amount: number;
+  /** For an effect that changes the session itself: deliver under a session lock at this version. */
+  readonly sessionLock?: { readonly expectedVersion: number };
+  /**
+   * Runs on an existing QUOTED purchase once it is known to be this same request (fingerprint matched),
+   * before payment is requested or verified: throw to refuse a quote that no longer holds.
+   */
+  readonly checkQuoted?: (quoted: Purchase) => void;
 }
 
 const REQUEST_ID = /^[A-Za-z0-9._:-]{1,100}$/;
@@ -151,7 +158,8 @@ export async function purchase(
         effect: neverRun,
       });
     }
-    return settle(deps, cmd, read, existing, request.paymentTxnId, effect);
+    request.checkQuoted?.(existing);
+    return settle(deps, cmd, read, existing, request.paymentTxnId, effect, request.sessionLock);
   }
 
   // 4. No purchase yet: quote it.
@@ -168,7 +176,7 @@ export async function purchase(
     payee,
     requester_member_id: requesterSeat,
   });
-  return settle(deps, cmd, read, quoted, request.paymentTxnId, effect);
+  return settle(deps, cmd, read, quoted, request.paymentTxnId, effect, request.sessionLock);
 }
 
 /** A `quoted` purchase: ask for payment, or verify the payment that was presented and deliver. */
@@ -179,6 +187,7 @@ async function settle(
   quoted: Purchase,
   txnId: string | undefined,
   effect: PurchaseEffect,
+  sessionLock: PurchaseRequest['sessionLock'],
 ): Promise<DeliveredResponse> {
   const externalRoomId = await externalRoomIdOf(read, quoted.room_id as Uuid);
   if (txnId === undefined) throw paymentRequired(deps, quoted, externalRoomId);
@@ -207,7 +216,12 @@ async function settle(
   );
   switch (verdict.status) {
     case 'verified':
-      return deliverPurchase(cmd, { purchase: quoted, txn_id: txnId, effect });
+      return deliverPurchase(cmd, {
+        purchase: quoted,
+        txn_id: txnId,
+        effect,
+        ...(sessionLock === undefined ? {} : { sessionLock }),
+      });
     case 'not_found':
       throw new ChorusError('payment_not_found', 'The payment is not visible in the ledger yet.', {
         details: {

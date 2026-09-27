@@ -1,19 +1,24 @@
 import {
   ChorusError,
+  coordinationModeOf,
   createSessionInTx,
   createTaskInTx,
   conversationDigest,
+  findPurchase,
+  parseCoordinationModeChange,
   parseCreateSession,
   parseCreateTask,
   roomPulse,
+  setCoordinationMode,
+  setCoordinationModeInTx,
   type CreateTaskParams,
   type JsonValue,
   type TaskSummary,
   type Uuid,
 } from '@chorus/domain';
 import { purchase, type ArenaDeps } from '../../arena/payments.ts';
-import { PRICES } from '../../arena/prices.ts';
-import { B, S, SA, objectArray, type ChorusToolSpec, type ToolDeps } from './define.ts';
+import { PRICES, coordinationModePrice } from '../../arena/prices.ts';
+import { B, I, S, SA, objectArray, type ChorusToolSpec, type ToolDeps } from './define.ts';
 
 const room = (): string[] => ['room'];
 const session = (a: Record<string, unknown>): string[] => ['sessions', String(a['session_id'])];
@@ -233,3 +238,143 @@ export const arenaTools: readonly ChorusToolSpec[] = [
     },
   },
 ];
+
+/**
+ * With billing enabled, `chorus.set_coordination_mode` is paid when it RAISES the mode, priced from the session's
+ * CURRENT mode at quote time: off → observe and off → assist cost their price, observe → assist the
+ * difference. The same mode, lowering it, and `off` are free and run the ordinary command. It replaces the
+ * free tool of the same name only when billing is enabled (tools/index.ts).
+ *
+ * The quote-vs-delivery race: delivery runs under a lock on the session row at the caller's expected
+ * version and recomputes the price from the mode as it is then. If it differs from what was quoted and
+ * paid, nothing is delivered (`invalid_transition`, reason `mode_changed`), so a mode is never delivered for
+ * less than its price; the transaction rolls back, the purchase stays quoted and the payment unclaimed.
+ */
+export const paidCoordinationModeTool: ChorusToolSpec = {
+  name: 'chorus.set_coordination_mode',
+  description: `Sets a session's room-message coordination mode ('off', 'observe' or 'assist'). Requires an administrator and the latest session version. Paid when it raises the mode: off → observe ${String(PRICES.set_coordination_mode_observe)} credits, off → assist ${String(PRICES.set_coordination_mode_assist)}, observe → assist ${String(PRICES.set_coordination_mode_assist - PRICES.set_coordination_mode_observe)} (the difference); the same mode, lowering it, and 'off' are free. A raise answers payment_required with what to pay; call again with the same arguments plus payment_txn_id. Pass request_id (idempotency_key is accepted in its place).`,
+  action: 'administer',
+  write: true,
+  idempotency: 'request_id',
+  rateLimit: 'paid',
+  // idempotency_key stays accepted so callers of the pre-billing shape keep working; request_id wins.
+  props: {
+    request_id: S,
+    idempotency_key: S,
+    session_id: S,
+    mode: S,
+    expected_version: I,
+    payment_txn_id: S,
+  },
+  required: ['session_id', 'mode', 'expected_version'],
+  path: session,
+  run: async ({ command, read, input, deps }) => {
+    const change = parseCoordinationModeChange(
+      defined({
+        session_id: input['session_id'],
+        expected_version: input['expected_version'],
+        mode: input['mode'],
+      }),
+    );
+    const requestId = requestIdOrKey(input, command.idempotencyKey);
+    // Administrator only, before anything is quoted (a non-member learns nothing: not_found).
+    const current = await coordinationModeOf(read, change.sessionId);
+    const existing = await findPurchase(read, 'set_coordination_mode', requestId);
+    const due = coordinationModePrice(current.mode, change.mode);
+    if (existing === undefined && due === 0) {
+      // Free (the same mode, lowering, off): the ordinary command, keyed by the caller's request_id.
+      try {
+        return await setCoordinationMode(
+          { ...command, idempotencyKey: `set_coordination_mode:${requestId}` },
+          {
+            session_id: change.sessionId,
+            expected_version: change.expectedVersion,
+            mode: change.mode,
+          },
+        );
+      } catch (error) {
+        // Same answer as the paid path for a request_id reused with different arguments.
+        if (error instanceof ChorusError && error.code === 'idempotency_conflict') {
+          throw new ChorusError(
+            'request_conflict',
+            'This request_id was already used for a different request.',
+          );
+        }
+        throw error;
+      }
+    }
+    const staleVersion = (): ChorusError =>
+      new ChorusError('version_conflict', 'The session changed after the supplied version.', {
+        details: { session_id: change.sessionId, current_version: current.version },
+      });
+    // Refused before a quote, so nobody pays for a change that cannot be delivered at this version.
+    if (existing === undefined && current.version !== change.expectedVersion) throw staleVersion();
+    // A stored purchase keeps the price it was quoted at (its replay never charges again).
+    const amount = existing?.amount ?? due;
+    return purchase(
+      arenaOf(deps),
+      command,
+      'set_coordination_mode',
+      {
+        requestId,
+        paymentTxnId: txnOf(input),
+        target: { sessionId: change.sessionId },
+        // What the purchase is FOR is the target mode. expected_version is checked at the quote (above) and
+        // again under the lock at delivery, with the version THIS call passes: an unrelated policy change
+        // after paying needs only a retry at the new version, not a new purchase.
+        input: { mode: change.mode },
+        amount,
+        sessionLock: { expectedVersion: change.expectedVersion },
+        // An unpaid quote of THIS request (the fingerprint already matched, so a reused request_id is a
+        // request_conflict first) whose price or version no longer holds is refused BEFORE anyone is
+        // asked to pay it: paying would only be refused at delivery.
+        checkQuoted: (quoted) => {
+          if (quoted.amount !== due) throw modeChanged(current.mode, quoted.amount, due);
+          if (current.version !== change.expectedVersion) throw staleVersion();
+        },
+      },
+      async (tx) => {
+        const applied = await setCoordinationModeInTx(tx, {
+          sessionId: change.sessionId,
+          mode: change.mode,
+          guard: (now) => {
+            const price = coordinationModePrice(now, change.mode);
+            if (price !== amount) throw modeChanged(now, amount, price);
+          },
+        });
+        return { result: applied.result as unknown as JsonValue, events: applied.events };
+      },
+    );
+  },
+};
+
+/** The paid mode tool's idempotency: `request_id`, or the `idempotency_key` of the pre-billing call shape. */
+function requestIdOrKey(input: Record<string, unknown>, key: string | undefined): string {
+  const value = input['request_id'];
+  if (typeof value === 'string') return value;
+  if (key === undefined) throw invalid('request_id is required.', 'request_id');
+  // It becomes this call's request_id, so it must satisfy request_id's rules (a UUID does).
+  if (!/^[A-Za-z0-9._:-]{1,100}$/.test(key)) {
+    throw invalid(
+      'idempotency_key must match ^[A-Za-z0-9._:-]{1,100}$ here (it is used as the request_id); or send request_id.',
+      'idempotency_key',
+    );
+  }
+  return key;
+}
+
+/** The quoted price of a mode change no longer holds, because the session's mode moved since the quote. */
+function modeChanged(now: string, quoted: number, current: number): ChorusError {
+  return new ChorusError(
+    'invalid_transition',
+    `The coordination mode is now '${now}', so this change costs ${String(current)}, not the ${String(quoted)} quoted. Nothing was delivered. A payment already made for this quote stays reserved for it and delivers only if the mode returns to where it was quoted; to change the mode now, use a new request_id.`,
+    {
+      details: {
+        reason: 'mode_changed',
+        current_mode: now,
+        quoted_amount: quoted,
+        current_amount: current,
+      },
+    },
+  );
+}

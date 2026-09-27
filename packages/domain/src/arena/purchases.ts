@@ -81,6 +81,19 @@ const toPurchase = (row: PurchaseRow): Purchase => ({
 
 const notFound = (): ChorusError => new ChorusError('not_found', 'Not found.');
 
+const SCOPE_MESSAGE: Readonly<Record<ArenaService, string>> = {
+  create_action_board: 'create_action_board takes no session_id or board_id.',
+  create_tasks: 'create_tasks needs a session_id and a board_id.',
+  set_coordination_mode: 'set_coordination_mode needs a session_id and takes no board_id.',
+};
+
+/** The session action a session-scoped service requires, at quote and at delivery. */
+const SESSION_ACTION = {
+  create_action_board: 'create_item',
+  create_tasks: 'create_item',
+  set_coordination_mode: 'administer',
+} as const satisfies Readonly<Record<ArenaService, 'create_item' | 'administer'>>;
+
 /** A live member of the (active) room the command runs in. */
 async function requireRoomMember(tx: CommandTx, roomId: Uuid | undefined): Promise<Uuid> {
   if (roomId === undefined) throw new ChorusError('invalid_request', 'The caller has no room.');
@@ -107,13 +120,14 @@ export async function quotePurchase(ctx: CommandContext, args: QuoteArgs): Promi
   const boardId = args.target.board_id ?? null;
   if (ctx.roomId === undefined) throw new ChorusError('invalid_request', 'The caller has no room.');
   const roomId = ctx.roomId;
-  if ((service === 'create_tasks') !== (sessionId !== null && boardId !== null)) {
-    throw new ChorusError(
-      'invalid_request',
-      service === 'create_tasks'
-        ? 'create_tasks needs a session_id and a board_id.'
-        : 'create_action_board takes no session_id or board_id.',
-    );
+  const scopeOk =
+    service === 'create_tasks'
+      ? sessionId !== null && boardId !== null
+      : service === 'set_coordination_mode'
+        ? sessionId !== null && boardId === null
+        : sessionId === null && boardId === null;
+  if (!scopeOk) {
+    throw new ChorusError('invalid_request', SCOPE_MESSAGE[service]);
   }
   const fingerprint = purchaseFingerprint({
     service,
@@ -135,8 +149,9 @@ export async function quotePurchase(ctx: CommandContext, args: QuoteArgs): Promi
         authorize: async (tx) => {
           await requireRoomMember(tx, roomId);
           if (sessionId === null) return;
-          // create_tasks: the buyer must be able to create items in the target session, and the board must be
-          // that session's (a non-member learns nothing: not_found).
+          // A session-scoped service needs its action in the target session (a non-member learns nothing:
+          // not_found). create_tasks: create items, on that session's own board. set_coordination_mode:
+          // administer the session.
           const roles = await tx.db.query<{ roles: string[] | null }>(
             'SELECT chorus_session_roles($1) AS roles',
             [sessionId],
@@ -145,8 +160,9 @@ export async function quotePurchase(ctx: CommandContext, args: QuoteArgs): Promi
           if (held === null || held === undefined) throw notFound();
           requireAction(
             { roles: held as ('participant' | 'manager' | 'administrator')[] },
-            'create_item',
+            SESSION_ACTION[service],
           );
+          if (boardId === null) return;
           const board = await tx.db.query(
             'SELECT 1 FROM projects WHERE workspace_id = $1 AND id = $2 AND session_id = $3',
             [tx.workspaceId, boardId, sessionId],
@@ -228,9 +244,18 @@ export async function findPurchase(
  */
 export async function deliverPurchase(
   ctx: CommandContext,
-  args: { readonly purchase: Purchase; readonly txn_id: string; readonly effect: PurchaseEffect },
+  args: {
+    readonly purchase: Purchase;
+    readonly txn_id: string;
+    readonly effect: PurchaseEffect;
+    /**
+     * Lock the purchase's session FOR UPDATE and check its version, for an effect that changes the session
+     * itself (set_coordination_mode). A replay of a delivered purchase returns before the version check.
+     */
+    readonly sessionLock?: { readonly expectedVersion: number };
+  },
 ): Promise<DeliveredResponse> {
-  const { purchase, txn_id: txnId, effect } = args;
+  const { purchase, txn_id: txnId, effect, sessionLock } = args;
   const sessionId = purchase.session_id;
   return runCommand<DeliveredResponse>(
     { ...ctx, idempotencyKey: `arena:${purchase.id}` },
@@ -241,10 +266,21 @@ export async function deliverPurchase(
       // idempotency_conflict that means nothing to a buyer (paid tools have no idempotency key). Reuse of a
       // txn is refused in the handler (pre-check + UNIQUE), not by the command hash.
       input: { purchase_id: purchase.id },
-      ...(sessionId === null ? {} : { session: { id: sessionId as Uuid } }),
+      ...(sessionId === null
+        ? {}
+        : {
+            session:
+              sessionLock === undefined
+                ? { id: sessionId as Uuid }
+                : {
+                    id: sessionId as Uuid,
+                    lock: true,
+                    expectedVersion: sessionLock.expectedVersion,
+                  },
+          }),
       authorize: async (tx) => {
         await requireRoomMember(tx, ctx.roomId);
-        if (sessionId !== null) requireAction(tx, 'create_item');
+        if (sessionId !== null) requireAction(tx, SESSION_ACTION[purchase.service]);
       },
       handle: async (tx) => {
         const locked = await tx.db.query<PurchaseRow>(
@@ -304,13 +340,17 @@ const alreadyUsed = (): ChorusError =>
  * Records which purchase created what, on EVERY created aggregate's creation event (version 1: the session of
  * a board, each task of a batch). It is data on those events, not an event of its own: a separate event would
  * need an aggregate version of its own, which the aggregate's next real command would then collide with.
+ * A set_coordination_mode purchase creates nothing: its one effect is the session's policy change, so that
+ * event carries the purchase instead.
  */
 function withPurchaseProvenance(
   events: readonly DomainEventDraft[],
   purchase: { purchase_id: string; service: ArenaService; amount: number; txn_id: string },
 ): DomainEventDraft[] {
   return events.map((event) =>
-    event.aggregateVersion === 1 ? { ...event, payload: { ...event.payload, purchase } } : event,
+    event.aggregateVersion === 1 || purchase.service === 'set_coordination_mode'
+      ? { ...event, payload: { ...event.payload, purchase } }
+      : event,
   );
 }
 

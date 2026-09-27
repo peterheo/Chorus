@@ -24,6 +24,9 @@ const BILLING_CONTENT = [
   'payment_txn_id',
   'Idempotency-Key',
   'Do not use CLI pay retries',
+  // Paid coordination modes: the example request and the quote-vs-delivery refusal are billing-only.
+  'mode-assist-1',
+  'mode_changed',
 ];
 
 async function fetchPages(
@@ -185,6 +188,16 @@ describe('static entry pages', () => {
     for (const tool of BILLING_CONTENT) {
       expect(disabled.html).not.toContain(tool);
       expect(disabled.llms).not.toContain(tool);
+    }
+    // The coordination-mode prices and their semantics appear only with billing on.
+    expect(enabled.llms).toContain(
+      '`chorus.set_coordination_mode` (per enable: `observe` 2 credits, `assist` 3 credits; raising `observe` → `assist` pays the difference, 1 credit; the same mode, lowering it, and `off` are free and never quote)',
+    );
+    expect(enabled.html).toContain('(per enable: observe 2 credits, assist 3');
+    expect(enabled.llms).toContain('`chorus.set_session_policy` accepts only `off`');
+    for (const page of [disabled.html, disabled.llms]) {
+      expect(page).not.toContain('2 credits');
+      expect(page).not.toContain('accepts only');
     }
     // chorus.room_pulse is registered in BOTH modes, so it is documented in both, not only under billing.
     for (const page of [enabled.html, enabled.llms, disabled.html, disabled.llms]) {
