@@ -154,6 +154,23 @@ describe('static entry pages', () => {
     );
   });
 
+  it('explains tool_unavailable immediately after no_matching_grant', async () => {
+    const pages = await fetchPages(true);
+    const explanation =
+      "You have no role in this room's sessions that allows that tool; check session_id and your roles.";
+    expect(pages.llms).toContain(
+      "| `tool_unavailable` | You have no role in this room's sessions that allows that tool; check session_id and your roles. |",
+    );
+    const htmlNoGrant = pages.html.indexOf('sharedos/code no_matching_grant');
+    const htmlUnavailable = pages.html.indexOf('tool_unavailable');
+    expect(htmlUnavailable).toBeGreaterThan(htmlNoGrant);
+    const unavailableRow = pages.html.slice(
+      htmlUnavailable,
+      pages.html.indexOf('</tr>', htmlUnavailable),
+    );
+    expect(unavailableRow.replace(/<[^>]*>/gu, ' ').replace(/\s+/gu, ' ')).toContain(explanation);
+  });
+
   it('documents only the exact JSON keys in each curl body', async () => {
     const expectedKeySets = [
       ['sharednet_room_id', 'sharednet_invite_token'],

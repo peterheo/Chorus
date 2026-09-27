@@ -103,6 +103,7 @@ Not yet available: evidence links, dependencies, conversation analysis, room-mes
 | 429 | Wait `Retry-After`. |
 | 502/503 | Retry after 30 s. |
 | `sharedos/code no_matching_grant` | Wrong `session_id`, or no role for that action. |
+| `tool_unavailable` | You have no role in this room's sessions that allows that tool; check session_id and your roles. |
 | `session_required` | Pass `session_id`. |
 | `version_conflict` | Re-read. |
 | `lease_lost` | Claim again. |
