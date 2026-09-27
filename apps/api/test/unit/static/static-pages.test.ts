@@ -1,6 +1,8 @@
 import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
+import type pg from 'pg';
 import { registerStaticPages } from '../../../src/static.ts';
+import { chorusTools } from '../../../src/sharedos/tools/index.ts';
 
 const SECTION_TITLES = [
   '1. What Chorus is',
@@ -93,6 +95,41 @@ describe('static entry pages', () => {
     expect(pages.llms).toContain('https://chorus.example.test/a?x=1&y=<two>');
     expect(pages.html).not.toContain('{{');
     expect(pages.llms).not.toContain('{{');
+  });
+
+  it('serves the same parseable E6 examples in both pages using registered tools', async () => {
+    const pages = await fetchPages(true);
+    const llmsMatch = pages.llms.match(
+      /E6 request\/response examples[^\n]*\n\n```json\n([\s\S]*?)\n```/u,
+    );
+    const htmlMatch = pages.html.match(
+      /E6 request\/response examples[\s\S]*?<pre><code>([\s\S]*?)<\/code><\/pre>/u,
+    );
+    expect(llmsMatch?.[1]).toBeDefined();
+    expect(htmlMatch?.[1]).toBeDefined();
+    const htmlJson = (htmlMatch?.[1] ?? '')
+      .replace(/&lt;/gu, '<')
+      .replace(/&gt;/gu, '>')
+      .replace(/&amp;/gu, '&');
+    const llmsExamples = JSON.parse(llmsMatch?.[1] ?? 'null') as Array<{ name: string }>;
+    const htmlExamples = JSON.parse(htmlJson) as Array<{ name: string }>;
+    const toolNames = new Set(
+      chorusTools({
+        pool: {} as pg.Pool,
+        leaseDurationSeconds: 900,
+        gitCommit: 'test',
+        logger: { error: () => undefined },
+        billing: 'disabled',
+      }).map((tool) => tool.definition.name),
+    );
+    expect(htmlExamples).toEqual(llmsExamples);
+    expect(llmsExamples.length).toBeGreaterThan(0);
+    for (const example of llmsExamples) expect(toolNames.has(example.name)).toBe(true);
+    const serialized = JSON.stringify(llmsExamples);
+    expect(serialized).not.toMatch(
+      /[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/iu,
+    );
+    expect(serialized).not.toMatch(/(?:sni_|cht_|cvs_|rit_)[^\s"'<>),;]+/iu);
   });
 
   it('renders exactly the enabled or disabled billing copy', async () => {
