@@ -741,6 +741,31 @@ describe('paid coordination modes (real PostgreSQL as chorus_app, fake ledger)',
       },
     });
   });
+  it('a request_id spent on a free change is request_conflict when reused for a raise (no quote)', async () => {
+    const w = await world('spent');
+    await buy(w, 'assist', 'sp-buy');
+    okOut(
+      await invoke(
+        'enabled',
+        w.admin,
+        'chorus.set_coordination_mode',
+        await modeArgs(w, 'off', 'sp-r'),
+      ),
+    );
+    const before = await purchases(w);
+    const reused = failed(
+      await invoke(
+        'enabled',
+        w.admin,
+        'chorus.set_coordination_mode',
+        await modeArgs(w, 'observe', 'sp-r'),
+      ),
+    );
+    expect(reused.code).toBe('request_conflict');
+    expect(await purchases(w)).toBe(before);
+    expect((await sessionState(w)).mode).toBe('off');
+  });
+
   describe('the refund/void path', () => {
     /** Quotes observe → assist, turns the mode off (free), pays: the delivery is refused as mode_changed. */
     const stranded = async (label: string) => {
