@@ -32,7 +32,7 @@ Run it with environment variables, for example:
 ```sh
 CHORUS_URL='https://chorus.example' \
 EXPECTED_COMMIT='0123456789abcdef0123456789abcdef01234567' \
-E2E_ROOM='rom_ExampleRoom01' \
+E2E_ROOM='rom_YourRoomId' \
 E2E_SEATS_FILE='/secure/path/chorus-seats.json' \
 node tests/deployed/e2e.mjs
 ```
