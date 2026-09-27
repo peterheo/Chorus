@@ -77,38 +77,6 @@ E6 request/response examples from a passing deployed run (IDs and times are plac
 ```json
 [
   {
-    "name": "chorus.create_task",
-    "request": {
-      "session_id": "<session_id>",
-      "board_id": "<board_id>",
-      "title": "Example task",
-      "acceptance_criteria": [
-        "The first requirement is met.",
-        "The second requirement is met."
-      ],
-      "idempotency_key": "<uuid>"
-    },
-    "response": {
-      "task": {
-        "id": "<task_id>",
-        "state": "ready",
-        "title": "Example task",
-        "room_id": "<uuid>",
-        "version": 1,
-        "board_id": "<board_id>",
-        "priority": 2,
-        "shareable": false,
-        "created_at": "<timestamp>",
-        "session_id": "<session_id>",
-        "updated_at": "<timestamp>",
-        "criteria_count": 2,
-        "owner_actor_id": null,
-        "review_required": true
-      },
-      "audit_trace_id": "<uuid>"
-    }
-  },
-  {
     "name": "chorus.claim",
     "request": {
       "session_id": "<session_id>",

@@ -283,9 +283,7 @@ async function runPaidSteps(ctx, step, runId, ids) {
         session.counts !== null &&
         typeof session.counts === 'object' &&
         json(Object.keys(session.counts).sort()) === json(PULSE_COUNT_KEYS) &&
-        Object.values(session.counts).every(
-          (count) => Number.isSafeInteger(count) && count >= 0,
-        ),
+        Object.values(session.counts).every((count) => Number.isSafeInteger(count) && count >= 0),
       'pulse_missing_session_counts',
     );
     check(
@@ -731,10 +729,7 @@ export async function runE2E() {
       const expectedRoomTools = ROOM_TOOLS.filter(
         (name) => !(paidMode && name === 'chorus.create_session'),
       );
-      check(
-        json(names) === json(expectedRoomTools),
-        'outsider_room_tool_list',
-      );
+      check(json(names) === json(expectedRoomTools), 'outsider_room_tool_list');
       return { ids: { outsider_tools: names } };
     });
 
@@ -1076,102 +1071,102 @@ export async function runE2E() {
           'bad_bearer_challenge',
         );
 
-      const staleTask = await createTask(
-        ctx.clients.A,
-        ctx.sessionId,
-        ctx.boardId,
-        `${runId}-task-fence`,
-        ['one'],
-      );
-      ids.tasks.push(staleTask.task.id);
-      const firstLease = await claimTask(ctx.clients.B, ctx.sessionId, staleTask.task);
-      const staleContent = `${runId} stale fence`;
-      const staleDigest = createHash('sha256')
-        .update(Buffer.from(staleContent, 'utf8'))
-        .digest('hex');
-      const staleSubmit = await submitTask(
-        ctx.clients.B,
-        ctx.sessionId,
-        staleTask.task.id,
-        firstLease,
-        staleContent,
-        [{ criterion: 0, note: 'done' }],
-      );
-      const staleReview = await toolOk(
-        ctx.clients.B,
-        'chorus.request_review',
-        {
-          session_id: ctx.sessionId,
-          task_id: staleTask.task.id,
-          expected_version: staleSubmit.version,
-          revision: 1,
-          reviewer_actor_id: ctx.actors.C.actor_id,
-        },
-        true,
-      );
-      const staleVerdict = await toolOk(
-        ctx.clients.C,
-        'chorus.review',
-        {
-          session_id: ctx.sessionId,
-          review_id: staleReview.review.id,
-          expected_version: staleReview.review.version,
-          verdict: 'changes_requested',
-          content_sha256: staleDigest,
-        },
-        true,
-      );
-      check(staleVerdict.review?.state === 'changes_requested', 'stale_review_verdict');
-      const returnedTask = await toolOk(ctx.clients.B, 'chorus.get_task', {
-        session_id: ctx.sessionId,
-        task_id: staleTask.task.id,
-      });
-      const secondLease = await claimTask(ctx.clients.B, ctx.sessionId, returnedTask);
-      check(secondLease.fence === firstLease.fence + 1, 'stale_fence_did_not_increment');
-      await toolError(
-        ctx.clients.B,
-        'chorus.renew_lease',
-        {
-          session_id: ctx.sessionId,
-          task_id: staleTask.task.id,
-          expected_version: secondLease.version,
-          fence: firstLease.fence,
-          idempotency_key: randomUUID(),
-        },
-        'lease_lost',
-      );
-      return {
-        ids: { tasks: ids.tasks.slice() },
-        note: 'idempotent comparison excludes per-call audit and transport metadata',
-      };
-    });
-
-    await step('E8', 'Check audit visibility', async () => {
-      const auditUrl = `${baseUrl}/v1/audit?trace=${encodeURIComponent(ctx.reviewTrace)}`;
-      let ownEvents = [];
-      const deadline = Date.now() + 15_000;
-      while (Date.now() < deadline && ownEvents.length === 0) {
-        const { body } = await responseJson(
-          auditUrl,
-          {
-            headers: {
-              authorization: `Bearer ${ctx.actors.C.token}`,
-              accept: 'application/json',
-            },
-          },
-          [200],
+        const staleTask = await createTask(
+          ctx.clients.A,
+          ctx.sessionId,
+          ctx.boardId,
+          `${runId}-task-fence`,
+          ['one'],
         );
-        ownEvents = body?.events ?? [];
-        if (ownEvents.length === 0) await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-      check(
-        ownEvents.some(
-          (event) =>
-            json(event).includes('chorus.review') && json(event).includes(ctx.actors.C.actor_id),
-        ),
-        'review_audit_event_missing',
-      );
-      const { body: outsider } = await responseJson(
+        ids.tasks.push(staleTask.task.id);
+        const firstLease = await claimTask(ctx.clients.B, ctx.sessionId, staleTask.task);
+        const staleContent = `${runId} stale fence`;
+        const staleDigest = createHash('sha256')
+          .update(Buffer.from(staleContent, 'utf8'))
+          .digest('hex');
+        const staleSubmit = await submitTask(
+          ctx.clients.B,
+          ctx.sessionId,
+          staleTask.task.id,
+          firstLease,
+          staleContent,
+          [{ criterion: 0, note: 'done' }],
+        );
+        const staleReview = await toolOk(
+          ctx.clients.B,
+          'chorus.request_review',
+          {
+            session_id: ctx.sessionId,
+            task_id: staleTask.task.id,
+            expected_version: staleSubmit.version,
+            revision: 1,
+            reviewer_actor_id: ctx.actors.C.actor_id,
+          },
+          true,
+        );
+        const staleVerdict = await toolOk(
+          ctx.clients.C,
+          'chorus.review',
+          {
+            session_id: ctx.sessionId,
+            review_id: staleReview.review.id,
+            expected_version: staleReview.review.version,
+            verdict: 'changes_requested',
+            content_sha256: staleDigest,
+          },
+          true,
+        );
+        check(staleVerdict.review?.state === 'changes_requested', 'stale_review_verdict');
+        const returnedTask = await toolOk(ctx.clients.B, 'chorus.get_task', {
+          session_id: ctx.sessionId,
+          task_id: staleTask.task.id,
+        });
+        const secondLease = await claimTask(ctx.clients.B, ctx.sessionId, returnedTask);
+        check(secondLease.fence === firstLease.fence + 1, 'stale_fence_did_not_increment');
+        await toolError(
+          ctx.clients.B,
+          'chorus.renew_lease',
+          {
+            session_id: ctx.sessionId,
+            task_id: staleTask.task.id,
+            expected_version: secondLease.version,
+            fence: firstLease.fence,
+            idempotency_key: randomUUID(),
+          },
+          'lease_lost',
+        );
+        return {
+          ids: { tasks: ids.tasks.slice() },
+          note: 'idempotent comparison excludes per-call audit and transport metadata',
+        };
+      });
+
+      await step('E8', 'Check audit visibility', async () => {
+        const auditUrl = `${baseUrl}/v1/audit?trace=${encodeURIComponent(ctx.reviewTrace)}`;
+        let ownEvents = [];
+        const deadline = Date.now() + 15_000;
+        while (Date.now() < deadline && ownEvents.length === 0) {
+          const { body } = await responseJson(
+            auditUrl,
+            {
+              headers: {
+                authorization: `Bearer ${ctx.actors.C.token}`,
+                accept: 'application/json',
+              },
+            },
+            [200],
+          );
+          ownEvents = body?.events ?? [];
+          if (ownEvents.length === 0) await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        check(
+          ownEvents.some(
+            (event) =>
+              json(event).includes('chorus.review') && json(event).includes(ctx.actors.C.actor_id),
+          ),
+          'review_audit_event_missing',
+        );
+        const { body: outsider } = await responseJson(
           auditUrl,
           {
             headers: { authorization: `Bearer ${ctx.actors.D.token}`, accept: 'application/json' },

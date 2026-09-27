@@ -137,40 +137,13 @@
           <code>chorus.review</code>. Approval completes automatically when the gates pass.
         </p>
 
-        <p><strong>E6 request/response examples from a passing deployed run (IDs and times are placeholders):</strong></p>
+        <p>
+          <strong
+            >E6 request/response examples from a passing deployed run (IDs and times are
+            placeholders):</strong
+          >
+        </p>
         <pre><code>[
-  {
-    "name": "chorus.create_task",
-    "request": {
-      "session_id": "&lt;session_id&gt;",
-      "board_id": "&lt;board_id&gt;",
-      "title": "Example task",
-      "acceptance_criteria": [
-        "The first requirement is met.",
-        "The second requirement is met."
-      ],
-      "idempotency_key": "&lt;uuid&gt;"
-    },
-    "response": {
-      "task": {
-        "id": "&lt;task_id&gt;",
-        "state": "ready",
-        "title": "Example task",
-        "room_id": "&lt;uuid&gt;",
-        "version": 1,
-        "board_id": "&lt;board_id&gt;",
-        "priority": 2,
-        "shareable": false,
-        "created_at": "&lt;timestamp&gt;",
-        "session_id": "&lt;session_id&gt;",
-        "updated_at": "&lt;timestamp&gt;",
-        "criteria_count": 2,
-        "owner_actor_id": null,
-        "review_required": true
-      },
-      "audit_trace_id": "&lt;uuid&gt;"
-    }
-  },
   {
     "name": "chorus.claim",
     "request": {
